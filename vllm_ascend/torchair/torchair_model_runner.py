@@ -63,6 +63,15 @@ class NPUTorchairModelRunner(NPUModelRunner):
         register_torchair_model()
         torchair_ops_patch()
         torchair_quant_method_register()
+
+        # GE Dump 配置（用于多次推理精度调试）
+        # 必须在 enable_shared_expert_dp early return 之前初始化
+        self.dump_counter = 0  # 推理计数器
+        self.dump_config = self._load_dump_config()
+        self.dump_enabled = self.dump_config.get('dump_enabled', False)
+        if self.dump_enabled:
+            logger.info(f"GE dump enabled: config={self.dump_config}")
+
         if self.enable_shared_expert_dp:
             return
         self.new_kv_cache_bytes = -1
@@ -83,13 +92,6 @@ class NPUTorchairModelRunner(NPUModelRunner):
             recompiles=envs_ascend.VLLM_ASCEND_TRACE_RECOMPILES)
 
         self._check_batch_sizes_consistency()
-
-        # GE Dump 配置（用于多次推理精度调试）
-        self.dump_counter = 0  # 推理计数器
-        self.dump_config = self._load_dump_config()
-        self.dump_enabled = self.dump_config.get('dump_enabled', False)
-        if self.dump_enabled:
-            logger.info(f"GE dump enabled: config={self.dump_config}")
 
     def _load_dump_config(self):
         """加载 GE dump 配置文件"""
