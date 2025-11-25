@@ -1,0 +1,18 @@
+{
+  "dump_enabled": true,
+  "dump_path": "./dump_temp",
+  "dump_mode": "output",
+  "dump_token": [0],
+  "dump_layer": [
+    "MatMul",
+    "MatMulV2",
+    "BatchMatMul",
+    "QuantBatchMatmul",
+    "QuantMatmul",
+    "AllToAll",
+    "AllGather",
+    "ReduceScatter"
+  ],
+  "fusion_switch_file": null,
+  "max_requests": 10
+}

@@ -53,39 +53,73 @@ python -c "from msit_llm.dump import torchair_dump; print('msit_llm installed')"
 
 **修改内容**：
 
-1. **在 `__init__` 方法中添加 dump 配置**（第 85-92 行）：
+1. **在 `__init__` 方法中添加 dump 配置加载**（第 85-90 行）：
    - `self.dump_counter = 0`：推理计数器
-   - `self.dump_enabled`：是否启用 dump
-   - `self.dump_base_path`：临时 dump 目录
-   - `self.dump_max_requests`：最多 dump 多少次请求
+   - `self.dump_config = self._load_dump_config()`：加载 JSON 配置文件
+   - `self.dump_enabled`：从配置中读取是否启用 dump
 
-2. **在 `_get_torchair_lazy_compiled_model` 方法中配置 GE dump**（第 418-442 行）：
+2. **新增 `_load_dump_config` 方法**（第 92-140 行）：
+   - 通过环境变量 `VLLM_ASCEND_DUMP_CONFIG` 指定配置文件路径
+   - 解析 JSON 配置文件并设置默认值
+   - 处理文件不存在或格式错误的情况
+
+3. **在 `_get_torchair_lazy_compiled_model` 方法中配置 GE dump**（第 516-544 行）：
    - 使用 `msit_llm.dump.torchair_dump.get_ge_dump_config()` 配置
-   - **只 dump 第 0 个 token**（首个生成 token）
-   - **只 dump MoE 相关算子**：MatMul、量化矩阵乘、AllToAll 等
+   - 从 dump_config 中读取所有参数（dump_path、dump_mode、dump_token、dump_layer、fusion_switch_file）
 
-3. **在 `_generate_process_reqs_hidden_states` 方法中处理 dump 数据**（第 378-380 行）：
+4. **在 `_generate_process_reqs_hidden_states` 方法中处理 dump 数据**（第 426-428 行）：
    - 每次 decode 推理后，将 dump 数据移动到 `run_1`、`run_2` ... 目录
    - 计数器自动递增
-   - 达到 `dump_max_requests` 后自动停止 dump
+   - 达到 `max_requests` 后自动停止 dump
 
-4. **新增 `_move_dump_data_to_counter_dir` 方法**（第 396-439 行）：
-   - 将 `{dump_base_path}/msit_ge_dump` 移动到 `run_{N}/msit_ge_dump`
+5. **`_move_dump_data_to_counter_dir` 方法**（第 444-490 行）：
+   - 将 `{dump_path}/msit_ge_dump` 移动到 `run_{N}/msit_ge_dump`
    - 清空临时目录，为下一次 dump 做准备
 
-### 2.2 环境变量控制
+### 2.2 配置文件说明
 
-| 环境变量 | 说明 | 默认值 | 示例 |
-|---------|------|--------|------|
-| `VLLM_ASCEND_DUMP_ENABLED` | 是否启用 dump（**必填**） | `0` | `1` |
-| `VLLM_ASCEND_DUMP_PATH` | 临时 dump 目录路径 | `./dump_base` | `./dump_temp` |
-| `VLLM_ASCEND_DUMP_MODE` | dump 模式：`input`、`output`、`all` | `output` | `output` |
-| `VLLM_ASCEND_DUMP_MAX_REQUESTS` | 最多 dump 多少次请求 | `10` | `10` |
+**环境变量**：`VLLM_ASCEND_DUMP_CONFIG` - 指向 dump 配置 JSON 文件的路径
+
+**配置文件示例**（`dump_config.json`）：
+
+```json
+{
+  "dump_enabled": true,
+  "dump_path": "./dump_temp",
+  "dump_mode": "output",
+  "dump_token": [0],
+  "dump_layer": [
+    "MatMul",
+    "MatMulV2",
+    "BatchMatMul",
+    "QuantBatchMatmul",
+    "QuantMatmul",
+    "AllToAll",
+    "AllGather",
+    "ReduceScatter"
+  ],
+  "fusion_switch_file": null,
+  "max_requests": 10
+}
+```
+
+**配置参数说明**：
+
+| 参数 | 说明 | 默认值 | 示例 |
+|-----|------|--------|------|
+| `dump_enabled` | 是否启用 dump（**必填**） | `false` | `true` |
+| `dump_path` | 临时 dump 目录路径 | `./dump_base` | `"./dump_temp"` |
+| `dump_mode` | dump 模式：`input`、`output`、`all` | `output` | `"output"` |
+| `dump_token` | 指定要 dump 的 token 索引 | `null`（全部） | `[0]` 或 `[0,1,2]` |
+| `dump_layer` | 指定要 dump 的算子名称 | `null`（全部） | `["MatMul", "QuantMatmul"]` |
+| `fusion_switch_file` | 融合开关配置文件路径 | `null` | `"./fusion_switch.json"` |
+| `max_requests` | 最多 dump 多少次请求 | `10` | `10` |
 
 **注意**：
-- **`VLLM_ASCEND_DUMP_ENABLED=1` 是启用 dump 的开关**
-- dump 数据最终保存在与 `VLLM_ASCEND_DUMP_PATH` 同级的 `run_1`、`run_2` ... 目录中
+- **`dump_enabled: true` 是启用 dump 的开关**
+- dump 数据最终保存在与 `dump_path` 同级的 `run_1`、`run_2` ... 目录中
 - 只 dump **decode 阶段**的推理（prefill 阶段不 dump）
+- `dump_token` 和 `dump_layer` 为 `null` 时会 dump 全量数据，建议指定范围以减少数据量
 
 ---
 
@@ -96,17 +130,33 @@ python -c "from msit_llm.dump import torchair_dump; print('msit_llm installed')"
 **优势**：
 - **启动一次 vLLM serve**，发送多次请求，自动 dump 到不同目录
 - 无需每次重启服务
+- 所有配置集中在一个 JSON 文件中，易于管理
 
 **步骤**：
 
 ```bash
-# 1. 设置环境变量启用 dump
-export VLLM_ASCEND_DUMP_ENABLED=1
-export VLLM_ASCEND_DUMP_PATH="./dump_temp"  # 临时目录
-export VLLM_ASCEND_DUMP_MODE="output"       # 只 dump 输出，减少数据量
-export VLLM_ASCEND_DUMP_MAX_REQUESTS=10     # 最多 dump 10 次请求
+# 1. 创建或编辑 dump 配置文件
+cat > dump_config.json <<EOF
+{
+  "dump_enabled": true,
+  "dump_path": "./dump_temp",
+  "dump_mode": "output",
+  "dump_token": [0],
+  "dump_layer": [
+    "MatMul",
+    "QuantBatchMatmul",
+    "QuantMatmul",
+    "AllToAll"
+  ],
+  "fusion_switch_file": null,
+  "max_requests": 10
+}
+EOF
 
-# 2. 启动 vLLM 服务
+# 2. 设置环境变量指向配置文件
+export VLLM_ASCEND_DUMP_CONFIG="./dump_config.json"
+
+# 3. 启动 vLLM 服务
 vllm serve /path/to/qwen3-30b-a3b-w4a4 \
     --trust-remote-code \
     --dtype float16 \
@@ -116,7 +166,7 @@ vllm serve /path/to/qwen3-30b-a3b-w4a4 \
     --quantization w4a4_flatquant_dynamic \
     --enforce-eager=false  # 确保使用图模式
 
-# 3. 在另一个终端发送多次请求（例如 10 次）
+# 4. 在另一个终端发送多次请求（例如 10 次）
 for i in {1..10}; do
     echo "Request $i:"
     curl -X POST http://localhost:8000/v1/completions \
@@ -131,11 +181,11 @@ for i in {1..10}; do
     sleep 0.5  # 稍微延迟，确保 dump 数据写入完成
 done
 
-# 4. 查看生成的 dump 目录
+# 5. 查看生成的 dump 目录
 ls -l
 # 应该看到：run_1/, run_2/, run_3/, ..., run_10/, dump_temp/
 
-# 5. 停止 vLLM 服务
+# 6. 停止 vLLM 服务
 ```
 
 **预期结果**：
@@ -144,10 +194,42 @@ ls -l
 - 第 1、3、5、7、9 次应该输出正常
 - 第 2、4、6、8、10 次应该输出 "!!!!"
 
-### 3.2 Dump 数据目录结构
+### 3.2 配置文件变体
+
+**最小配置**（只 dump，不限制算子）：
+```json
+{
+  "dump_enabled": true,
+  "dump_path": "./dump_temp"
+}
+```
+
+**关闭融合配置**：
+```json
+{
+  "dump_enabled": true,
+  "dump_path": "./dump_temp",
+  "dump_mode": "output",
+  "dump_token": [0],
+  "fusion_switch_file": "./fusion_switch.json",
+  "max_requests": 10
+}
+```
+
+**只 dump 特定算子**：
+```json
+{
+  "dump_enabled": true,
+  "dump_path": "./dump_temp",
+  "dump_layer": ["QuantMatmul", "AllToAll"]
+}
+```
+
+### 3.3 Dump 数据目录结构
 
 ```
 ./
+├── dump_config.json        # dump 配置文件
 ├── dump_temp/              # 临时目录（空，已被清理）
 ├── run_1/                  # 第 1 次请求（正常）
 │   └── msit_ge_dump/
@@ -225,141 +307,124 @@ diff ./comparison_1vs2/compare_result.csv ./comparison_3vs4/compare_result.csv
    - `AllToAll`、`AllGather` → MoE 专家通信问题
    - `MatMul`、`MatMulV2` → 权重或激活问题
 
-**示例分析**：
-
-假设比对结果显示：
-```csv
-operator_name,cosine_similarity,max_abs_error,mean_abs_error
-model.layers.0.self_attn.q_proj.MatMul,1.0000,0.0001,0.0000
-model.layers.0.mlp.gate_proj.QuantMatmul,0.9876,0.5234,0.0123  ← 第一个发散点
-model.layers.0.mlp.up_proj.QuantMatmul,0.7234,1.2345,0.2345  ← 误差传播
-...
-```
-
-**结论**：
-- **问题算子**：`model.layers.0.mlp.gate_proj.QuantMatmul`（MoE 的 gate 投影）
-- **可能原因**：
-  1. **W4A4 量化的 gate 权重在第 2 次推理时被污染**
-  2. **激活量化的 scale 参数在图模式下未正确重置**
-  3. **MoE 路由权重在图缓存重用时有状态残留**
-
 ---
 
-## 五、根据比对结果定位代码
+## 五、配置文件管理
 
-### 5.1 检查 W4A4 量化实现
+### 5.1 针对不同场景的配置
 
-**文件**：`vllm_ascend/quantization/w4a4_flatquant_dynamic.py`
+**场景 1：快速定位（只 dump MoE 相关算子）**
 
-**关键点**：
-1. 权重转置是否正确（第 89 行和第 167 行）：
-   ```python
-   # 第 89 行
-   self.transpose_weight = True  # 确认是 True
+```json
+{
+  "dump_enabled": true,
+  "dump_path": "./dump_temp",
+  "dump_mode": "output",
+  "dump_token": [0],
+  "dump_layer": ["QuantMatmul", "AllToAll"],
+  "max_requests": 5
+}
+```
 
-   # 第 167 行
-   layer.weight_packed  # 确认没有 .t() 调用
-   ```
+**场景 2：全量 dump（所有算子）**
 
-2. 激活量化 scale 是否正确管理：
-   ```python
-   # 第 126-138 行：激活量化
-   x_quantized, pertoken_scale = quantize_per_token_dynamic(
-       x_reshaped, torch.int8, torch.float32, self.sym
-   )
-   # 检查 pertoken_scale 是否每次推理都重新计算，没有复用旧值
-   ```
+```json
+{
+  "dump_enabled": true,
+  "dump_path": "./dump_temp",
+  "dump_mode": "all",
+  "dump_token": null,
+  "dump_layer": null,
+  "max_requests": 3
+}
+```
 
-3. 权重 scale 是否被修改：
-   ```python
-   # 添加调试日志
-   logger.debug(f"weight_scale hash: {hash(layer.weight_scale.data_ptr())}")
-   logger.debug(f"weight_scale mean: {layer.weight_scale.mean()}")
-   ```
+**场景 3：关闭融合进行比对**
 
-### 5.2 检查 MoE 实现
+```json
+{
+  "dump_enabled": true,
+  "dump_path": "./dump_fusion_off",
+  "dump_mode": "output",
+  "dump_token": [0],
+  "fusion_switch_file": "./fusion_switch.json",
+  "max_requests": 10
+}
+```
 
-**文件**：查找 MoE 相关实现
+### 5.2 配置文件验证
+
+验证配置文件格式是否正确：
 
 ```bash
-# 搜索 MoE 相关代码
-grep -r "class.*MoE" vllm_ascend/
-grep -r "AllToAll" vllm_ascend/
+# 使用 jq 验证 JSON 格式
+jq . dump_config.json
+
+# 或使用 Python
+python -c "import json; print(json.load(open('dump_config.json')))"
 ```
 
-**关键检查点**：
-1. 专家路由权重是否正确加载
-2. 专家选择逻辑是否有状态残留
-3. AllToAll 通信是否正确同步
+---
 
-### 5.3 检查图缓存
+## 六、常见问题排查
 
-**可能原因**：TorchAir 图缓存导致第 2 次推理复用了错误的状态
+### 6.1 配置文件未加载
 
-**排查方法**：
+**现象**：
+```
+WARNING: Dump config file not found: xxx, dump disabled
+```
+
+**解决**：
 ```bash
-# 清除图缓存后重新测试
-rm -rf ~/.cache/torch_npu/torchair_cache/
+# 检查环境变量
+echo $VLLM_ASCEND_DUMP_CONFIG
 
-# 或在启动时禁用图缓存
-# 修改 vllm 配置：use_cached_graph=False
+# 检查文件是否存在
+ls -la ./dump_config.json
+
+# 使用绝对路径
+export VLLM_ASCEND_DUMP_CONFIG="/absolute/path/to/dump_config.json"
 ```
 
----
+### 6.2 JSON 格式错误
 
-## 六、进阶调试方法
-
-### 6.1 调整 dump 参数
-
-**dump 所有算子**（如果 MoE 相关算子不够）：
-
-修改 `torchair_model_runner.py` 第 424-428 行，注释掉 `dump_layer` 参数：
-```python
-torchair_dump.get_ge_dump_config(
-    dump_path=self.dump_base_path,
-    dump_mode=self.dump_mode,
-    dump_token=[0],
-    # dump_layer=dump_layers,  # 注释掉，dump 所有算子
-    compiler_config=config
-)
+**现象**：
+```
+WARNING: Failed to parse dump config xxx: Expecting ',' delimiter, dump disabled
 ```
 
-**注意**：dump 所有算子会产生大量数据，请确保磁盘空间充足。
+**解决**：
+```bash
+# 使用 jq 检查格式
+jq . dump_config.json
 
-### 6.2 dump 多个 token
-
-修改第 432 行：
-```python
-dump_token=[0, 1, 2],  # dump 前 3 个 token
+# 常见错误：最后一项有多余逗号
+{
+  "dump_enabled": true,  # ← 多余逗号
+}
 ```
 
-### 6.3 关闭融合进行比对
+### 6.3 Dump 数据未生成
 
-如果怀疑算子融合导致问题，可以关闭融合：
+**可能原因**：
+1. `dump_enabled` 设置为 `false`
+2. 配置文件路径错误
+3. 权限问题，无法写入目标目录
 
-1. 使用提供的 `fusion_switch.json`
-2. 修改 `torchair_model_runner.py` 第 429 行，添加 `fusion_switch_file` 参数：
-   ```python
-   fusion_switch_file = os.environ.get('VLLM_ASCEND_FUSION_SWITCH_FILE', None)
-   torchair_dump.get_ge_dump_config(
-       dump_path=self.dump_base_path,
-       dump_mode=self.dump_mode,
-       dump_token=[0],
-       dump_layer=dump_layers,
-       fusion_switch_file=fusion_switch_file,  # 添加这一行
-       compiler_config=config
-   )
-   ```
-3. 设置环境变量：
-   ```bash
-   export VLLM_ASCEND_FUSION_SWITCH_FILE="./fusion_switch.json"
-   ```
+**检查**：
+```bash
+# 查看日志中是否有 "GE dump enabled"
+grep "GE dump" <vllm_log_file>
 
----
+# 查看是否有 "GE dump configured"
+grep "GE dump configured" <vllm_log_file>
 
-## 七、常见问题排查
+# 查看是否有 "Moved dump data to run_X"
+grep "Moved dump data" <vllm_log_file>
+```
 
-### 7.1 msit_llm 导入失败
+### 6.4 msit_llm 导入失败
 
 **现象**：
 ```
@@ -373,82 +438,25 @@ pip install msit
 cd /path/to/msit && pip install -e .
 ```
 
-### 7.2 Dump 数据未生成
-
-**可能原因**：
-1. `VLLM_ASCEND_DUMP_ENABLED` 未设置为 `1`
-2. 权限问题，无法写入目标目录
-3. 模型推理报错，未到达 decode 阶段
-
-**检查**：
-```bash
-# 查看日志中是否有 "GE dump enabled" 和 "GE dump configured"
-grep "GE dump" <vllm_log_file>
-
-# 查看是否有 "Moved dump data to run_X"
-grep "Moved dump data" <vllm_log_file>
-
-# 检查目录权限
-ls -la ./dump_temp/
-```
-
-### 7.3 Dump 数据被覆盖
-
-**现象**：只看到 `run_1/`，后续的 `run_2/` 等没有生成
-
-**可能原因**：
-- `_move_dump_data_to_counter_dir` 方法执行失败
-- 文件移动时发生错误
-
-**检查**：
-```bash
-# 查看日志中的错误信息
-grep "Failed to move dump data" <vllm_log_file>
-```
-
-### 7.4 比对时找不到映射
-
-**现象**：
-```
-WARNING: No mapping found for operator xxx
-```
-
-**原因**：不同推理的图结构可能略有差异（不太可能）
-
-**解决**：
-```bash
-# 使用 -l debug 查看详细信息
-msit llm compare \
-  --golden-path ./run_1/msit_ge_dump \
-  --my-path ./run_2/msit_ge_dump \
-  --output ./comparison_1vs2 \
-  -l debug
-```
-
-### 7.5 Dump 数据量过大
-
-**优化方法**：
-1. **只 dump 输出**：`export VLLM_ASCEND_DUMP_MODE="output"`（已默认）
-2. **只 dump 第 0 个 token**：代码中已配置 `dump_token=[0]`
-3. **只 dump MoE 相关算子**：代码中已配置 `dump_layer`
-4. **减少 dump 次数**：`export VLLM_ASCEND_DUMP_MAX_REQUESTS=5`
-
 ---
 
-## 八、快速参考
+## 七、快速参考
 
-### 8.1 最小化 Dump 流程
+### 7.1 最小化 Dump 流程
 
 ```bash
-# 1. 设置环境变量
-export VLLM_ASCEND_DUMP_ENABLED=1
-export VLLM_ASCEND_DUMP_PATH="./dump_temp"
-export VLLM_ASCEND_DUMP_MAX_REQUESTS=10
+# 1. 创建配置文件
+cat > dump_config.json <<'EOF'
+{"dump_enabled": true, "dump_path": "./dump_temp"}
+EOF
 
-# 2. 启动 vLLM serve
+# 2. 设置环境变量
+export VLLM_ASCEND_DUMP_CONFIG="./dump_config.json"
+
+# 3. 启动 vLLM serve
 vllm serve <model_path> <args> --enforce-eager=false
 
-# 3. 发送多次请求
+# 4. 发送多次请求
 for i in {1..10}; do
     curl -X POST http://localhost:8000/v1/completions \
       -H "Content-Type: application/json" \
@@ -456,84 +464,58 @@ for i in {1..10}; do
     sleep 0.5
 done
 
-# 4. 比对第 1 次（正常）和第 2 次（异常）
-msit llm compare --golden-path ./run_1/msit_ge_dump --my-path ./run_2/msit_ge_dump --output ./comparison_1vs2
+# 5. 比对
+msit llm compare --golden-path ./run_1/msit_ge_dump --my-path ./run_2/msit_ge_dump --output ./comparison
 
-# 5. 查看结果
-cat ./comparison_1vs2/compare_result.csv
+# 6. 查看结果
+cat ./comparison/compare_result.csv
 ```
 
-### 8.2 环境变量速查表
+### 7.2 配置文件模板
 
-```bash
-# 必填
-export VLLM_ASCEND_DUMP_ENABLED=1
-
-# 可选（有默认值）
-export VLLM_ASCEND_DUMP_PATH="./dump_temp"      # 默认: ./dump_base
-export VLLM_ASCEND_DUMP_MODE="output"           # 默认: output
-export VLLM_ASCEND_DUMP_MAX_REQUESTS=10          # 默认: 10
+**基础模板**：
+```json
+{
+  "dump_enabled": true,
+  "dump_path": "./dump_temp",
+  "dump_mode": "output",
+  "dump_token": [0],
+  "dump_layer": null,
+  "fusion_switch_file": null,
+  "max_requests": 10
+}
 ```
 
-### 8.3 代码修改位置速查
+### 7.3 代码修改位置速查
 
 | 修改点 | 文件 | 行号 | 作用 |
 |-------|------|------|------|
-| 计数器初始化 | `torchair_model_runner.py` | 85-92 | 添加 dump 配置属性 |
-| GE dump 配置 | `torchair_model_runner.py` | 418-442 | 配置 msit GE dump |
-| dump 后处理 | `torchair_model_runner.py` | 378-380 | 移动 dump 数据 |
-| 数据移动逻辑 | `torchair_model_runner.py` | 396-439 | 实现数据移动 |
+| 配置加载 | `torchair_model_runner.py` | 85-90 | 加载 dump 配置 |
+| 配置解析 | `torchair_model_runner.py` | 92-140 | 解析 JSON 文件 |
+| GE dump 配置 | `torchair_model_runner.py` | 516-544 | 配置 msit GE dump |
+| dump 后处理 | `torchair_model_runner.py` | 426-428 | 移动 dump 数据 |
+| 数据移动逻辑 | `torchair_model_runner.py` | 444-490 | 实现数据移动 |
 
 ---
 
-## 九、预期结果与下一步
-
-### 9.1 预期发现
-
-通过比对，你应该能够发现：
-
-1. **第一个发散的算子**：例如 `QuantMatmul`、`AllToAll` 等
-2. **发散程度**：`cosine_similarity < 0.99`
-3. **问题模式**：
-   - 量化算子发散 → 检查 `w4a4_flatquant_dynamic.py`
-   - MoE 算子发散 → 检查 MoE 实现和权重加载
-   - 通信算子发散 → 检查 AllToAll 同步逻辑
-
-### 9.2 进一步定位
-
-根据比对结果，可能的下一步：
-
-1. **添加调试日志**：在可疑算子处添加 logger.debug
-2. **检查权重状态**：打印权重 hash 和统计信息
-3. **对比 eager 模式**：确认问题只在图模式出现
-4. **清除图缓存**：排除图缓存污染
-
----
-
-## 十、参考资料
-
-- [TorchAir场景-整网算子精度比对](https://gitcode.com/Ascend/msit/blob/master/msit/docs/llm/TorchAir场景-整网算子精度比对.md)
-- [TorchAir场景Dump案例](https://gitcode.com/Ascend/msit/blob/master/msit/docs/llm/TorchAir场景Dump案例.md)
-- [大模型精度问题定位全流程](https://gitcode.com/Ascend/msit/blob/master/msit/docs/llm/大模型精度问题定位全流程.md)
-- [精度比对结果参数说明](https://gitcode.com/Ascend/msit/blob/master/msit/docs/llm/精度比对结果参数说明.md)
-
----
-
-## 十一、总结
+## 八、总结
 
 **核心优势**：
+- ✅ **配置集中管理**：所有参数在一个 JSON 文件中，清晰易维护
+- ✅ **灵活配置**：支持所有 msit GE dump 参数
 - ✅ **一次启动，多次 dump**：无需每次重启 vLLM serve
 - ✅ **自动计数器**：每次推理自动保存到 `run_1`、`run_2` ... 目录
-- ✅ **MoE 优化**：只 dump MoE 相关算子，减少数据量
-- ✅ **自动停止**：达到 `max_requests` 后自动禁用 dump
+- ✅ **MoE 优化**：可指定只 dump MoE 相关算子
+- ✅ **错误处理**：配置文件错误时优雅降级，不影响正常使用
 
 **使用流程**：
-1. 设置 `VLLM_ASCEND_DUMP_ENABLED=1`
-2. 启动 vLLM serve 一次
-3. 发送多次请求（10 次）
-4. 自动生成 `run_1/` 到 `run_10/` 目录
-5. 使用 `msit llm compare` 比对 `run_1` 和 `run_2`
-6. 定位第一个发散的算子
-7. 修复代码
+1. 创建 `dump_config.json` 配置文件
+2. 设置 `export VLLM_ASCEND_DUMP_CONFIG="./dump_config.json"`
+3. 启动 vLLM serve 一次
+4. 发送多次请求（10 次）
+5. 自动生成 `run_1/` 到 `run_10/` 目录
+6. 使用 `msit llm compare` 比对 `run_1` 和 `run_2`
+7. 定位第一个发散的算子
+8. 修复代码
 
 祝调试顺利！

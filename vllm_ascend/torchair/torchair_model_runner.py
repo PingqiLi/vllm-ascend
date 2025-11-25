@@ -84,12 +84,60 @@ class NPUTorchairModelRunner(NPUModelRunner):
 
         # GE Dump 配置（用于多次推理精度调试）
         self.dump_counter = 0  # 推理计数器
-        self.dump_enabled = os.environ.get('VLLM_ASCEND_DUMP_ENABLED', '0') == '1'
-        self.dump_base_path = os.environ.get('VLLM_ASCEND_DUMP_PATH', './dump_base')
-        self.dump_mode = os.environ.get('VLLM_ASCEND_DUMP_MODE', 'output')
-        self.dump_max_requests = int(os.environ.get('VLLM_ASCEND_DUMP_MAX_REQUESTS', '10'))
+        self.dump_config = self._load_dump_config()
+        self.dump_enabled = self.dump_config.get('dump_enabled', False)
         if self.dump_enabled:
-            logger.info(f"GE dump enabled: base_path={self.dump_base_path}, max_requests={self.dump_max_requests}")
+            logger.info(f"GE dump enabled: config={self.dump_config}")
+
+    def _load_dump_config(self):
+        """加载 GE dump 配置文件"""
+        import json
+
+        # 通过环境变量指定配置文件路径
+        config_path = os.environ.get('VLLM_ASCEND_DUMP_CONFIG', None)
+
+        if not config_path:
+            # 如果未指定配置文件，返回默认配置（dump 禁用）
+            return {
+                'dump_enabled': False,
+                'dump_path': './dump_base',
+                'dump_mode': 'output',
+                'dump_token': None,
+                'dump_layer': None,
+                'fusion_switch_file': None,
+                'max_requests': 10
+            }
+
+        try:
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+
+            # 验证必要的字段
+            if not isinstance(config, dict):
+                logger.warning(f"Invalid dump config format in {config_path}, dump disabled")
+                config['dump_enabled'] = False
+
+            # 设置默认值
+            config.setdefault('dump_enabled', False)
+            config.setdefault('dump_path', './dump_base')
+            config.setdefault('dump_mode', 'output')
+            config.setdefault('dump_token', None)
+            config.setdefault('dump_layer', None)
+            config.setdefault('fusion_switch_file', None)
+            config.setdefault('max_requests', 10)
+
+            logger.info(f"Loaded dump config from {config_path}")
+            return config
+
+        except FileNotFoundError:
+            logger.warning(f"Dump config file not found: {config_path}, dump disabled")
+            return {'dump_enabled': False}
+        except json.JSONDecodeError as e:
+            logger.warning(f"Failed to parse dump config {config_path}: {e}, dump disabled")
+            return {'dump_enabled': False}
+        except Exception as e:
+            logger.warning(f"Failed to load dump config {config_path}: {e}, dump disabled")
+            return {'dump_enabled': False}
 
     def _may_pad_kv_consumer_num_seq(self):
         # pd disaggregation scenario need redundant_batch_sizes to avoid each batch's seq_len exceed 16 tokens
@@ -376,7 +424,7 @@ class NPUTorchairModelRunner(NPUModelRunner):
             )
 
             # Dump 后处理：移动 dump 数据到带计数器的目录
-            if self.dump_enabled and self.dump_counter < self.dump_max_requests:
+            if self.dump_enabled and self.dump_counter < self.dump_config.get('max_requests', 10):
                 self._move_dump_data_to_counter_dir()
 
         else:
@@ -398,11 +446,14 @@ class NPUTorchairModelRunner(NPUModelRunner):
         import shutil
         import time
 
+        dump_base_path = self.dump_config.get('dump_path', './dump_base')
+        max_requests = self.dump_config.get('max_requests', 10)
+
         # GE dump 数据保存在 {dump_base_path}/msit_ge_dump/
-        source_dir = os.path.join(self.dump_base_path, "msit_ge_dump")
+        source_dir = os.path.join(dump_base_path, "msit_ge_dump")
 
         # 目标目录：dump_base_path 的父目录 + run_{counter}
-        parent_dir = os.path.dirname(self.dump_base_path)
+        parent_dir = os.path.dirname(dump_base_path)
         target_base = os.path.join(parent_dir if parent_dir else ".", f"run_{self.dump_counter + 1}")
         target_dir = os.path.join(target_base, "msit_ge_dump")
 
@@ -431,8 +482,8 @@ class NPUTorchairModelRunner(NPUModelRunner):
             self.dump_counter += 1
 
             # 如果达到最大 dump 次数，禁用 dump
-            if self.dump_counter >= self.dump_max_requests:
-                logger.info(f"Reached max dump requests ({self.dump_max_requests}), disabling dump")
+            if self.dump_counter >= max_requests:
+                logger.info(f"Reached max dump requests ({max_requests}), disabling dump")
                 self.dump_enabled = False
 
         except Exception as e:
@@ -469,21 +520,25 @@ class NPUTorchairModelRunner(NPUModelRunner):
         if self.dump_enabled:
             try:
                 from msit_llm.dump import torchair_dump
-                # 只 dump 第 0 个 token（首个生成 token）
-                # MoE 模型主要关注量化矩阵乘和 MoE 相关算子
-                dump_layers = [
-                    "MatMul", "MatMulV2", "BatchMatMul",  # 基础矩阵乘
-                    "QuantBatchMatmul", "QuantMatmul",     # 量化矩阵乘
-                    "AllToAll", "AllGather", "ReduceScatter",  # MoE 通信算子
-                ]
+
+                # 从配置文件读取参数
+                dump_path = self.dump_config.get('dump_path', './dump_base')
+                dump_mode = self.dump_config.get('dump_mode', 'output')
+                dump_token = self.dump_config.get('dump_token', None)
+                dump_layer = self.dump_config.get('dump_layer', None)
+                fusion_switch_file = self.dump_config.get('fusion_switch_file', None)
+
+                # 配置 GE dump
                 torchair_dump.get_ge_dump_config(
-                    dump_path=self.dump_base_path,
-                    dump_mode=self.dump_mode,
-                    dump_token=[0],  # 只 dump 首个 token
-                    dump_layer=dump_layers,
+                    dump_path=dump_path,
+                    dump_mode=dump_mode,
+                    dump_token=dump_token,
+                    dump_layer=dump_layer,
+                    fusion_switch_file=fusion_switch_file,
                     compiler_config=config
                 )
-                logger.info(f"GE dump configured: path={self.dump_base_path}, token=[0]")
+                logger.info(f"GE dump configured: path={dump_path}, mode={dump_mode}, "
+                           f"token={dump_token}, layer={dump_layer}")
             except ImportError:
                 logger.warning("msit_llm not installed, GE dump disabled")
                 self.dump_enabled = False
