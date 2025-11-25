@@ -48,8 +48,10 @@ from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 class NPUTorchairModelRunner(NPUModelRunner):
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
+        logger.info("[DEBUG] NPUTorchairModelRunner.__init__ called")
         self.ascend_config = get_ascend_config()
         self.enable_shared_expert_dp = self.ascend_config.enable_shared_expert_dp
+        logger.info(f"[DEBUG] enable_shared_expert_dp={self.enable_shared_expert_dp}")
         super().__init__(vllm_config, device)
         if self.speculative_config:
             self.actual_seq_lengths_q = list(
