@@ -32,6 +32,8 @@ class ACLGraphEntry:
     # for aclgraph debugging, track the input addresses
     # during capture, and check if they are the same during replay
     input_addresses: Optional[list[int]] = None
+    # [PATCH] Add static inputs storage for graph replay
+    static_inputs: Optional[list[torch.Tensor]] = None
 
 
 class ACLGraphWrapper:
@@ -85,8 +87,7 @@ class ACLGraphWrapper:
         self.aclgraph_options = cudagraph_options
         # the entries for different batch descriptors that we need to capture
         # aclgraphs for.
-        self.concrete_aclgraph_entries: dict[BatchDescriptor, ACLGraphEntry]\
-                                                                        = {}
+        self.concrete_aclgraph_entries: dict[BatchDescriptor, ACLGraphEntry]\                                                                        = {}
 
     def __getattr__(self, key: str):
         # allow accessing the attributes of the runnable.
@@ -136,6 +137,21 @@ class ACLGraphWrapper:
                 x.data_ptr() for x in args if isinstance(x, torch.Tensor)
             ]
             entry.input_addresses = input_addresses
+            
+            # [PATCH] Capture Phase: Clone inputs to static buffers
+            static_inputs = []
+            capture_args = []
+            for arg in args:
+                if isinstance(arg, torch.Tensor):
+                    # Create a static buffer with the same content and properties
+                    static_tensor = arg.clone().detach()
+                    static_inputs.append(static_tensor)
+                    capture_args.append(static_tensor)
+                else:
+                    capture_args.append(arg)
+            
+            entry.static_inputs = static_inputs
+            
             aclgraph = torch.npu.NPUGraph()
 
             with ExitStack() as stack:
@@ -154,7 +170,8 @@ class ACLGraphWrapper:
                 forward_context.capturing = True
                 with torch.npu.graph(aclgraph, pool=self.graph_pool):
                     # `output` is managed by pytorch's aclgraph pool
-                    output = self.runnable(*args, **kwargs)
+                    # [PATCH] Use capture_args instead of args
+                    output = self.runnable(*capture_args, **kwargs)
                     if self.aclgraph_options.weak_ref_output:
                         # by converting it to weak ref,
                         # the original `output` will immediately be released
@@ -176,15 +193,23 @@ class ACLGraphWrapper:
             # manage the memory during acl graph capture
             return output
 
+        # [PATCH] Replay Phase: Copy current args to static inputs
+        if entry.static_inputs:
+            tensor_idx = 0
+            for arg in args:
+                if isinstance(arg, torch.Tensor):
+                    entry.static_inputs[tensor_idx].copy_(arg)
+                    tensor_idx += 1
+
         if self.is_debugging_mode:
             # check if the input addresses are the same
             new_input_addresses = [
                 x.data_ptr() for x in args if isinstance(x, torch.Tensor)
             ]
-            assert new_input_addresses == entry.input_addresses, (
-                f"Input addresses for aclgraphs are different "
-                f"during replay. Expected {entry.input_addresses}, "
-                f"got {new_input_addresses}")
+            # With the patch, mismatch is expected if we check args vs entry.input_addresses.
+            # But entry.aclgraph is now bound to entry.static_inputs.
+            # We can log a debug message if needed.
+            pass
 
         logger.info_once("Replaying aclgraph")
         entry.aclgraph.replay()
