@@ -412,8 +412,13 @@ class AscendFusedMoEMethod(FusedMoEMethodBase):
             layer.register_parameter(param_key, param)
             set_weight_attrs(param, extra_weight_attrs)
 
+        default_quant_method = FusedMoeWeightScaleSupported.CHANNEL.value
+        if hasattr(self.quant_method, "is_per_channel_weight") and \
+            not self.quant_method.is_per_channel_weight:
+            default_quant_method = FusedMoeWeightScaleSupported.GROUP.value
+
         extra_weight_attrs.update(
-            {"quant_method": FusedMoeWeightScaleSupported.CHANNEL.value})
+            {"quant_method": default_quant_method})
         per_group_param = [
             "weight_scale_second", "weight_offset_second", "scale_bias"
         ]

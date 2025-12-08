@@ -92,22 +92,18 @@ class AscendW4A4DynamicLinearMethod:
         Create per-group quantization parameters.
         """
         params_dict = {}
+        # NOTE: The checkpoint uses "weight_scale" to store the group scales directly.
+        # Shape: [output_size, input_size // group_size]
+        scale_dim = input_size // self.group_size
         params_dict["weight_scale"] = torch.empty(output_size,
-                                                  1,
+                                                  scale_dim,
                                                   dtype=params_dtype)
         params_dict["weight_offset"] = torch.empty(output_size,
-                                                   1,
+                                                   scale_dim,
                                                    dtype=params_dtype)
-        if not self.is_per_channel_weight:
-            params_dict["weight_scale_second"] = torch.empty(output_size,
-                                                             input_size //
-                                                             self.group_size,
-                                                             dtype=params_dtype)
-            params_dict["weight_offset_second"] = torch.empty(output_size,
-                                                              input_size //
-                                                              self.group_size,
-                                                              dtype=params_dtype)
-
+        
+        # We generally do not need separate second level scales if weight_scale already holds group scales
+        
         # NOTE: In w4a8 quantization implementation,
         #       for down_proj and o_proj(layer_type == "row") scale_bias shape is [output_size, 16],
         #       others are [output_size, 1]
@@ -129,7 +125,7 @@ class AscendW4A4DynamicLinearMethod:
         
         Args:
             weight: weight tensor [k, n] (in new version, n is already compressed to n/2)
-            scale: first-level quantization scale [output_size]
+            scale: first-level quantization scale [output_size] (dummy ones for this method)
             per_group_scale: second-level per-group quantization scale [group_num, n_scale]
             is_new_quant: whether it's the new quantization version (weight already compressed)
         
@@ -148,6 +144,7 @@ class AscendW4A4DynamicLinearMethod:
             weight_high = weight.to(torch.float32).reshape(
                 group_num, -1, n) * per_group_scale.reshape(group_num, 1, n)
             weight_high = weight_high.reshape(k, n)
+            # scale is ones, so we can ignore it in sum or multiply
             bias = 8 * (weight_high.to(torch.float32) * scale).sum(dim=0)
         # NOTE: scale_bias is not used currently
         #       because in msmodelslim w4a8 uses symmetric quantization
@@ -163,6 +160,7 @@ class AscendW4A4DynamicLinearMethod:
         bias: Optional[torch.Tensor] = None,
         tp_rank: Optional[int] = None,
     ) -> torch.Tensor:
+        # We reuse weight_scale_second attribute name for the final processed scale
         return torch_npu.npu_weight_quant_batchmatmul(
             x,
             layer.weight,
@@ -173,15 +171,28 @@ class AscendW4A4DynamicLinearMethod:
     def process_weights_after_loading(self, layer: torch.nn.Module):
         if self.transpose_weight:
             layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
-        layer.weight_scale.data = layer.weight_scale.data.flatten().to(
-            torch.float32)
+        
+        # layer.weight_scale loaded from checkpoint contains the group scales
+        # We treat it as 'per_group_scale' and use a dummy 'scale' of ones.
+        group_scales = layer.weight_scale.data.transpose(0, 1).contiguous()
+        
+        output_size = group_scales.shape[0]
+        # Dummy channel scale of 1.0
+        dummy_channel_scale = torch.ones(output_size, 1, dtype=group_scales.dtype, device=group_scales.device)
+        
         layer.weight_offset.data = layer.weight_offset.data.flatten()
+        
+        # Store processed scale into weight_scale_second as expected by apply()
+        layer.weight_scale_second = torch.nn.Parameter(torch.empty(1), requires_grad=False) 
         layer.weight_scale_second.data, scale_bias = self.process_scale_second(
             layer.weight.data,
-            layer.weight_scale.data,
-            layer.weight_scale_second.data.transpose(0, 1).contiguous(),
+            dummy_channel_scale,
+            group_scales,
             is_new_quant=self.new_quant_version,
         )
+
+        # Release weight_scale memory as it's processed into weight_scale_second
+        layer.weight_scale.data = torch.empty(0) 
 
         if self.new_quant_version:
             # Process the loaded data based on layer type
@@ -221,8 +232,8 @@ class AscendW4A4DynamicFusedMoEMethod:
         vllm_config = get_current_vllm_config()
         self.group_size = vllm_config.quant_config.quant_description.get(
             "group_size", 256)
-        # NOTE: Force is_per_channel_weight to True as the checkpoint uses per-channel scales
-        self.is_per_channel_weight = True
+        # NOTE: Force is_per_channel_weight to False as the checkpoint uses per-group scales
+        self.is_per_channel_weight = False
         # NOTE: Force new_quant_version to False for W4A4_DYNAMIC to handle unpacked weights from msmodelslim
         self.new_quant_version = False
 
@@ -273,7 +284,7 @@ class AscendW4A4DynamicFusedMoEMethod:
         param_dict["w13_weight_scale"] = torch.empty(
             num_experts,
             2 * intermediate_size_per_partition,
-            1,
+            hidden_sizes // self.group_size,
             dtype=torch.float32)
 
         param_dict["w13_weight_offset"] = torch.empty(
@@ -284,34 +295,12 @@ class AscendW4A4DynamicFusedMoEMethod:
 
         param_dict["w2_weight_scale"] = torch.empty(num_experts,
                                                     hidden_sizes,
-                                                    1,
+                                                    intermediate_size_per_partition // self.group_size,
                                                     dtype=torch.float32)
         param_dict["w2_weight_offset"] = torch.empty(num_experts,
                                                      hidden_sizes,
                                                      1,
                                                      dtype=torch.float32)
-        if not self.is_per_channel_weight:
-            param_dict["w13_weight_scale_second"] = torch.empty(
-                num_experts,
-                2 * intermediate_size_per_partition,
-                hidden_sizes // self.group_size,
-                dtype=torch.float32)
-            param_dict["w13_weight_offset_second"] = torch.empty(
-                num_experts,
-                2 * intermediate_size_per_partition,
-                hidden_sizes // self.group_size,
-                dtype=torch.float32)
-
-            param_dict["w2_weight_scale_second"] = torch.empty(
-                num_experts,
-                hidden_sizes,
-                intermediate_size_per_partition // self.group_size,
-                dtype=torch.float32)
-            param_dict["w2_weight_offset_second"] = torch.empty(
-                num_experts,
-                hidden_sizes,
-                intermediate_size_per_partition // self.group_size,
-                dtype=torch.float32)
 
         if self.new_quant_version:
             param_dict["w13_scale_bias"] = torch.empty(
@@ -462,24 +451,48 @@ class AscendW4A4DynamicFusedMoEMethod:
             layer.w2_weight.data = layer.w2_weight.data.transpose(
                 1, 2).contiguous()
 
-        w13_weight_scale_second = layer.w13_weight_scale_second.data if hasattr(
-            layer, "w13_weight_scale_second") else None
-        w2_weight_scale_second = layer.w2_weight_scale_second.data if hasattr(
-            layer, "w2_weight_scale_second") else None
-        layer.w13_weight_scale.data, w13_bias = self.process_scale(
-            layer.w13_weight, layer.w13_weight_scale.data,
-            w13_weight_scale_second)
-        layer.w2_weight_scale.data, w2_bias = self.process_scale(
-            layer.w2_weight, layer.w2_weight_scale.data,
-            w2_weight_scale_second)
-        if hasattr(layer, "w13_weight_scale_second"):
-            # scale_second is no longer used, release this part of the memory
-            del layer.w13_weight_scale_second
-            del layer.w2_weight_scale_second
-            del layer.w13_weight_offset_second
-            del layer.w2_weight_offset_second
+        # Treat loaded weight_scales as group scales
+        w13_group_scale = layer.w13_weight_scale.data
+        w2_group_scale = layer.w2_weight_scale.data
 
-        self.update_bias(layer, w13_bias, w2_bias)
+        # Expand group scales to per-channel scales
+        # w13_group_scale: [num, 2*inter // group, 1] -> [num, 2*inter, 1]
+        if w13_group_scale.shape[1] < layer.w13_weight.data.shape[2]:
+             layer.w13_weight_scale.data = w13_group_scale.repeat_interleave(
+                self.group_size, dim=1).contiguous().to(torch.float32)
+        else:
+             layer.w13_weight_scale.data = w13_group_scale.to(torch.float32)
+
+        # w2_group_scale: [num, hidden // group, 1] -> [num, hidden, 1]
+        if w2_group_scale.shape[1] < layer.w2_weight.data.shape[2]:
+            layer.w2_weight_scale.data = w2_group_scale.repeat_interleave(
+                self.group_size, dim=1).contiguous().to(torch.float32)
+        else:
+             layer.w2_weight_scale.data = w2_group_scale.to(torch.float32)
+
+        # Handle biases
+        # In this workflow, we might need to create dummy biases if they don't exist
+        # or handle them if they do. The original code assumed specific bias handling.
+        # Here we initialize them to zeros if not present, as usually W4A4 might not have individual biases
+        # or they are integrated.
+        
+        # Check if we need to zero-fill or if they are loaded
+        # Based on previous code, they were outputs of process_scale (which returned None in one branch)
+        # We'll just create zero biases if needed for the kernel
+        if not hasattr(layer, "w13_scale_bias"):
+             layer.register_parameter("w13_scale_bias", torch.nn.Parameter(
+                 torch.zeros(layer.w13_weight.shape[0], layer.w13_weight.shape[2], dtype=torch.float32, device=layer.w13_weight.device), requires_grad=False)) # Minimal dummy
+        if not hasattr(layer, "w2_scale_bias"):
+             layer.register_parameter("w2_scale_bias", torch.nn.Parameter(
+                 torch.zeros(layer.w2_weight.shape[0], layer.w2_weight.shape[2], dtype=torch.float32, device=layer.w2_weight.device), requires_grad=False))
+
+        # Cleanup second level parameters if they exist (from loading template)
+        if hasattr(layer, "w13_weight_scale_second"):
+            del layer.w13_weight_scale_second
+            del layer.w13_weight_offset_second
+        if hasattr(layer, "w2_weight_scale_second"):
+            del layer.w2_weight_scale_second
+            del layer.w2_weight_offset_second
 
         if is_enable_nz():
             layer.w13_weight.data = torch_npu.npu_format_cast(
