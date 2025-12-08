@@ -17,6 +17,7 @@
 # Adapted from vllm-project/vllm/vllm/worker/gpu_worker.py
 #
 
+import os
 import copy
 from typing import Optional, Union
 
@@ -333,6 +334,25 @@ class NPUWorker(WorkerBase):
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
         NPUPlatform.seed_everything(self.model_config.seed)
+
+        dump_path = os.environ.get('DUMP_PATH')
+        if dump_path:
+            try:
+                from msit_llm import DumpConfig, register_hook
+                from vllm_ascend.common.log import logger
+                dump_config = DumpConfig(
+                    dump_path=dump_path,
+                    token_range=[0],
+                    layer_name='root.model.layers.*',
+                    mode=["module", "api"]
+                )
+                # self.model_runner.model is the actual model instance
+                register_hook(self.model_runner.model, dump_config)
+                logger.info(f"Injected msit_llm dump hook, dump path -> {dump_path}.")
+            except ImportError:
+                logger.warning("msit_llm not found, skipping dump hook injection.")
+            except Exception as e:
+                logger.warning(f"Failed to inject dump hook: {e}")
 
     def _warm_up_atb(self):
         x = torch.rand((2, 4), dtype=torch.float16).npu()
