@@ -15,12 +15,12 @@
 # limitations under the License.
 #
 
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import numpy as np
 import torch
 import torch_npu
-from vllm.config import get_current_vllm_config
+from vllm.config import CompilationLevel, get_current_vllm_config
 from vllm.distributed import get_ep_group
 from vllm.forward_context import get_forward_context
 
@@ -29,184 +29,110 @@ from vllm_ascend.distributed.parallel_state import get_mc2_group
 from vllm_ascend.ops.moe.experts_selector import select_experts
 from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, is_enable_nz
 
+from .w4a4_flatquant_dynamic import pack_int4_weights
+
+
+def quantize(
+    x: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    orig_shape = x.shape
+    x2 = x.reshape(-1, x.shape[-1])
+    qscale = torch.abs(x2).max(dim=-1, keepdim=True)[0].to(torch.float)
+    ratio = torch.ones_like(qscale) * 7
+    qscale2 = ratio / qscale
+    x_quantized_int4 = \
+        torch_npu.npu_quantize(x2, qscale2.to(x2.dtype), zero_points=None, dtype=torch.quint4x2, axis=-2, div_mode=False)
+    activation_scale = torch.flatten(qscale / ratio)
+
+    if len(x_quantized_int4.shape) != 2 and x_quantized_int4.shape[
+            1] != orig_shape[-1] // 8:
+        x_quantized_int4 = x_quantized_int4.reshape(-1, orig_shape[-1] // 8)
+    return x_quantized_int4, activation_scale
+
+
 
 class AscendW4A4DynamicLinearMethod:
-    """Linear method for Ascend W4A4_DYNAMIC
-    """
+    input_size = 0
 
     def __init__(self):
-        self.transpose_weight = True
-
+        self.sym = True
         vllm_config = get_current_vllm_config()
-        self.group_size = vllm_config.quant_config.quant_description.get(
-            "group_size", 256)
-        quant_version = vllm_config.quant_config.quant_description.get(
-            "version", "0")
-        self.new_quant_version = quant_version == "1.0.0"
+        ascend_config = get_ascend_config()
+        self.use_aclgraph = (
+            vllm_config.compilation_config.level == CompilationLevel.PIECEWISE
+            and not vllm_config.model_config.enforce_eager
+            and not ascend_config.torchair_graph_config.enabled)
 
-        from vllm.distributed import get_tensor_model_parallel_world_size
-        self.tp_size = get_tensor_model_parallel_world_size()
-
-    def get_weight(self, input_size: int, output_size: int,
+    @staticmethod
+    def get_weight(input_size: int, output_size: int,
                    params_dtype: torch.dtype) -> Dict[str, Any]:
-        """Create weight parameters.
-        
-        For new quantization version (double int4 pack into int8), the output dimension
-        is compressed by factor 2 (e.g., [2048, 3072] -> [1024, 3072]). The returned
-        dict includes "_packed_dim" and "_packed_factor" for vLLM's weight loader.
-        """
-        params_dict = {}
-
-        if self.new_quant_version:
-            # double int4 pack into int8: output dimension is compressed
-            pack_factor = 2
-            actual_output_size = output_size // pack_factor
-            params_dict["weight"] = torch.empty(actual_output_size,
-                                                input_size,
-                                                dtype=torch.int8)
-            # Add packing information for vLLM's weight_loader
-            params_dict["_packed_dim"] = 0
-            params_dict["_packed_factor"] = pack_factor
-        else:
-            params_dict["weight"] = torch.empty(output_size,
-                                                input_size,
-                                                dtype=torch.int8)
-
+        if input_size % 8 != 0:
+            raise ValueError(
+                f"input_size ({input_size}) must be divisible by 8 for int4 packing"
+            )
+        AscendW4A4DynamicLinearMethod.input_size = input_size
+        params_dict = {
+            "weight": torch.empty(output_size, input_size, dtype=torch.int8)
+        }
         return params_dict
 
     @staticmethod
     def get_pertensor_param(params_dtype: torch.dtype) -> Dict[str, Any]:
-        return {}
+        params_dict = {}
+        return params_dict
 
     @staticmethod
-    def get_perchannel_param(output_size: int,
-                             params_dtype: torch.dtype) -> Dict[str, Any]:
-        return {}
+    def get_perchannel_param(
+        output_size: int,
+        params_dtype: torch.dtype,
+    ) -> Dict[str, Any]:
+        params_dict = {}
+        params_dict["weight_scale"] = torch.empty(output_size,
+                                                  1,
+                                                  dtype=torch.float32)
+        params_dict["weight_offset"] = torch.empty(output_size,
+                                                   1,
+                                                   dtype=torch.float32)
+        return params_dict
 
     def get_pergroup_param(self,
                            input_size: int,
                            output_size: int,
                            params_dtype: torch.dtype,
                            layer_type: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Create per-group quantization parameters.
-        """
-        params_dict = {}
-        params_dict["weight_scale"] = torch.empty(output_size,
-                                                  1,
-                                                  dtype=params_dtype)
-        params_dict["weight_offset"] = torch.empty(output_size,
-                                                   1,
-                                                   dtype=params_dtype)
-        params_dict["weight_scale_second"] = torch.empty(output_size,
-                                                         input_size //
-                                                         self.group_size,
-                                                         dtype=params_dtype)
-        params_dict["weight_offset_second"] = torch.empty(output_size,
-                                                          input_size //
-                                                          self.group_size,
-                                                          dtype=params_dtype)
-
-        # NOTE: In w4a8 quantization implementation,
-        #       for down_proj and o_proj(layer_type == "row") scale_bias shape is [output_size, 16],
-        #       others are [output_size, 1]
-        if self.new_quant_version:
-            scale_bias_dim = 16 if layer_type == "row" else 1
-
-            params_dict["scale_bias"] = torch.empty(output_size,
-                                                    scale_bias_dim,
-                                                    dtype=torch.float32)
-        return params_dict
-
-    @staticmethod
-    def process_scale_second(weight: torch.Tensor,
-                             scale: torch.Tensor,
-                             per_group_scale: torch.Tensor,
-                             is_new_quant: bool = False):
-        """
-        Process the scale for second-level quantization.
-        
-        Args:
-            weight: weight tensor [k, n] (in new version, n is already compressed to n/2)
-            scale: first-level quantization scale [output_size]
-            per_group_scale: second-level per-group quantization scale [group_num, n_scale]
-            is_new_quant: whether it's the new quantization version (weight already compressed)
-        
-        Returns:
-            (antiquant_scale, bias): dequantization scale and bias (bias=None for new version)
-        """
-        k, n = weight.shape
-        group_num, n_scale = per_group_scale.shape
-
-        if is_new_quant:
-            # Restore logical dimension for compressed weight
-            n = n * 2
-
-        bias = None
-        if not is_new_quant:
-            weight_high = weight.to(torch.float32).reshape(
-                group_num, -1, n) * per_group_scale.reshape(group_num, 1, n)
-            weight_high = weight_high.reshape(k, n)
-            bias = 8 * (weight_high.to(torch.float32) * scale).sum(dim=0)
-        # NOTE: scale_bias is not used currently
-        #       because in msmodelslim w4a8 uses symmetric quantization
-
-        # TODO: support potential future asymmetric quantization
-        antiquant_scale = (scale * per_group_scale).reshape(group_num, n)
-        return antiquant_scale.npu(), bias
+        return {}
 
     def apply(
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
-        tp_rank: Optional[int] = None,
+        tp_rank: Optional[int] = 0,
     ) -> torch.Tensor:
-        return torch_npu.npu_weight_quant_batchmatmul(
-            x,
-            layer.weight,
-            antiquant_scale=layer.weight_scale_second.to(x.dtype),
-            antiquant_group_size=self.group_size,
-        )
+        input_shape = x.shape
+        original_dtype = x.dtype
+        x_quantized_reshaped, pertoken_scale = quantize(x)
+        
+        output = torch_npu.npu_quant_matmul(x_quantized_reshaped,
+                                            layer.weight_packed.t(),
+                                            layer.weight_scale.data,
+                                            pertoken_scale=pertoken_scale,
+                                            bias=None,
+                                            output_dtype=original_dtype)
+        output = output.view(*input_shape[:-1], -1)
+        if bias is not None:
+            output = output + bias.to(original_dtype)
+        return output
 
-    def process_weights_after_loading(self, layer: torch.nn.Module):
-        if self.transpose_weight:
-            layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
-        layer.weight_scale.data = layer.weight_scale.data.flatten().to(
-            torch.float32)
-        layer.weight_offset.data = layer.weight_offset.data.flatten()
-        layer.weight_scale_second.data, scale_bias = self.process_scale_second(
-            layer.weight.data,
-            layer.weight_scale.data,
-            layer.weight_scale_second.data.transpose(0, 1).contiguous(),
-            is_new_quant=self.new_quant_version,
-        )
+    def process_weights_after_loading(self, layer):
+        weight_packed = pack_int4_weights(layer.weight.data)
+        layer.weight_scale.data = layer.weight_scale.data.view(-1).to(torch.float32)
 
-        if self.new_quant_version:
-            # Process the loaded data based on layer type
-            if hasattr(layer, "scale_bias"):
-                if layer.scale_bias.data.shape[1] == 1:
-                    layer.scale_bias.data = layer.scale_bias.data.flatten()
-                else:
-                    layer.scale_bias.data = layer.scale_bias.data.contiguous()
-        else:
-            if scale_bias is not None:
-                param = torch.nn.Parameter(scale_bias, requires_grad=False)
-                layer.register_parameter("weight_scale_bias", param)
-
-        # Convert to NPU-specific int4pack format
-        if self.new_quant_version:
-            # weights on disk are already in packed int4 format
-            # pack 4 int8(int4*2) to int32
-            assert layer.weight.data.shape[-1] % 4 == 0, \
-                f"the last dim of weight needs to be divided by 4, got shape {layer.weight.data.shape}"
-            layer.weight.data = layer.weight.data.view(
-                torch.int32).contiguous()
-        else:
-            # weights are not compressed
-            # need to be packed via npu_convert_weight_to_int4pack
-            layer.weight.data = torch_npu.npu_convert_weight_to_int4pack(
-                layer.weight.data.to(torch.int32))
+        layer.register_parameter(
+            'weight_packed',
+            torch.nn.Parameter(weight_packed, requires_grad=False))
+        del layer.weight
+        layer.weight_offset.data = layer.weight_offset.data.to(torch.float32)
 
 
 class AscendW4A4DynamicFusedMoEMethod:
@@ -219,13 +145,11 @@ class AscendW4A4DynamicFusedMoEMethod:
         self.ep_group = get_ep_group()
 
         vllm_config = get_current_vllm_config()
-        self.group_size = vllm_config.quant_config.quant_description.get(
-            "group_size", 256)
-        # NOTE: the weights are quantized from bf16 to int4 through a per-channel quantization process
-        self.is_per_channel_weight = self.group_size == 0
+        # Only support per-channel quantization
+        self.is_per_channel_weight = True
+        
         quant_version = vllm_config.quant_config.quant_description.get(
             "version", "0")
-        # NOTE: new quantize weights: 2 int4 pack into int8
         self.new_quant_version = quant_version == "1.0.0"
         self.tp_size = 1 if vllm_config.parallel_config.enable_expert_parallel else self.ep_group.world_size
         ascend_config = get_ascend_config()
@@ -270,48 +194,25 @@ class AscendW4A4DynamicFusedMoEMethod:
                                 hidden_sizes: int,
                                 params_dtype: torch.dtype) -> Dict[str, Any]:
         param_dict = {}
+        # Per-channel quantization scales have last dimension 1
+        w13_scale_dim = 1
+        w2_scale_dim = 1
+
         param_dict["w13_weight_scale"] = torch.empty(
-            num_experts,
-            2 * intermediate_size_per_partition,
-            1,
+            (num_experts, 2 * intermediate_size_per_partition, w13_scale_dim),
             dtype=torch.float32)
 
         param_dict["w13_weight_offset"] = torch.empty(
-            num_experts,
-            2 * intermediate_size_per_partition,
-            1,
+            (num_experts, 2 * intermediate_size_per_partition, w13_scale_dim),
             dtype=torch.float32)
 
-        param_dict["w2_weight_scale"] = torch.empty(num_experts,
-                                                    hidden_sizes,
-                                                    1,
-                                                    dtype=torch.float32)
-        param_dict["w2_weight_offset"] = torch.empty(num_experts,
-                                                     hidden_sizes,
-                                                     1,
-                                                     dtype=torch.float32)
-        if not self.is_per_channel_weight:
-            param_dict["w13_weight_scale_second"] = torch.empty(
-                num_experts,
-                2 * intermediate_size_per_partition,
-                hidden_sizes // self.group_size,
-                dtype=torch.float32)
-            param_dict["w13_weight_offset_second"] = torch.empty(
-                num_experts,
-                2 * intermediate_size_per_partition,
-                hidden_sizes // self.group_size,
-                dtype=torch.float32)
+        param_dict["w2_weight_scale"] = torch.empty(
+            (num_experts, hidden_sizes, w2_scale_dim),
+            dtype=torch.float32)
 
-            param_dict["w2_weight_scale_second"] = torch.empty(
-                num_experts,
-                hidden_sizes,
-                intermediate_size_per_partition // self.group_size,
-                dtype=torch.float32)
-            param_dict["w2_weight_offset_second"] = torch.empty(
-                num_experts,
-                hidden_sizes,
-                intermediate_size_per_partition // self.group_size,
-                dtype=torch.float32)
+        param_dict["w2_weight_offset"] = torch.empty(
+            (num_experts, hidden_sizes, w2_scale_dim),
+            dtype=torch.float32)
 
         if self.new_quant_version:
             param_dict["w13_scale_bias"] = torch.empty(
@@ -375,6 +276,9 @@ class AscendW4A4DynamicFusedMoEMethod:
 
         topk_weights = topk_weights.to(x.dtype)
 
+        # Quantize input for shared experts (and other backend that support it)
+        x_quantized, pertoken_scale = quantize(x)
+
         moe_comm_method = get_forward_context().moe_comm_method
         return moe_comm_method.fused_experts(
             hidden_states=x,
@@ -382,8 +286,8 @@ class AscendW4A4DynamicFusedMoEMethod:
             w2=layer.w2_weight,
             w1_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
-            w1_scale_bias=layer.w13_scale_bias,
-            w2_scale_bias=layer.w2_scale_bias,
+            w1_scale_bias=getattr(layer, 'w13_scale_bias', None),
+            w2_scale_bias=getattr(layer, 'w2_scale_bias', None),
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             use_int4_w4a8=True,
@@ -391,46 +295,17 @@ class AscendW4A4DynamicFusedMoEMethod:
             log2phy=log2phy,
             global_redundant_expert_num=global_redundant_expert_num,
             shared_experts=shared_experts,
-            quantized_x_for_share=quantized_x_for_share,
-            dynamic_scale_for_share=dynamic_scale_for_share,
+            quantized_x_for_share=x_quantized,
+            dynamic_scale_for_share=pertoken_scale,
             dynamic_eplb=self.dynamic_eplb)
 
-    def process_scale(self, weight: torch.Tensor, scale, per_group_scale):
+    def process_scale(self, weight: torch.Tensor, scale):
         scale = scale.transpose(1, 2).contiguous()
-        if self.is_per_channel_weight:
-            scale_np = scale.cpu().numpy()
-            scale_np.dtype = np.uint32
-            scale_uint64_tensor = torch.from_numpy(scale_np.astype(
-                np.int64)).npu()
-            return scale_uint64_tensor, None
-        per_group_scale = per_group_scale.transpose(1, 2).contiguous()
-        group_num, k, n = weight.shape
-        # the weight of the new version is reduced by half by pack n, so it needs to be restored
-        if self.new_quant_version:
-            n = n * 2
-        per_group_scale = per_group_scale.reshape(group_num, -1, n)
-        group_num, quantgroup_num, n = per_group_scale.shape
-        bias = None
-        if not self.new_quant_version:
-            weight_high = weight.to(torch.float32).reshape([group_num, quantgroup_num, -1, n]) * \
-                per_group_scale.reshape([group_num, quantgroup_num, 1, n])
-            weight_high = weight_high.reshape([group_num, k, n])
-            bias = 8 * (weight_high.to(torch.float32) * scale).sum(axis=1)
-        scale_fp32 = (scale * per_group_scale).to(torch.float16).to(
-            torch.float32)
-        scale_fp32_np = scale_fp32.cpu().numpy()
-        scale_fp32_np.dtype = np.uint32
-        sscale_uint64 = np.zeros((group_num, quantgroup_num, n * 2),
-                                 dtype=np.uint32)
-
-        sscale_uint64[..., ::2] = scale_fp32_np
-
-        sscale_uint64_buffer = np.frombuffer(sscale_uint64.tobytes(),
-                                             dtype=np.int64).copy()
-        sscale_uint64_tensor = torch.from_numpy(sscale_uint64_buffer).reshape(
-            group_num, quantgroup_num, n)
-        sscale_uint64_tensor = sscale_uint64_tensor.npu()
-        return sscale_uint64_tensor, bias
+        scale_np = scale.cpu().numpy()
+        scale_np.dtype = np.uint32
+        scale_uint64_tensor = torch.from_numpy(scale_np.astype(
+            np.int64)).npu()
+        return scale_uint64_tensor, None
 
     def update_bias(self, layer, w13_bias, w2_bias):
         if self.new_quant_version:
@@ -439,10 +314,12 @@ class AscendW4A4DynamicFusedMoEMethod:
             layer.w2_scale_bias.data = layer.w2_scale_bias.data.transpose(
                 1, 2).contiguous().sum(axis=1)
         else:
-            w13_scale_bias = torch.nn.Parameter(w13_bias, requires_grad=False)
-            layer.register_parameter("w13_scale_bias", w13_scale_bias)
-            w2_scale_bias = torch.nn.Parameter(w2_bias, requires_grad=False)
-            layer.register_parameter("w2_scale_bias", w2_scale_bias)
+            if w13_bias is not None:
+                w13_scale_bias = torch.nn.Parameter(w13_bias, requires_grad=False)
+                layer.register_parameter("w13_scale_bias", w13_scale_bias)
+            if w2_bias is not None:
+                w2_scale_bias = torch.nn.Parameter(w2_bias, requires_grad=False)
+                layer.register_parameter("w2_scale_bias", w2_scale_bias)
 
     def pack_to_int32(self, weight: torch.Tensor):
         if self.new_quant_version:
@@ -462,21 +339,20 @@ class AscendW4A4DynamicFusedMoEMethod:
             layer.w2_weight.data = layer.w2_weight.data.transpose(
                 1, 2).contiguous()
 
-        w13_weight_scale_second = layer.w13_weight_scale_second.data if hasattr(
-            layer, "w13_weight_scale_second") else None
-        w2_weight_scale_second = layer.w2_weight_scale_second.data if hasattr(
-            layer, "w2_weight_scale_second") else None
         layer.w13_weight_scale.data, w13_bias = self.process_scale(
-            layer.w13_weight, layer.w13_weight_scale.data,
-            w13_weight_scale_second)
+            layer.w13_weight, layer.w13_weight_scale.data)
+            
         layer.w2_weight_scale.data, w2_bias = self.process_scale(
-            layer.w2_weight, layer.w2_weight_scale.data,
-            w2_weight_scale_second)
+            layer.w2_weight, layer.w2_weight_scale.data)
+
+        # Remove redundant attributes if they exist (cleanup)
         if hasattr(layer, "w13_weight_scale_second"):
-            # scale_second is no longer used, release this part of the memory
             del layer.w13_weight_scale_second
+        if hasattr(layer, "w2_weight_scale_second"):
             del layer.w2_weight_scale_second
+        if hasattr(layer, "w13_weight_offset_second"):
             del layer.w13_weight_offset_second
+        if hasattr(layer, "w2_weight_offset_second"):
             del layer.w2_weight_offset_second
 
         self.update_bias(layer, w13_bias, w2_bias)
