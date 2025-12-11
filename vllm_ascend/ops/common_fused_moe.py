@@ -369,6 +369,22 @@ class AscendFusedMoE(FusedMoE):
             loaded_weight = loaded_weight.transpose(0, 1).contiguous()
         return loaded_weight, shard_dim
 
+    def _pack_if_needed(self, expert_data: torch.Tensor,
+                        loaded_weight: torch.Tensor) -> torch.Tensor:
+        """
+        Pack loaded_weight if its shape is double of expert_data in the first dimension.
+        This handles the case where checkpoint contains unpacked int8 weights but model expects packed int4.
+        """
+        if (expert_data.dtype == torch.int8 and loaded_weight.dtype == torch.int8
+                and expert_data.shape[0] * 2 == loaded_weight.shape[0]
+                and expert_data.shape[1] == loaded_weight.shape[1]):
+            # Pack 2 int8s into 1 int8 along dimension 0
+            # Assuming little endian packing: first element in lower 4 bits
+            low = loaded_weight[0::2] & 0x0F
+            high = loaded_weight[1::2] & 0x0F
+            return low | (high << 4)
+        return loaded_weight
+
     def _load_w13(self,
                   expert_data: torch.Tensor,
                   shard_dim: int,
@@ -380,6 +396,10 @@ class AscendFusedMoE(FusedMoE):
         # gate_up_proj: "MergedColumnParallel", so tp sharding on output_dim
         loaded_weight, shard_dim = self.transpose_weight(
             loaded_weight, expert_data, shard_dim)
+
+        # Try to pack before narrowing if shapes mismatch due to packing
+        loaded_weight = self._pack_if_needed(expert_data, loaded_weight)
+
         shard_size = expert_data.shape[shard_dim] // 2
         if not load_full:
             loaded_weight = loaded_weight.narrow(shard_dim,
@@ -406,6 +426,10 @@ class AscendFusedMoE(FusedMoE):
         # Narrow parameter and load.
         loaded_weight, shard_dim = self.transpose_weight(
             loaded_weight, expert_data, shard_dim)
+
+        # Try to pack before narrowing if shapes mismatch due to packing
+        loaded_weight = self._pack_if_needed(expert_data, loaded_weight)
+
         shard_size = expert_data.shape[shard_dim]
         if not load_full:
             loaded_weight = loaded_weight.narrow(shard_dim,
