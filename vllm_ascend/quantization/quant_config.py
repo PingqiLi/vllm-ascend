@@ -398,6 +398,9 @@ class AscendFusedMoEMethod(FusedMoEMethodBase):
         self.quant_method = get_quant_method(quant_config.quant_description,
                                              prefix, "moe",
                                              packed_modules_mapping)
+        self.quant_method.quant_config = quant_config
+        self.quant_method.prefix = prefix
+        self.quant_method.packed_modules_mapping = packed_modules_mapping
 
     def create_weights(
         self,
@@ -412,28 +415,7 @@ class AscendFusedMoEMethod(FusedMoEMethodBase):
             num_experts, intermediate_size_per_partition, hidden_size,
             params_dtype)
         
-        # Check if w2 (down_proj) is FLOAT
-        is_w2_float = False
-        proj_name = self.prefix.split(".")[-1]
-        if proj_name in self.packed_modules_mapping:
-            shard_list = self.packed_modules_mapping[proj_name]
-            # Assuming down_proj is the last one in the list (index 2 for qwen3_moe)
-            if len(shard_list) > 2:
-                down_proj_suffix = shard_list[2]
-                down_proj_full_name = self.prefix.replace(proj_name, down_proj_suffix)
-                down_proj_quant = self.quant_config.quant_description.get(down_proj_full_name + ".weight")
-                print(f"{down_proj_full_name + '.weight'}: {down_proj_quant}")
-                if down_proj_quant == "FLOAT" or down_proj_quant is None:
-                    is_w2_float = True
-                    # Recreate w2_weight as Float/BF16
-                    # Use original params_dtype for float weights (usually bf16/fp16)
-                    # Note: w2_weight shape in get_weight is (Experts, N, K) = (E, Hidden, Inter)
-                    weight_param["w2_weight"] = torch.empty(num_experts,
-                                                            hidden_size,
-                                                            intermediate_size_per_partition,
-                                                            dtype=params_dtype)
-        
-        if is_w2_float:
+        if getattr(self.quant_method, "is_w2_float", False):
             layer.is_w2_float = True
 
         for param_key, param_value in weight_param.items():
@@ -449,12 +431,6 @@ class AscendFusedMoEMethod(FusedMoEMethodBase):
         dynamic_quant_param = self.quant_method.get_dynamic_quant_param(
             num_experts, intermediate_size_per_partition, hidden_size,
             params_dtype)
-
-        if is_w2_float:
-             # Remove w2 scale params
-             keys_to_remove = [k for k in dynamic_quant_param.keys() if 'w2_' in k]
-             for k in keys_to_remove:
-                 del dynamic_quant_param[k]
 
         for param_key, param_value in dynamic_quant_param.items():
             param = torch.nn.Parameter(param_value, requires_grad=False)

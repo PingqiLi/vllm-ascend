@@ -72,13 +72,10 @@ def to_nz(weight_i32):
     # assert weight_nz.to(torch.float32).abs().sum() > 0
     return weight_nz
 
-
 def pack_to_int32_moe(weight: torch.Tensor):
     assert -8 <= weight.min()
     assert weight.max() <= 7
     return torch_npu.npu_quantize(weight.to(torch.float32), torch.tensor([1.]).npu(), None, torch.quint4x2, -1, False)
-
-
 
 def quantize(
     x: torch.Tensor,
@@ -87,14 +84,32 @@ def quantize(
     return x_quantized_int4, activation_scale
 
 
+def manual_w8a8_dynamic_quant(x: torch.Tensor):
+    # x: [num_tokens, hidden_dim]
+    # per-token quantization (symmetric)
+    # scale: [num_tokens, 1]
+    
+    # Calculate scale: max(abs(x)) / 127
+    scale = x.abs().max(dim=-1, keepdim=True)[0] / 127.0
+    # scale = scale.to(x.dtype) # match input dtype (e.g. bf16) -> GMM requires float32 scale
+    scale = scale.to(torch.float32)
+
+    # Quantize: x / scale
+    # avoid division by zero
+    scale_safe = torch.where(scale == 0, torch.ones_like(scale), scale)
+    x_quant = (x / scale_safe).round().clamp(-127, 127).to(torch.int8)
+    
+    return x_quant, scale.squeeze(-1)
+
+
 def fused_experts(x,
-                         w1,
-                         w1_scale,
-                         w2,
-                         w2_scale,
-                         topk_weights,
-                         topk_ids,
-                         global_num_experts):
+                  w1,
+                  w1_scale,
+                  w2,
+                  w2_scale,
+                  topk_weights,
+                  topk_ids,
+                  global_num_experts):
     original_dtype = x.dtype
 
     expanded_x, expanded_row_idx, expert_token_count, _ = torch_npu.npu_moe_init_routing_v2(
@@ -113,26 +128,60 @@ def fused_experts(x,
     )
     expert_token_count = expert_token_count.to(torch.int64)
 
-    x_quantized, pertoken_scale = quantize(expanded_x)
-    print(f"DEBUG: fused_experts x_quantized: {x_quantized.shape}, w1: {w1.shape}, w1_scale: {w1_scale.shape}")
-
-    expanded_x = torch_npu.npu_grouped_matmul(
-        x=[x_quantized],
-        weight=[w1],
-        scale=[w1_scale],
-        bias=None,
-        per_token_scale=[pertoken_scale],
-        split_item=2,
-        group_list_type=1,
-        group_type=0,
-        group_list=expert_token_count,
-        output_dtype=original_dtype)[0]
+    if w1_scale is not None:
+        x_quantized, pertoken_scale = quantize(expanded_x)
+        expanded_x = torch_npu.npu_grouped_matmul(
+            x=[x_quantized],
+            weight=[w1],
+            scale=[w1_scale],
+            bias=None,
+            per_token_scale=[pertoken_scale],
+            split_item=2,
+            group_list_type=1,
+            group_type=0,
+            group_list=expert_token_count,
+            output_dtype=original_dtype)[0]
+    else:
+        # Float execution for w1
+        expanded_x = torch_npu.npu_grouped_matmul(
+            x=[expanded_x],
+            weight=[w1],
+            scale=[],
+            bias=None,
+            per_token_scale=[],
+            split_item=2,
+            group_list_type=1,
+            group_type=0,
+            group_list=expert_token_count,
+            output_dtype=original_dtype)[0]
 
     # act_fn: swiglu
     expanded_x = torch_npu.npu_swiglu(expanded_x)
 
+    w2_is_int8 = False
+    if w2.dtype == torch.int8: 
+        # Heuristic: if shape matches w8a8 (not packed)
+        # Packed w4a4 (int8 storage) usually has halved dimensions. 
+        # w2 (2048, 768) -> packed (1024, 384).
+        # We can check global_experts or just consistency.
+        # But simpler: check if we attached a flag or infer from scale?
+        # Let's assume w8a8 if scale is not None and we can't pack it?
+        # Actually, simpler: if w2.shape[1] == 768 (full size) vs 384 (packed).
+        # intermediate_size/2 = 384. 
+        # expert_token_count logic doesn't change weight shape.
+        pass
+
     if w2_scale is not None:
-        x_quantized, pertoken_scale = quantize(expanded_x)
+        if w2_scale.dtype == torch.float32 and original_dtype == torch.bfloat16:
+            w2_scale = w2_scale.to(original_dtype)
+        # Check if w2 is W8A8 (by checking shape match)
+        # If w2 dimension matches x dimension (768), it is unpacked (W8A8).
+        # If w2 was packed (W4A4), its dimension would be smaller (e.g. 96 or 384).
+        is_w8a8_w2 = w2.shape[1] == expanded_x.shape[-1]
+        if is_w8a8_w2:
+             x_quantized, pertoken_scale = manual_w8a8_dynamic_quant(expanded_x)
+        else:
+             x_quantized, pertoken_scale = quantize(expanded_x)
 
         expanded_x = torch_npu.npu_grouped_matmul(
             x=[x_quantized],
@@ -265,18 +314,14 @@ class AscendW4A4DynamicFusedMoEMethod:
         self.transpose_weight = True
         self.ep_group = get_ep_group()
         vllm_config = get_current_vllm_config()
+        self.quant_config = vllm_config.quant_config
         self.group_size = vllm_config.quant_config.quant_description.get("group_size", 0)
         # NOTE: the weights are quantized from bf16 to int4 through a per-channel quantization process
         self.is_per_channel_weight = self.group_size == 0
-        quant_version = vllm_config.quant_config.quant_description.get("version", "0")
         # NOTE: new quantize weights: 2 int4 pack into int8
-        self.new_quant_version = quant_version == "1.0.0"
         self.tp_size = 1 if vllm_config.parallel_config.enable_expert_parallel else self.ep_group.world_size
         ascend_config = get_ascend_config()
         self.dynamic_eplb = ascend_config.dynamic_eplb or ascend_config.expert_map_record_path
-        if self.new_quant_version and self.tp_size > 16:
-            raise ValueError(
-                "The current weight does not support moe part tp>16.")
 
         try:
             device_group = get_mc2_group().device_group
@@ -288,27 +333,87 @@ class AscendW4A4DynamicFusedMoEMethod:
         except AttributeError:
             self.moe_all_to_all_group_name = ""
 
+
+    def _detect_quant_types(self):
+        # Default assume quantized
+        self.w13_is_float = False
+        self.w2_is_float = False
+        self.w2_is_int8 = False
+
+        # Detect W8A8 for down_proj using global config if specific check fails or as fallback
+        if hasattr(self.quant_config, "quant_description"):
+            down_proj_type = self.quant_config.quant_description.get(
+                "model.layers.*.mlp.experts.*.down_proj.weight")
+            if down_proj_type == "W8A8_DYNAMIC":
+                self.w2_is_int8 = True
+
+        if hasattr(self, "prefix") and hasattr(self, "packed_modules_mapping") and hasattr(self, "quant_config"):
+            proj_name = self.prefix.split(".")[-1]
+            if proj_name in self.packed_modules_mapping:
+                shard_list = self.packed_modules_mapping[proj_name]
+                # Assume last one is w2 (down_proj), others are w13 (gate/up)
+                if len(shard_list) >= 2:
+                    # Check w13 parts
+                    w13_shards = shard_list[:-1] # All except last
+                    w13_is_float = True
+                    # If any part of w13 is NOT float, we assume whole w13 is NOT float (or handle mixed? usually consistent)
+                    for suffix in w13_shards:
+                        full_name = self.prefix.replace(proj_name, suffix)
+                        quant_type = self.quant_config.quant_description.get(full_name + ".weight")
+                        if quant_type != "FLOAT" and quant_type is not None:
+                            w13_is_float = False
+                            break
+                    self.w13_is_float = w13_is_float
+
+                    # Check w2 part
+                    w2_suffix = shard_list[-1]
+                    w2_full_name = self.prefix.replace(proj_name, w2_suffix)
+                    w2_quant_type = self.quant_config.quant_description.get(w2_full_name + ".weight")
+                    if w2_quant_type == "FLOAT" or w2_quant_type is None:
+                        self.w2_is_float = True
+                    elif w2_quant_type == "W8A8_DYNAMIC":
+                        self.w2_is_int8 = True
+                    elif w2_quant_type == "W8A8_DYNAMIC":
+                        self.w2_is_int8 = True
+
     def get_weight(self, num_experts: int,
                    intermediate_size_per_partition: int, hidden_sizes: int,
                    params_dtype: torch.dtype) -> Dict[str, Any]:
         param_dict = {}
-        if self.new_quant_version:
-            w13_output_size = intermediate_size_per_partition
-            w2_output_size = hidden_sizes // 2
-            w2_input_size = intermediate_size_per_partition // 2
-        else:
-            w13_output_size = 2 * intermediate_size_per_partition
-            w2_output_size = hidden_sizes
-            w2_input_size = intermediate_size_per_partition
 
-        param_dict["w13_weight"] = torch.empty(num_experts,
+        self._detect_quant_types()
+
+        # Always use full unpacked sizes for loading
+        w13_output_size = 2 * intermediate_size_per_partition
+        w2_output_size = hidden_sizes
+        w2_input_size = intermediate_size_per_partition
+
+        if self.w13_is_float:
+             param_dict["w13_weight"] = torch.empty(num_experts,
                                                w13_output_size,
                                                hidden_sizes,
-                                               dtype=torch.int8)
-        param_dict["w2_weight"] = torch.empty(num_experts,
-                                              w2_output_size,
-                                              w2_input_size,
-                                              dtype=torch.int8)
+                                               dtype=params_dtype)
+        else:
+            param_dict["w13_weight"] = torch.empty(num_experts,
+                                                w13_output_size,
+                                                hidden_sizes,
+                                                dtype=torch.int8)
+
+        if self.w2_is_float:
+            param_dict["w2_weight"] = torch.empty(num_experts,
+                                                  w2_output_size,
+                                                  w2_input_size,
+                                                  dtype=params_dtype)
+        elif getattr(self, "w2_is_int8", False):
+             param_dict["w2_weight"] = torch.empty(num_experts,
+                                                   w2_output_size,
+                                                   w2_input_size, 
+                                                   dtype=torch.int8)
+        else:
+            param_dict["w2_weight"] = torch.empty(num_experts,
+                                                  w2_output_size,
+                                                  w2_input_size,
+                                                  dtype=torch.int8)
         return param_dict
 
     def get_dynamic_quant_param(self, num_experts: int,
@@ -317,14 +422,10 @@ class AscendW4A4DynamicFusedMoEMethod:
                                 params_dtype: torch.dtype) -> Dict[str, Any]:
         param_dict = {}
         
-        if self.new_quant_version:
-            w13_output_size = intermediate_size_per_partition
-            w2_output_size = hidden_sizes // 2
-            w2_input_size = intermediate_size_per_partition // 2
-        else:
-            w13_output_size = 2 * intermediate_size_per_partition
-            w2_output_size = hidden_sizes
-            w2_input_size = intermediate_size_per_partition
+        # Consistent with get_weight
+        w13_output_size = 2 * intermediate_size_per_partition
+        w2_output_size = hidden_sizes
+        w2_input_size = intermediate_size_per_partition
 
         # Per-channel quantization scales have last dimension 1
         w13_scale_dim = 1
@@ -345,6 +446,19 @@ class AscendW4A4DynamicFusedMoEMethod:
         param_dict["w2_weight_offset"] = torch.empty(
             (num_experts, w2_output_size, w2_scale_dim),
             dtype=torch.float32)
+        
+        if getattr(self, "w2_is_int8", False):
+            # Override for W8A8 dynamic shapes
+            param_dict["w2_weight_scale"] = torch.empty(
+                    num_experts,
+                    hidden_sizes,
+                    1,
+                    dtype=torch.float32)
+            param_dict["w2_weight_offset"] = torch.empty(
+                num_experts,
+                hidden_sizes,
+                1,
+                dtype=torch.float32)
 
         if not self.is_per_channel_weight:
             param_dict["w13_weight_scale_second"] = torch.empty(
@@ -369,16 +483,17 @@ class AscendW4A4DynamicFusedMoEMethod:
                 w2_input_size // self.group_size,
                 dtype=torch.float32)
 
-        if self.new_quant_version:
-            param_dict["w13_scale_bias"] = torch.empty(
-                num_experts,
-                w13_output_size,
-                1,
-                dtype=torch.float32)
-            param_dict["w2_scale_bias"] = torch.empty(num_experts,
-                                                      w2_output_size,
-                                                      16 // self.tp_size,
-                                                      dtype=torch.float32)
+        if getattr(self, "w13_is_float", False):
+            # Remove w13 scale params
+             keys_to_remove = [k for k in param_dict.keys() if 'w13_' in k]
+             for k in keys_to_remove:
+                 del param_dict[k]
+
+        if getattr(self, "w2_is_float", False):
+             # Remove w2 scale params
+             keys_to_remove = [k for k in param_dict.keys() if 'w2_' in k]
+             for k in keys_to_remove:
+                 del param_dict[k]
 
         return param_dict
 
@@ -436,7 +551,7 @@ class AscendW4A4DynamicFusedMoEMethod:
 
         return fused_experts(x=x,
                              w1=layer.w13_weight,
-                             w1_scale=layer.w13_weight_scale,
+                             w1_scale=getattr(layer, 'w13_weight_scale', None),
                              w2=layer.w2_weight,
                              w2_scale=getattr(layer, 'w2_weight_scale', None),
                              topk_weights=topk_weights,
@@ -446,28 +561,29 @@ class AscendW4A4DynamicFusedMoEMethod:
     def process_scale(self, weight: torch.Tensor, scale, per_group_scale):
         scale = scale.transpose(1, 2).contiguous()
         if self.is_per_channel_weight:
-            scale_np = scale.cpu().numpy()
-            scale_np.dtype = np.uint32
-            scale_uint64_tensor = torch.from_numpy(scale_np.astype(
-                np.int64)).npu()
+            # Match Reference convert_scales logic exactly
+            E, _, N = scale.shape  # scale is (E, 1, Out)
+            scale_fp32 = scale.to(torch.float32)
+            scale_fp32_np = scale_fp32.cpu().numpy()
+            scale_fp32_np.dtype = np.uint32
+            
+            # Pack into uint64 by interleaving with zeros
+            scale_uint64 = np.zeros((E, 1, N * 2), dtype=np.uint32)
+            scale_uint64[..., ::2] = scale_fp32_np.reshape(E, 1, N)
+            
+            scale_uint64.dtype = np.int64
+            scale_uint64_tensor = torch.from_numpy(scale_uint64).npu()
+            
             return scale_uint64_tensor, None
 
         # Handle group quantization
         per_group_scale = per_group_scale.transpose(1, 2).contiguous()
         group_num, k, n = weight.shape
-        if self.new_quant_version:
-            n = n * 2
+        n = n * 2
         per_group_scale = per_group_scale.reshape(group_num, -1, n)
         group_num, quantgroup_num, n = per_group_scale.shape
         
         bias = None
-        if not self.new_quant_version:
-            # Reconstruct high precision weight for bias calculation
-            # Note: This part might be computationally expensive
-            weight_high = weight.to(torch.float32).reshape([group_num, quantgroup_num, -1, n]) * \
-                per_group_scale.reshape([group_num, quantgroup_num, 1, n])
-            weight_high = weight_high.reshape([group_num, k, n])
-            bias = 8 * (weight_high.to(torch.float32) * scale).sum(axis=1)
 
         scale_fp32 = (scale * per_group_scale).to(torch.float16).to(torch.float32)
         scale_fp32_np = scale_fp32.cpu().numpy()
@@ -476,8 +592,8 @@ class AscendW4A4DynamicFusedMoEMethod:
         sscale_uint64 = np.zeros((group_num, quantgroup_num, n * 2), dtype=np.uint32)
         sscale_uint64[..., ::2] = scale_fp32_np
         
-        sscale_uint64_buffer = np.frombuffer(sscale_uint64.tobytes(), dtype=np.int64).copy()
-        sscale_uint64_tensor = torch.from_numpy(sscale_uint64_buffer).reshape(
+        sscale_uint64.dtype = np.int64
+        sscale_uint64_tensor = torch.from_numpy(sscale_uint64).reshape(
             group_num, quantgroup_num, n)
         return sscale_uint64_tensor.npu(), bias
 
@@ -507,38 +623,59 @@ class AscendW4A4DynamicFusedMoEMethod:
         return torch_npu.npu_convert_weight_to_int4pack(weight.to(torch.int32))
 
     def process_weights_after_loading(self, layer):
-        print(f"DEBUG: Transposing weights. Pre-transpose w13: {layer.w13_weight.data.shape}")
-        layer.w13_weight.data = layer.w13_weight.data.transpose(1, 2).contiguous()
-        layer.w2_weight.data = layer.w2_weight.data.transpose(1, 2).contiguous()
-        print(f"DEBUG: Post-transpose w13: {layer.w13_weight.data.shape}")
-
-        layer.w13_weight.data = pack_to_int32_moe(layer.w13_weight.data)
-        
-        is_w2_float = getattr(layer, "is_w2_float", False)
-        if not is_w2_float and hasattr(layer, "w2_weight_scale"):
-             layer.w2_weight.data = pack_to_int32_moe(layer.w2_weight.data)
-
-
-
-
-        w13_weight_scale_second = layer.w13_weight_scale_second.data if hasattr(
-            layer, "w13_weight_scale_second") else None
-
-        layer.w13_weight_scale.data, w13_bias = self.process_scale(
-            layer.w13_weight, layer.w13_weight_scale.data, w13_weight_scale_second)
-
-
-        # is_w2_float has been checked above
-        if not is_w2_float:
-            w2_weight_scale_second = layer.w2_weight_scale_second.data if hasattr(
-                layer, "w2_weight_scale_second") else None
-            layer.w2_weight_scale.data, w2_bias = self.process_scale(
-                layer.w2_weight, layer.w2_weight_scale.data, w2_weight_scale_second)
+       # Only pack if quantized
+        if not getattr(self, "w13_is_float", False):
+            layer.w13_weight.data = layer.w13_weight.data.transpose(1, 2).contiguous()
+            layer.w13_weight.data = pack_to_int32_moe(layer.w13_weight.data)
+            
+            w13_weight_scale_second = layer.w13_weight_scale_second.data if hasattr(
+                layer, "w13_weight_scale_second") else None
+            layer.w13_weight_scale.data, w13_bias = self.process_scale(
+                layer.w13_weight, layer.w13_weight_scale.data, w13_weight_scale_second)
         else:
-            w2_bias = None
-            if hasattr(layer, "w2_weight_scale"):
-                print("DEBUG: Deleting w2_weight_scale because is_w2_float is True")
+            # Float execution also wants NZ format for w13?
+            if is_enable_nz():
+                 layer.w13_weight.data = torch_npu.npu_format_cast(
+                    layer.w13_weight.data, ACL_FORMAT_FRACTAL_NZ)
+            w13_bias = None
+
+        
+        # Only pack if quantized
+        if not getattr(self, "w2_is_float", False):
+            if getattr(self, "w2_is_int8", False):
+                 # W8A8 specific processing
+                 layer.w2_weight.data = layer.w2_weight.data.transpose(1, 2).contiguous()
+                 if is_enable_nz():
+                     layer.w2_weight.data = torch_npu.npu_format_cast(
+                         layer.w2_weight.data, ACL_FORMAT_FRACTAL_NZ)
+                 # Handle Scale
+                 layer.w2_weight_scale.data = layer.w2_weight_scale.data.view(
+                        layer.w2_weight_scale.data.shape[0], -1)
+                 # W8A8 usually wants flat scale or specific shape?
+                 # W8A8DynamicFusedMoEMethod uses view(.., -1).
+                 # And offsets. 
+                 layer.w2_weight_offset.data = layer.w2_weight_offset.data.view(
+                        layer.w2_weight_offset.data.shape[0], -1)
+                 
+                 w2_bias = None 
+            else:
+                # W4A4 packing
+                layer.w2_weight.data = layer.w2_weight.data.transpose(1, 2).contiguous()
+                layer.w2_weight.data = pack_to_int32_moe(layer.w2_weight.data)
+    
+                w2_weight_scale_second = layer.w2_weight_scale_second.data if hasattr(
+                    layer, "w2_weight_scale_second") else None
+    
+                layer.w2_weight_scale.data, w2_bias = self.process_scale(
+                    layer.w2_weight, layer.w2_weight_scale.data, w2_weight_scale_second)
+        else:
+             if hasattr(layer, "w2_weight_scale"):
                 del layer.w2_weight_scale
+             if is_enable_nz():
+                 layer.w2_weight.data = torch_npu.npu_format_cast(
+                    layer.w2_weight.data, ACL_FORMAT_FRACTAL_NZ)
+             w2_bias = None
+
 
         # Cleanup
         if hasattr(layer, "w13_weight_scale_second"):
@@ -553,10 +690,8 @@ class AscendW4A4DynamicFusedMoEMethod:
         self.update_bias(layer, w13_bias, w2_bias)
 
         if is_enable_nz():
-            layer.w13_weight.data = to_nz(layer.w13_weight.data)
-            if not is_w2_float:
+            if not getattr(self, "w13_is_float", False):
+                layer.w13_weight.data = to_nz(layer.w13_weight.data)
+
+            if not getattr(self, "w2_is_float", False) and not getattr(self, "w2_is_int8", False):
                 layer.w2_weight.data = to_nz(layer.w2_weight.data)
-            else:
-                 # Assuming float weights also need NZ format for grouped matmul
-                layer.w2_weight.data = torch_npu.npu_format_cast(
-                    layer.w2_weight.data, ACL_FORMAT_FRACTAL_NZ)
