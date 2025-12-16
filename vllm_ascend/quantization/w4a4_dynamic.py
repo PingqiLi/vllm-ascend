@@ -32,6 +32,54 @@ from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, is_enable_nz
 from .w4a4_flatquant_dynamic import pack_int4_weights
 
 
+def unpack_int32_to_int4_signed(x: torch.Tensor) -> torch.Tensor:
+    assert x.dtype == torch.int32
+    E, K, N_ = x.shape  # N_ = N/8
+
+    # 取出 8 个 4bit
+    out = torch.stack([(x >> (4 * i)) & 0xF for i in range(8)], dim=-1)  # (E,K,M,8)
+
+    # 转成有符号 int4
+    out = out.to(torch.int8)
+    out = torch.where(out >= 8, out - 16, out)  # [-8,7]
+
+    out = out.reshape(E, K, N_ * 8).to(torch.int8)  # (E, K, N)
+    return out
+
+
+def pack_int4_to_int8_signed(x: torch.Tensor) -> torch.Tensor:
+    assert x.dtype == torch.int8
+    E, K, N = x.shape
+    assert N % 2 == 0
+    
+    # 转成无符号补码 [0, 15]
+    x_unsigned = torch.where(x < 0, x + 16, x).to(torch.int32)
+
+    low = x_unsigned[..., 0::2]   # 偶数 -> 低 4 位
+    high = x_unsigned[..., 1::2]  # 奇数 -> 高 4 位
+
+    out = (low | (high << 4)).to(torch.int8)
+    return out
+
+
+def to_nz(weight_i32):
+    assert weight_i32.to(torch.float32).abs().sum() > 0
+    weight = unpack_int32_to_int4_signed(weight_i32)
+    assert weight.to(torch.float32).abs().sum() > 0
+    weight_i8 = pack_int4_to_int8_signed(weight)
+    assert weight_i8.to(torch.float32).abs().sum() > 0
+    weight_nz = torch_npu.npu_format_cast(weight_i8.npu(), 29).view(torch.int32)
+    # assert weight_nz.to(torch.float32).abs().sum() > 0
+    return weight_nz
+
+
+def pack_to_int32_moe(weight: torch.Tensor):
+    assert -8 <= weight.min()
+    assert weight.max() <= 7
+    return torch_npu.npu_quantize(weight.to(torch.float32), torch.tensor([1.]).npu(), None, torch.quint4x2, -1, False)
+
+
+
 def quantize(
     x: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -247,9 +295,11 @@ class AscendW4A4DynamicFusedMoEMethod:
         if self.new_quant_version:
             w13_output_size = intermediate_size_per_partition
             w2_output_size = hidden_sizes // 2
+            w2_input_size = intermediate_size_per_partition // 2
         else:
             w13_output_size = 2 * intermediate_size_per_partition
             w2_output_size = hidden_sizes
+            w2_input_size = intermediate_size_per_partition
 
         param_dict["w13_weight"] = torch.empty(num_experts,
                                                w13_output_size,
@@ -257,7 +307,7 @@ class AscendW4A4DynamicFusedMoEMethod:
                                                dtype=torch.int8)
         param_dict["w2_weight"] = torch.empty(num_experts,
                                               w2_output_size,
-                                              intermediate_size_per_partition,
+                                              w2_input_size,
                                               dtype=torch.int8)
         return param_dict
 
@@ -266,57 +316,67 @@ class AscendW4A4DynamicFusedMoEMethod:
                                 hidden_sizes: int,
                                 params_dtype: torch.dtype) -> Dict[str, Any]:
         param_dict = {}
+        
+        if self.new_quant_version:
+            w13_output_size = intermediate_size_per_partition
+            w2_output_size = hidden_sizes // 2
+            w2_input_size = intermediate_size_per_partition // 2
+        else:
+            w13_output_size = 2 * intermediate_size_per_partition
+            w2_output_size = hidden_sizes
+            w2_input_size = intermediate_size_per_partition
+
         # Per-channel quantization scales have last dimension 1
         w13_scale_dim = 1
         w2_scale_dim = 1
 
         param_dict["w13_weight_scale"] = torch.empty(
-            (num_experts, 2 * intermediate_size_per_partition, w13_scale_dim),
+            (num_experts, w13_output_size, w13_scale_dim),
             dtype=torch.float32)
 
         param_dict["w13_weight_offset"] = torch.empty(
-            (num_experts, 2 * intermediate_size_per_partition, w13_scale_dim),
+            (num_experts, w13_output_size, w13_scale_dim),
             dtype=torch.float32)
 
         param_dict["w2_weight_scale"] = torch.empty(
-            (num_experts, hidden_sizes, w2_scale_dim),
+            (num_experts, w2_output_size, w2_scale_dim),
             dtype=torch.float32)
 
         param_dict["w2_weight_offset"] = torch.empty(
-            (num_experts, hidden_sizes, w2_scale_dim),
+            (num_experts, w2_output_size, w2_scale_dim),
             dtype=torch.float32)
 
         if not self.is_per_channel_weight:
             param_dict["w13_weight_scale_second"] = torch.empty(
                 num_experts,
-                2 * intermediate_size_per_partition,
+                w13_output_size,
                 hidden_sizes // self.group_size,
                 dtype=torch.float32)
             param_dict["w13_weight_offset_second"] = torch.empty(
                 num_experts,
-                2 * intermediate_size_per_partition,
+                w13_output_size,
                 hidden_sizes // self.group_size,
                 dtype=torch.float32)
 
             param_dict["w2_weight_scale_second"] = torch.empty(
                 num_experts,
-                hidden_sizes,
-                intermediate_size_per_partition // self.group_size,
+                w2_output_size,
+                w2_input_size // self.group_size,
                 dtype=torch.float32)
             param_dict["w2_weight_offset_second"] = torch.empty(
                 num_experts,
-                hidden_sizes,
-                intermediate_size_per_partition // self.group_size,
+                w2_output_size,
+                w2_input_size // self.group_size,
                 dtype=torch.float32)
 
         if self.new_quant_version:
             param_dict["w13_scale_bias"] = torch.empty(
                 num_experts,
-                2 * intermediate_size_per_partition,
+                w13_output_size,
                 1,
                 dtype=torch.float32)
             param_dict["w2_scale_bias"] = torch.empty(num_experts,
-                                                      hidden_sizes,
+                                                      w2_output_size,
                                                       16 // self.tp_size,
                                                       dtype=torch.float32)
 
@@ -447,21 +507,19 @@ class AscendW4A4DynamicFusedMoEMethod:
         return torch_npu.npu_convert_weight_to_int4pack(weight.to(torch.int32))
 
     def process_weights_after_loading(self, layer):
-        layer.w13_weight.data = self.pack_to_int32(layer.w13_weight.data)
+        print(f"DEBUG: Transposing weights. Pre-transpose w13: {layer.w13_weight.data.shape}")
+        layer.w13_weight.data = layer.w13_weight.data.transpose(1, 2).contiguous()
+        layer.w2_weight.data = layer.w2_weight.data.transpose(1, 2).contiguous()
+        print(f"DEBUG: Post-transpose w13: {layer.w13_weight.data.shape}")
+
+        layer.w13_weight.data = pack_to_int32_moe(layer.w13_weight.data)
         
         is_w2_float = getattr(layer, "is_w2_float", False)
         if not is_w2_float and hasattr(layer, "w2_weight_scale"):
-             layer.w2_weight.data = self.pack_to_int32(layer.w2_weight.data)
+             layer.w2_weight.data = pack_to_int32_moe(layer.w2_weight.data)
 
-        if self.transpose_weight:
-            print(f"DEBUG: Transposing weights. Pre-transpose w13: {layer.w13_weight.data.shape}")
-            layer.w13_weight.data = layer.w13_weight.data.transpose(
-                1, 2).contiguous()
-            layer.w2_weight.data = layer.w2_weight.data.transpose(
-                1, 2).contiguous()
-            print(f"DEBUG: Post-transpose w13: {layer.w13_weight.data.shape}")
-        else:
-            print(f"DEBUG: NOT Transposing weights. w13: {layer.w13_weight.data.shape}")
+
+
 
         w13_weight_scale_second = layer.w13_weight_scale_second.data if hasattr(
             layer, "w13_weight_scale_second") else None
@@ -495,12 +553,10 @@ class AscendW4A4DynamicFusedMoEMethod:
         self.update_bias(layer, w13_bias, w2_bias)
 
         if is_enable_nz():
-            layer.w13_weight.data = torch_npu.npu_format_cast(
-                layer.w13_weight.data, ACL_FORMAT_FRACTAL_NZ)
+            layer.w13_weight.data = to_nz(layer.w13_weight.data)
             if not is_w2_float:
-                layer.w2_weight.data = torch_npu.npu_format_cast(
-                    layer.w2_weight.data, ACL_FORMAT_FRACTAL_NZ)
+                layer.w2_weight.data = to_nz(layer.w2_weight.data)
             else:
-                # Assuming float weights also need NZ format for grouped matmul
+                 # Assuming float weights also need NZ format for grouped matmul
                 layer.w2_weight.data = torch_npu.npu_format_cast(
                     layer.w2_weight.data, ACL_FORMAT_FRACTAL_NZ)
