@@ -49,6 +49,90 @@ def quantize(
     return x_quantized_int4, activation_scale
 
 
+def fused_experts(x,
+                         w1,
+                         w1_scale,
+                         w2,
+                         w2_scale,
+                         topk_weights,
+                         topk_ids,
+                         global_num_experts):
+    original_dtype = x.dtype
+
+    expanded_x, expanded_row_idx, expert_token_count, _ = torch_npu.npu_moe_init_routing_v2(
+        x,
+        topk_ids,
+        scale=None,
+        active_num=topk_ids.numel(),
+        expert_capacity=-1,
+        expert_num=global_num_experts,
+        drop_pad_mode=0,
+        expert_tokens_num_type=1,
+        expert_tokens_num_flag=True,
+        quant_mode=-1,
+        active_expert_range=[0, global_num_experts],
+        row_idx_type=0,
+    )
+    expert_token_count = expert_token_count.to(torch.int64)
+
+    x_quantized, pertoken_scale = quantize(expanded_x)
+
+    expanded_x = torch_npu.npu_grouped_matmul(
+        x=[x_quantized],
+        weight=[w1],
+        scale=[w1_scale],
+        bias=None,
+        per_token_scale=[pertoken_scale],
+        split_item=2,
+        group_list_type=1,
+        group_type=0,
+        group_list=expert_token_count,
+        output_dtype=original_dtype)[0]
+
+    # act_fn: swiglu
+    expanded_x = torch_npu.npu_swiglu(expanded_x)
+
+    if w2_scale is not None:
+        x_quantized, pertoken_scale = quantize(expanded_x)
+
+        expanded_x = torch_npu.npu_grouped_matmul(
+            x=[x_quantized],
+            weight=[w2],
+            scale=[w2_scale],
+            bias=None,
+            per_token_scale=[pertoken_scale],
+            split_item=2,
+            group_list_type=1,
+            group_type=0,
+            group_list=expert_token_count,
+            output_dtype=original_dtype)[0]
+    else:
+        # Float execution for w2
+        expanded_x = torch_npu.npu_grouped_matmul(
+            x=[expanded_x],
+            weight=[w2],
+            scale=[],
+            bias=None,
+            per_token_scale=[],
+            split_item=2,
+            group_list_type=1,
+            group_type=0,
+            group_list=expert_token_count,
+            output_dtype=original_dtype)[0]
+
+    x = torch_npu.npu_moe_finalize_routing(
+        expanded_x,
+        skip1=None,
+        skip2=None,
+        bias=None,
+        scales=topk_weights.to(original_dtype),
+        expanded_src_to_dst_row=expanded_row_idx,
+        export_for_source_row=topk_ids,
+        drop_pad_mode=2,
+    )
+    return x
+
+
 
 class AscendW4A4DynamicLinearMethod:
     input_size = 0
@@ -301,25 +385,14 @@ class AscendW4A4DynamicFusedMoEMethod:
         # Quantize input for shared experts (and other backend that support it)
         x_quantized, pertoken_scale = quantize(x)
 
-        moe_comm_method = get_forward_context().moe_comm_method
-        return moe_comm_method.fused_experts(
-            hidden_states=x,
-            w1=layer.w13_weight,
-            w2=layer.w2_weight,
-            w1_scale=layer.w13_weight_scale,
-            w2_scale=layer.w2_weight_scale,
-            w1_scale_bias=getattr(layer, 'w13_scale_bias', None),
-            w2_scale_bias=getattr(layer, 'w2_scale_bias', None),
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            use_int4_w4a8=True,
-            expert_map=expert_map,
-            log2phy=log2phy,
-            global_redundant_expert_num=global_redundant_expert_num,
-            shared_experts=shared_experts,
-            quantized_x_for_share=x_quantized,
-            dynamic_scale_for_share=pertoken_scale,
-            dynamic_eplb=self.dynamic_eplb)
+        return fused_experts(x=x,
+                             w1=layer.w13_weight,
+                             w1_scale=layer.w13_weight_scale,
+                             w2=layer.w2_weight,
+                             w2_scale=getattr(layer, 'w2_weight_scale', None),
+                             topk_weights=topk_weights,
+                             topk_ids=topk_ids,
+                             global_num_experts=global_num_experts)
 
     def process_scale(self, weight: torch.Tensor, scale, per_group_scale):
         scale = scale.transpose(1, 2).contiguous()
@@ -360,11 +433,14 @@ class AscendW4A4DynamicFusedMoEMethod:
         return sscale_uint64_tensor.npu(), bias
 
     def update_bias(self, layer, w13_bias, w2_bias):
-        if self.new_quant_version:
-            layer.w13_scale_bias.data = layer.w13_scale_bias.data.transpose(
-                1, 2).contiguous().sum(axis=1)
-            layer.w2_scale_bias.data = layer.w2_scale_bias.data.transpose(
-                1, 2).contiguous().sum(axis=1)
+        if self.group_size != 0:
+            if hasattr(layer, "w13_scale_bias"):
+                layer.w13_scale_bias.data = layer.w13_scale_bias.data.transpose(
+                    1, 2).contiguous().sum(axis=1)
+
+            if hasattr(layer, "w2_scale_bias"):
+                layer.w2_scale_bias.data = layer.w2_scale_bias.data.transpose(
+                    1, 2).contiguous().sum(axis=1)
         else:
             if w13_bias is not None:
                 w13_scale_bias = torch.nn.Parameter(w13_bias, requires_grad=False)
@@ -393,14 +469,18 @@ class AscendW4A4DynamicFusedMoEMethod:
 
         w13_weight_scale_second = layer.w13_weight_scale_second.data if hasattr(
             layer, "w13_weight_scale_second") else None
-        w2_weight_scale_second = layer.w2_weight_scale_second.data if hasattr(
-            layer, "w2_weight_scale_second") else None
 
         layer.w13_weight_scale.data, w13_bias = self.process_scale(
             layer.w13_weight, layer.w13_weight_scale.data, w13_weight_scale_second)
-            
-        layer.w2_weight_scale.data, w2_bias = self.process_scale(
-            layer.w2_weight, layer.w2_weight_scale.data, w2_weight_scale_second)
+
+        is_w2_float = getattr(layer, "is_w2_float", False)
+        if not is_w2_float:
+            w2_weight_scale_second = layer.w2_weight_scale_second.data if hasattr(
+                layer, "w2_weight_scale_second") else None
+            layer.w2_weight_scale.data, w2_bias = self.process_scale(
+                layer.w2_weight, layer.w2_weight_scale.data, w2_weight_scale_second)
+        else:
+            w2_bias = None
 
         # Cleanup
         if hasattr(layer, "w13_weight_scale_second"):
@@ -417,7 +497,14 @@ class AscendW4A4DynamicFusedMoEMethod:
         if is_enable_nz():
             layer.w13_weight.data = torch_npu.npu_format_cast(
                 layer.w13_weight.data, ACL_FORMAT_FRACTAL_NZ)
-            layer.w2_weight.data = torch_npu.npu_format_cast(
-                layer.w2_weight.data, ACL_FORMAT_FRACTAL_NZ)
+            if not is_w2_float:
+                layer.w2_weight.data = torch_npu.npu_format_cast(
+                    layer.w2_weight.data, ACL_FORMAT_FRACTAL_NZ)
+            else:
+                # Assuming float weights also need NZ format for grouped matmul
+                layer.w2_weight.data = torch_npu.npu_format_cast(
+                    layer.w2_weight.data, ACL_FORMAT_FRACTAL_NZ)
+
         layer.w13_weight.data = self.pack_to_int32(layer.w13_weight.data)
-        layer.w2_weight.data = self.pack_to_int32(layer.w2_weight.data)
+        if hasattr(layer, "w2_weight_scale"):
+             layer.w2_weight.data = self.pack_to_int32(layer.w2_weight.data)

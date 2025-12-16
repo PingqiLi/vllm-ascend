@@ -21,6 +21,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional
 import torch
 from vllm.config import get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_rank
+from vllm.logger import logger
 from vllm.model_executor.layers.fused_moe import (FusedMoE, FusedMoEMethodBase,
                                                   FusedMoeWeightScaleSupported)
 from vllm.model_executor.layers.linear import (LinearBase, LinearMethodBase,
@@ -153,10 +154,10 @@ class AscendQuantConfig(QuantizationConfig):
                 if is_skipped is None:
                     is_skipped = is_shard_skipped
                 elif is_shard_skipped != is_skipped:
-                    raise ValueError(
+                    logger.warning(
                         f"Detected some but not all shards of {prefix} "
-                        "are quantized. All shards of fused layers "
-                        "to have the same precision.")
+                        "are quantized. Assuming quantized.")
+                    return False
         else:
             is_skipped = self.quant_description[prefix + '.weight'] == "FLOAT"
 
@@ -391,6 +392,9 @@ class AscendFusedMoEMethod(FusedMoEMethodBase):
 
     def __init__(self, quant_config: AscendQuantConfig, prefix: str,
                  packed_modules_mapping: Dict[str, Any]):
+        self.quant_config = quant_config
+        self.prefix = prefix
+        self.packed_modules_mapping = packed_modules_mapping
         self.quant_method = get_quant_method(quant_config.quant_description,
                                              prefix, "moe",
                                              packed_modules_mapping)
@@ -407,6 +411,31 @@ class AscendFusedMoEMethod(FusedMoEMethodBase):
         weight_param = self.quant_method.get_weight(
             num_experts, intermediate_size_per_partition, hidden_size,
             params_dtype)
+        
+        # Check if w2 (down_proj) is FLOAT
+        is_w2_float = False
+        proj_name = self.prefix.split(".")[-1]
+        if proj_name in self.packed_modules_mapping:
+            shard_list = self.packed_modules_mapping[proj_name]
+            # Assuming down_proj is the last one in the list (index 2 for qwen3_moe)
+            if len(shard_list) > 2:
+                down_proj_suffix = shard_list[2]
+                down_proj_full_name = self.prefix.replace(proj_name, down_proj_suffix)
+                down_proj_quant = self.quant_config.quant_description.get(down_proj_full_name + ".weight")
+                print(f"{down_proj_full_name + '.weight'}: {down_proj_quant}")
+                if down_proj_quant == "FLOAT" or down_proj_quant is None:
+                    is_w2_float = True
+                    # Recreate w2_weight as Float/BF16
+                    # Use original params_dtype for float weights (usually bf16/fp16)
+                    # Note: w2_weight shape in get_weight is (Experts, N, K) = (E, Hidden, Inter)
+                    weight_param["w2_weight"] = torch.empty(num_experts,
+                                                            hidden_size,
+                                                            intermediate_size_per_partition,
+                                                            dtype=params_dtype)
+        
+        if is_w2_float:
+            layer.is_w2_float = True
+
         for param_key, param_value in weight_param.items():
             param = torch.nn.Parameter(param_value, requires_grad=False)
             layer.register_parameter(param_key, param)
@@ -420,6 +449,13 @@ class AscendFusedMoEMethod(FusedMoEMethodBase):
         dynamic_quant_param = self.quant_method.get_dynamic_quant_param(
             num_experts, intermediate_size_per_partition, hidden_size,
             params_dtype)
+
+        if is_w2_float:
+             # Remove w2 scale params
+             keys_to_remove = [k for k in dynamic_quant_param.keys() if 'w2_' in k]
+             for k in keys_to_remove:
+                 del dynamic_quant_param[k]
+
         for param_key, param_value in dynamic_quant_param.items():
             param = torch.nn.Parameter(param_value, requires_grad=False)
             layer.register_parameter(param_key, param)

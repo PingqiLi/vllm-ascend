@@ -54,10 +54,12 @@ def get_linear_quant_type(quant_description: Dict[str, Any], prefix: str,
             if quant_type is None:
                 quant_type = shard_quant_type
             elif shard_quant_type != quant_type:
-                raise ValueError(
+                logger.warning(
                     f"Not all shards of {prefix} are quantized with same quant type."
                     f"Shard {proj_name} uses {shard_quant_type}, but another shard"
                     f"use {quant_type}. Please check quantization config.")
+                if quant_type == "FLOAT" and shard_quant_type != "FLOAT":
+                    quant_type = shard_quant_type
     else:
         quant_type = quant_description[prefix + '.weight']
     return quant_type
