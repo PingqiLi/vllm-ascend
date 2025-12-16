@@ -66,6 +66,7 @@ def fused_experts(x,
     expert_token_count = expert_token_count.to(torch.int64)
 
     x_quantized, pertoken_scale = quantize(expanded_x)
+    print(f"DEBUG: fused_experts x_quantized: {x_quantized.shape}, w1: {w1.shape}, w1_scale: {w1_scale.shape}")
 
     expanded_x = torch_npu.npu_grouped_matmul(
         x=[x_quantized],
@@ -213,12 +214,10 @@ class AscendW4A4DynamicFusedMoEMethod:
     """
 
     def __init__(self):
-        self.transpose_weight = False
-
+        self.transpose_weight = True
         self.ep_group = get_ep_group()
-
         vllm_config = get_current_vllm_config()
-        self.group_size = vllm_config.quant_config.quant_description.get("group_size", 256)
+        self.group_size = vllm_config.quant_config.quant_description.get("group_size", 0)
         # NOTE: the weights are quantized from bf16 to int4 through a per-channel quantization process
         self.is_per_channel_weight = self.group_size == 0
         quant_version = vllm_config.quant_config.quant_description.get("version", "0")
@@ -455,16 +454,21 @@ class AscendW4A4DynamicFusedMoEMethod:
              layer.w2_weight.data = self.pack_to_int32(layer.w2_weight.data)
 
         if self.transpose_weight:
+            print(f"DEBUG: Transposing weights. Pre-transpose w13: {layer.w13_weight.data.shape}")
             layer.w13_weight.data = layer.w13_weight.data.transpose(
                 1, 2).contiguous()
             layer.w2_weight.data = layer.w2_weight.data.transpose(
                 1, 2).contiguous()
+            print(f"DEBUG: Post-transpose w13: {layer.w13_weight.data.shape}")
+        else:
+            print(f"DEBUG: NOT Transposing weights. w13: {layer.w13_weight.data.shape}")
 
         w13_weight_scale_second = layer.w13_weight_scale_second.data if hasattr(
             layer, "w13_weight_scale_second") else None
 
         layer.w13_weight_scale.data, w13_bias = self.process_scale(
             layer.w13_weight, layer.w13_weight_scale.data, w13_weight_scale_second)
+
 
         # is_w2_float has been checked above
         if not is_w2_float:
@@ -474,6 +478,9 @@ class AscendW4A4DynamicFusedMoEMethod:
                 layer.w2_weight, layer.w2_weight_scale.data, w2_weight_scale_second)
         else:
             w2_bias = None
+            if hasattr(layer, "w2_weight_scale"):
+                print("DEBUG: Deleting w2_weight_scale because is_w2_float is True")
+                del layer.w2_weight_scale
 
         # Cleanup
         if hasattr(layer, "w13_weight_scale_second"):
