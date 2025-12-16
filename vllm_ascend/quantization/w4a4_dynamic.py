@@ -35,17 +35,7 @@ from .w4a4_flatquant_dynamic import pack_int4_weights
 def quantize(
     x: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    orig_shape = x.shape
-    x2 = x.reshape(-1, x.shape[-1])
-    qscale = torch.abs(x2).max(dim=-1, keepdim=True)[0].to(torch.float)
-    ratio = torch.ones_like(qscale) * 7
-    qscale2 = ratio / qscale
-    x_quantized_int4 = \
-        torch_npu.npu_quantize(x2, qscale2.to(x2.dtype), zero_points=None, dtype=torch.quint4x2, axis=-2, div_mode=False)
-    activation_scale = torch.flatten(qscale / ratio)
-
-    if len(x_quantized_int4.shape) != 2 and x_quantized_int4.shape[1] != orig_shape[-1] // 8:
-        x_quantized_int4 = x_quantized_int4.reshape(-1, orig_shape[-1] // 8)
+    x_quantized_int4, activation_scale = torch_npu.npu_dynamic_quant(x, dst_type=torch.quint4x2)
     return x_quantized_int4, activation_scale
 
 
@@ -223,7 +213,7 @@ class AscendW4A4DynamicFusedMoEMethod:
     """
 
     def __init__(self):
-        self.transpose_weight = True
+        self.transpose_weight = False
 
         self.ep_group = get_ep_group()
 
@@ -450,17 +440,20 @@ class AscendW4A4DynamicFusedMoEMethod:
                 layer.register_parameter("w2_scale_bias", w2_scale_bias)
 
     def pack_to_int32(self, weight: torch.Tensor):
-        if self.new_quant_version:
-            # pack 4 int8(int4*2) to int32, because in pytorch, we need to use int32 to represent int4
-            assert weight.shape[
-                -1] % 4 == 0, "the last dim of weight needs to be divided by 4"
-            return weight.view(torch.int32).contiguous()
-        else:
-            return torch_npu.npu_quantize(weight.to(torch.float32),
-                                          torch.tensor([1.]).npu(), None,
-                                          torch.quint4x2, -1, False)
+        if weight.dim() == 3:
+            E, N, K = weight.shape
+            weight = weight.reshape(-1, K)
+            packed = torch_npu.npu_convert_weight_to_int4pack(weight.to(torch.int32))
+            return packed.reshape(E, N, -1)
+        return torch_npu.npu_convert_weight_to_int4pack(weight.to(torch.int32))
 
     def process_weights_after_loading(self, layer):
+        layer.w13_weight.data = self.pack_to_int32(layer.w13_weight.data)
+        
+        is_w2_float = getattr(layer, "is_w2_float", False)
+        if not is_w2_float and hasattr(layer, "w2_weight_scale"):
+             layer.w2_weight.data = self.pack_to_int32(layer.w2_weight.data)
+
         if self.transpose_weight:
             layer.w13_weight.data = layer.w13_weight.data.transpose(
                 1, 2).contiguous()
@@ -473,7 +466,7 @@ class AscendW4A4DynamicFusedMoEMethod:
         layer.w13_weight_scale.data, w13_bias = self.process_scale(
             layer.w13_weight, layer.w13_weight_scale.data, w13_weight_scale_second)
 
-        is_w2_float = getattr(layer, "is_w2_float", False)
+        # is_w2_float has been checked above
         if not is_w2_float:
             w2_weight_scale_second = layer.w2_weight_scale_second.data if hasattr(
                 layer, "w2_weight_scale_second") else None
@@ -504,7 +497,3 @@ class AscendW4A4DynamicFusedMoEMethod:
                 # Assuming float weights also need NZ format for grouped matmul
                 layer.w2_weight.data = torch_npu.npu_format_cast(
                     layer.w2_weight.data, ACL_FORMAT_FRACTAL_NZ)
-
-        layer.w13_weight.data = self.pack_to_int32(layer.w13_weight.data)
-        if hasattr(layer, "w2_weight_scale"):
-             layer.w2_weight.data = self.pack_to_int32(layer.w2_weight.data)
