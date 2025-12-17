@@ -83,7 +83,6 @@ def quantize(
     x_quantized_int4, activation_scale = torch_npu.npu_dynamic_quant(x, dst_type=torch.quint4x2)
     return x_quantized_int4, activation_scale
 
-
 def manual_w8a8_dynamic_quant(x: torch.Tensor):
     # x: [num_tokens, hidden_dim]
     # per-token quantization (symmetric)
@@ -101,7 +100,6 @@ def manual_w8a8_dynamic_quant(x: torch.Tensor):
     
     return x_quant, scale.squeeze(-1)
 
-
 def fused_experts(x,
                   w1,
                   w1_scale,
@@ -109,8 +107,9 @@ def fused_experts(x,
                   w2_scale,
                   topk_weights,
                   topk_ids,
-                  global_num_experts):
-    original_dtype = x.dtype
+                  global_num_experts
+):
+    original_dtype = x.dtype    
 
     expanded_x, expanded_row_idx, expert_token_count, _ = torch_npu.npu_moe_init_routing_v2(
         x,
@@ -127,6 +126,8 @@ def fused_experts(x,
         row_idx_type=0,
     )
     expert_token_count = expert_token_count.to(torch.int64)
+    print(f"DEBUG_W4A4: fused_experts start. x shape: {x.shape}, expert_token_count: {expert_token_count.tolist()}")
+    print(f"DEBUG_W4A4: global_num_experts: {global_num_experts}, topk_weights shape: {topk_weights.shape}")
 
     if w1_scale is not None:
         x_quantized, pertoken_scale = quantize(expanded_x)
@@ -174,13 +175,17 @@ def fused_experts(x,
     if w2_scale is not None:
         if w2_scale.dtype == torch.float32 and original_dtype == torch.bfloat16:
             w2_scale = w2_scale.to(original_dtype)
-        # Check if w2 is W8A8 (by checking shape match)
-        # If w2 dimension matches x dimension (768), it is unpacked (W8A8).
-        # If w2 was packed (W4A4), its dimension would be smaller (e.g. 96 or 384).
+        # Check if w2 is W8A8 (by checking dtype)
+        # W8A8 weights are stored as int8, while W4A4 weights are packed into int32
         is_w8a8_w2 = w2.shape[1] == expanded_x.shape[-1]
+        
         if is_w8a8_w2:
+             # DEBUG: Log before quantization
+             print(f"DEBUG_W4A4: Doing W8A8 dynamic quantization for w2. expanded_x shape: {expanded_x.shape}, min: {expanded_x.min()}, max: {expanded_x.max()}")
              x_quantized, pertoken_scale = manual_w8a8_dynamic_quant(expanded_x)
+             print(f"DEBUG_W4A4: W8A8 quantized x shape: {x_quantized.shape}, pertoken_scale shape: {pertoken_scale.shape}")
         else:
+             print(f"DEBUG_W4A4: Doing W4A4 dynamic quantization for w2. expanded_x shape: {expanded_x.shape}")
              x_quantized, pertoken_scale = quantize(expanded_x)
 
         expanded_x = torch_npu.npu_grouped_matmul(
@@ -375,6 +380,8 @@ class AscendW4A4DynamicFusedMoEMethod:
                         self.w2_is_int8 = True
                     elif w2_quant_type == "W8A8_DYNAMIC":
                         self.w2_is_int8 = True
+        
+        print(f"DEBUG_W4A4: _detect_quant_types result. w13_is_float: {self.w13_is_float}, w2_is_float: {self.w2_is_float}, w2_is_int8: {self.w2_is_int8}")
 
     def get_weight(self, num_experts: int,
                    intermediate_size_per_partition: int, hidden_sizes: int,
@@ -559,19 +566,35 @@ class AscendW4A4DynamicFusedMoEMethod:
                              global_num_experts=global_num_experts)
 
     def process_scale(self, weight: torch.Tensor, scale, per_group_scale):
+        # DEBUG: Log scale info
+        print(f"DEBUG_W4A4: process_scale called. Scale shape: {scale.shape}, dtype: {scale.dtype}, min: {scale.min()}, max: {scale.max()}")
+        
         scale = scale.transpose(1, 2).contiguous()
         if self.is_per_channel_weight:
-            # Match Reference convert_scales logic exactly
+            # Match w4a4_flatquant_dynamic_ref.py convert_scales logic EXACTLY
+            # convert_scales: 
+            # E, N = scales.shape
+            # scaleUint32 = scales.cpu().to(torch.float32).clone().numpy().astype(np.float32).reshape(E, 1, N)
+            # scaleUint32.dtype = np.uint32
+            # scaleUint64 = np.zeros((E, 1, N * 2), dtype=np.uint32)
+            # scaleUint64[...,::2] = scaleUint32
+            # scaleUint64.dtype = np.int64
+            # scale = torch.from_numpy(scaleUint64).npu()
+
             E, _, N = scale.shape  # scale is (E, 1, Out)
-            scale_fp32 = scale.to(torch.float32)
-            scale_fp32_np = scale_fp32.cpu().numpy()
-            scale_fp32_np.dtype = np.uint32
+            scale = scale.view(E, N) # Flatten middle dim if it is 1
+            
+            scale_fp32 = scale.to(torch.float32).cpu()
+            scale_fp32_np = scale_fp32.numpy().astype(np.float32)
+            
+            # View as uint32
+            scale_uint32 = scale_fp32_np.view(np.uint32).reshape(E, 1, N)
             
             # Pack into uint64 by interleaving with zeros
             scale_uint64 = np.zeros((E, 1, N * 2), dtype=np.uint32)
-            scale_uint64[..., ::2] = scale_fp32_np.reshape(E, 1, N)
+            scale_uint64[..., ::2] = scale_uint32
             
-            scale_uint64.dtype = np.int64
+            scale_uint64 = scale_uint64.view(np.int64) # Interpret as int64
             scale_uint64_tensor = torch.from_numpy(scale_uint64).npu()
             
             return scale_uint64_tensor, None
@@ -623,6 +646,9 @@ class AscendW4A4DynamicFusedMoEMethod:
         return torch_npu.npu_convert_weight_to_int4pack(weight.to(torch.int32))
 
     def process_weights_after_loading(self, layer):
+        print(f"DEBUG_W4A4: process_weights_after_loading start. Layer w2 shape: {layer.w2_weight.shape} dtype: {layer.w2_weight.dtype}")
+        if hasattr(layer, "w13_weight"):
+             print(f"DEBUG_W4A4: w13 shape: {layer.w13_weight.shape} dtype: {layer.w13_weight.dtype}")
        # Only pack if quantized
         if not getattr(self, "w13_is_float", False):
             layer.w13_weight.data = layer.w13_weight.data.transpose(1, 2).contiguous()
