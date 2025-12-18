@@ -21,6 +21,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional
 import torch
 from vllm.config import get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_rank
+from vllm.logger import logger
 from vllm.model_executor.layers.fused_moe import (FusedMoE, FusedMoEMethodBase,
                                                   FusedMoeWeightScaleSupported)
 from vllm.model_executor.layers.linear import (LinearBase, LinearMethodBase,
@@ -153,10 +154,10 @@ class AscendQuantConfig(QuantizationConfig):
                 if is_skipped is None:
                     is_skipped = is_shard_skipped
                 elif is_shard_skipped != is_skipped:
-                    raise ValueError(
+                    logger.warning(
                         f"Detected some but not all shards of {prefix} "
-                        "are quantized. All shards of fused layers "
-                        "to have the same precision.")
+                        "are quantized. Assuming quantized.")
+                    return False
         else:
             is_skipped = self.quant_description[prefix + '.weight'] == "FLOAT"
 
@@ -394,6 +395,9 @@ class AscendFusedMoEMethod(FusedMoEMethodBase):
         self.quant_method = get_quant_method(quant_config.quant_description,
                                              prefix, "moe",
                                              packed_modules_mapping)
+        self.quant_method.quant_config = quant_config
+        self.quant_method.prefix = prefix
+        self.quant_method.packed_modules_mapping = packed_modules_mapping
 
     def create_weights(
         self,
@@ -407,6 +411,11 @@ class AscendFusedMoEMethod(FusedMoEMethodBase):
         weight_param = self.quant_method.get_weight(
             num_experts, intermediate_size_per_partition, hidden_size,
             params_dtype)
+        
+        ## This is used for the case the down_proj of MoE layer is not quantized
+        if getattr(self.quant_method, "is_w2_float", False):
+            layer.is_w2_float = True
+
         for param_key, param_value in weight_param.items():
             param = torch.nn.Parameter(param_value, requires_grad=False)
             layer.register_parameter(param_key, param)
