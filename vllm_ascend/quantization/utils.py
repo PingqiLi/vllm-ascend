@@ -1,8 +1,10 @@
 from typing import Any, Dict, Optional, Type
 
+import torch
 from vllm.logger import logger
 
 from .w4a4_flatquant_dynamic import AscendW4A4FlatQuantDynamicLinearMethod
+from .w4a4_resq_dynamic import AscendResQW4A4DynamicLinearMethod
 from .w4a8_dynamic import (AscendW4A8DynamicFusedMoEMethod,
                            AscendW4A8DynamicLinearMethod)
 from .w8a8 import (AscendC8KVCacheMethod, AscendW8A8FusedMoEMethod,
@@ -17,6 +19,9 @@ ASCEND_QUANTIZATION_METHOD_MAP: Dict[str, Dict[str, Type[Any]]] = {
     },
     "W4A4_FLATQUANT_DYNAMIC": {
         "linear": AscendW4A4FlatQuantDynamicLinearMethod,
+    },
+    "RESQ": {
+        "linear": AscendResQW4A4DynamicLinearMethod,
     },
     "W8A8": {
         "linear": AscendW8A8LinearMethod,
@@ -72,6 +77,8 @@ def get_quant_method(quant_description: Dict[str, Any],
         quant_type = quant_description['kv_quant_type']
     # Linear
     else:
+        # Hack specific for ResQ enabling via config key mapping if needed, 
+        # but here we rely on 'quant_type' string being "RESQ_DYNAMIC" in the config.
         quant_type = get_linear_quant_type(quant_description, prefix,
                                            packed_modules_mapping)
     if quant_type in ASCEND_QUANTIZATION_METHOD_MAP.keys():
