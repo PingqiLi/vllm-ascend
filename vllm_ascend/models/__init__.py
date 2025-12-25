@@ -24,6 +24,10 @@ def register_model():
             "vllm_ascend.models.qwen2_5_vl:AscendQwen2_5_VLForConditionalGeneration"
         )
         ModelRegistry.register_model(
+            "Qwen3ResQForCausalLM",
+            "vllm_ascend.models.qwen3_resq:Qwen3ResQForCausalLM"
+        )
+        ModelRegistry.register_model(
             "Qwen2_5OmniModel",
             "vllm_ascend.models.qwen2_5_omni_thinker:AscendQwen2_5OmniThinkerForConditionalGeneration"
         )
