@@ -282,6 +282,9 @@ class AscendLinearMethod(LinearMethodBase):
         packed_factor = weight_dict.pop("_packed_factor", None)
 
         for weight_name, weight_param in weight_dict.items():
+            # Preserve original weight_loader if set by the quant_method
+            original_weight_loader = getattr(weight_param, "weight_loader", None)
+            
             param = torch.nn.Parameter(weight_param, requires_grad=False)
             set_weight_attrs(param, {"input_dim": 1, "output_dim": 0})
 
@@ -294,6 +297,11 @@ class AscendLinearMethod(LinearMethodBase):
 
             layer.register_parameter(weight_name, param)
             set_weight_attrs(param, extra_weight_attrs)
+            
+            # Restore original weight_loader AFTER set_weight_attrs (overrides it)
+            # Use direct setattr to bypass the assertion check
+            if original_weight_loader is not None:
+                param.weight_loader = original_weight_loader
 
         pertensor_dict = self.quant_method.get_pertensor_param(params_dtype)
         for pertensor_name, pertensor_param in pertensor_dict.items():
@@ -307,10 +315,18 @@ class AscendLinearMethod(LinearMethodBase):
         perchannel_dict = self.quant_method.get_perchannel_param(
             output_size_per_partition, params_dtype)
         for perchannel_name, perchannel_param in perchannel_dict.items():
+            # Preserve original weight_loader if set by the quant_method
+            original_weight_loader = getattr(perchannel_param, "weight_loader", None)
+            
             param = torch.nn.Parameter(perchannel_param, requires_grad=False)
             set_weight_attrs(param, {"output_dim": 0})
             layer.register_parameter(perchannel_name, param)
             set_weight_attrs(param, extra_weight_attrs)
+            
+            # Restore original weight_loader AFTER set_weight_attrs (overrides it)
+            # Use direct attribute assignment to bypass the assertion check
+            if original_weight_loader is not None:
+                param.weight_loader = original_weight_loader
 
         # NOTE: In w4a8 quantization implementation,
         # for down_proj and o_proj scale_bias shape is [output_size, 16],

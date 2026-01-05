@@ -30,8 +30,12 @@ class Qwen3ResQAttention(Qwen3Attention):
         # Note: Shape depends on implementation (head-wise vs full).
         # Assuming full rotation matrix based on reference.
         self.register_parameter("rotation_R3", torch.nn.Parameter(torch.empty(0), requires_grad=False))
-        # Use custom loader to handle shape mismatch if needed (e.g. if not in checkpoint, stay empty)
-        setattr(self.rotation_R3, "weight_loader", default_weight_loader)
+        # Use custom loader to handle shape mismatch (empty -> actual shape)
+        def rotation_weight_loader(param, loaded_weight):
+            if param.data.shape != loaded_weight.shape:
+                param.data = torch.empty_like(loaded_weight)
+            param.data.copy_(loaded_weight)
+        setattr(self.rotation_R3, "weight_loader", rotation_weight_loader)
 
     def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
@@ -127,7 +131,12 @@ class Qwen3ResQDecoderLayer(Qwen3DecoderLayer):
              # Register R4 parameter (initialized as empty)
              # If checkpoint contains rotation_R4, it will be loaded here.
              self.mlp.down_proj.register_parameter("rotation_R4", torch.nn.Parameter(torch.empty(0), requires_grad=False))
-             setattr(self.mlp.down_proj.rotation_R4, "weight_loader", default_weight_loader)
+             # Use custom loader to handle shape mismatch (empty -> actual shape)
+             def rotation_weight_loader(param, loaded_weight):
+                 if param.data.shape != loaded_weight.shape:
+                     param.data = torch.empty_like(loaded_weight)
+                 param.data.copy_(loaded_weight)
+             setattr(self.mlp.down_proj.rotation_R4, "weight_loader", rotation_weight_loader)
 
         # 3. ResQ Specific: Basis Change omitted for Shared Basis mode
 
@@ -230,3 +239,38 @@ class Qwen3ResQForCausalLM(Qwen3ForCausalLM):
 
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors)
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        """
+        Load weights with ResQ-specific name mappings.
+        Uses WeightsMapper to transform checkpoint key names to model parameter names.
+        """
+        from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
+        
+        # Create mapper for ResQ checkpoint format
+        # Maps checkpoint names -> model parameter names
+        mapper = WeightsMapper(
+            orig_to_new_prefix={
+                # ResQ checkpoint uses "resq.layer." (singular), model uses "model.layers." (plural)
+                "resq.layer.": "model.layers.",
+            },
+            orig_to_new_substr={
+                # Weight mappings (ResQ uses _low/_high suffix instead of _int4/_int8)
+                "weight_low": "weight_int4",
+                "weight_high": "weight_int8",
+                "scale_low": "weight_scale_int4",
+                "scale_high": "weight_scale_int8",
+                "offset_low": "weight_offset_int4",
+                "offset_high": "weight_offset_int8",
+                # Rotation matrix mappings
+                ".Uc": ".self_attn.rotation_R3",
+                ".Ud": ".mlp.down_proj.rotation_R4",
+            }
+        )
+        
+        loader = AutoWeightsLoader(
+            self,
+            skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
+        )
+        return loader.load_weights(weights, mapper=mapper)
+
