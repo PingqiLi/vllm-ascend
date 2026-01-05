@@ -43,11 +43,39 @@ def is_pow2(n):
 
 
 def apply_rotation(x: torch.Tensor, rotation_matrix: Optional[torch.Tensor] = None) -> torch.Tensor:
-    # 1. Learned Rotation (R3 / U_C)
+    """
+    Apply rotation to input tensor using block-wise approach.
+    
+    If rotation_matrix is None, apply Hadamard transform (for R4).
+    If rotation_matrix is provided, apply block-wise MatMul (for R3).
+    
+    Block-wise: Reshape x from [..., N] to [..., N/K, K], matmul with R [K, K], reshape back.
+    """
     if rotation_matrix is not None:
-        original_dtype = x.dtype
-        # Ensure matrix multiplication matches types (usually FP16/BF16)
-        return torch.matmul(x.to(rotation_matrix.dtype), rotation_matrix).to(original_dtype)
+        # 1. Learned Rotation (R3 / U_C) - with block-wise support
+        R = rotation_matrix.to(device=x.device, dtype=x.dtype)
+        K = R.shape[0]  # Block size
+        
+        original_shape = x.shape
+        N = original_shape[-1]
+        
+        if N == K:
+            # Simple case: no blocking needed
+            return torch.matmul(x, R)
+        
+        if N % K != 0:
+            raise ValueError(f"Feature dim {N} must be divisible by rotation block size {K}")
+        
+        num_blocks = N // K
+        
+        # Reshape: [..., N] -> [..., num_blocks, K]
+        x_blocked = x.view(*original_shape[:-1], num_blocks, K)
+        
+        # Matmul with R: [..., num_blocks, K] @ [K, K] -> [..., num_blocks, K]
+        x_rotated = torch.matmul(x_blocked, R)
+        
+        # Reshape back: [..., num_blocks, K] -> [..., N]
+        return x_rotated.view(*original_shape)
     
     # 2. Hadamard Rotation (R4 / U_D) - Parameterless
     n = x.shape[-1]
@@ -60,11 +88,67 @@ def apply_rotation(x: torch.Tensor, rotation_matrix: Optional[torch.Tensor] = No
     return x
 
 
-# Reuse hybrid loader from w4a4_dynamic if needed, or redefine
-def hybrid_weight_loader(param, loaded_weight):
-    if param.data.shape != loaded_weight.shape:
-        param.data = torch.empty_like(loaded_weight)
-    default_weight_loader(param, loaded_weight)
+# ---------------------------------------------------------------------------
+# Hybrid weight loader for RESQ
+# ---------------------------------------------------------------------------
+def hybrid_weight_loader(param: torch.nn.Parameter, 
+                         loaded_weight: torch.Tensor, 
+                         shard_id: Optional[int] = None) -> None:
+    """
+    Weight loader for RESQ that handles:
+    - Resizing empty parameters to match loaded weights
+    - Stacked parameters (qkv_proj, gate_up_proj) with shard_id
+    
+    Args:
+        param: The parameter to load weight into
+        loaded_weight: The weight tensor from checkpoint
+        shard_id: Optional shard index for stacked parameters
+    """
+    # Get output_dim from param attributes (default: 0)
+    output_dim = getattr(param, "output_dim", 0)
+    
+    if shard_id is not None:
+        # Stacked params: need to handle sharding
+        # output_sizes is set for stacked params like qkv_proj, gate_up_proj
+        output_sizes = getattr(param, "output_sizes", None)
+        
+        if output_sizes is not None:
+            # Calculate offset based on shard_id
+            offset = sum(output_sizes[:shard_id])
+            shard_size = loaded_weight.shape[output_dim] if loaded_weight.dim() > output_dim else loaded_weight.shape[0]
+            
+            # If param is empty, initialize with zeros
+            if param.data.numel() == 0:
+                total_size = sum(output_sizes)
+                # Handle both 1D and 2D tensors
+                if loaded_weight.dim() == 1:
+                    new_shape = (total_size,)
+                elif output_dim == 0:
+                    new_shape = (total_size, loaded_weight.shape[1])
+                else:
+                    new_shape = (loaded_weight.shape[0], total_size)
+                param.data = torch.zeros(new_shape, dtype=loaded_weight.dtype, 
+                                         device=loaded_weight.device)
+            
+            # Copy shard to correct position
+            if param.data.dim() == 1:
+                param.data[offset:offset + shard_size] = loaded_weight
+            elif output_dim == 0:
+                param.data[offset:offset + shard_size] = loaded_weight
+            else:
+                param.data[:, offset:offset + shard_size] = loaded_weight
+        else:
+            # Fallback: simple copy with resize
+            if param.data.shape != loaded_weight.shape:
+                param.data = loaded_weight.clone()
+            else:
+                param.data.copy_(loaded_weight)
+    else:
+        # Non-stacked params: simple resize and copy
+        if param.data.shape != loaded_weight.shape:
+            param.data = loaded_weight.clone()
+        else:
+            param.data.copy_(loaded_weight)
 
 
 class AscendResQW4A4DynamicLinearMethod:
@@ -101,11 +185,12 @@ class AscendResQW4A4DynamicLinearMethod:
         params_dtype: torch.dtype,
     ) -> Dict[str, Any]:
         params_dict = {}
-        # Force BF16 for scales/offsets
-        params_dict["weight_scale_int4"] = torch.empty(output_size, 1, dtype=torch.bfloat16)
-        params_dict["weight_offset_int4"] = torch.empty(output_size, 1, dtype=torch.bfloat16)
-        params_dict["weight_scale_int8"] = torch.empty(output_size, 1, dtype=torch.bfloat16)
-        params_dict["weight_offset_int8"] = torch.empty(output_size, 1, dtype=torch.bfloat16)
+        # Initialize as empty - hybrid_weight_loader will resize from checkpoint
+        # Using empty(0) instead of fixed size to handle TP sharding properly
+        params_dict["weight_scale_int4"] = torch.empty(0, dtype=torch.bfloat16)
+        params_dict["weight_offset_int4"] = torch.empty(0, dtype=torch.bfloat16)
+        params_dict["weight_scale_int8"] = torch.empty(0, dtype=torch.bfloat16)
+        params_dict["weight_offset_int8"] = torch.empty(0, dtype=torch.bfloat16)
         
         for p in params_dict.values():
             if not hasattr(p, "weight_loader"):
