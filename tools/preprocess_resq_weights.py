@@ -2,17 +2,34 @@
 """
 Preprocess ResQ quantized weights to standard bf16 format.
 
-This script takes a ResQ checkpoint with:
-- weight_low (int4), weight_high (int8)
-- scale_low, scale_high, offset_low, offset_high
-- Uc, Ud rotation matrices
+This script supports two modes:
 
-And produces a standard bf16 checkpoint with:
-- weight (dequantized bf16)
+Mode 1: 'dequant' (v1 - for real int4/int8 quantized weights)
+    Input checkpoint has:
+    - weight_low (int4), weight_high (int8) 
+    - scale_low, scale_high, offset_low, offset_high
+    - Uc, Ud rotation matrices
+    
+    Performs: dequant = (weight - offset) * scale, then concat
+
+Mode 2: 'concat' (v2 - for fake-quantized float weights, DEFAULT)
+    Input checkpoint has:
+    - weight_low (bf16/fp16/fp32, already fake-quantized)
+    - weight_high (bf16/fp16/fp32, already fake-quantized)
+    - Uc, Ud rotation matrices
+    
+    Performs: just concat weight_low and weight_high (no scale/offset needed)
+
+Output checkpoint has:
+- weight (bf16, concatenated as [low, high] following project-resq order)
 - rotation_R3, rotation_R4 (renamed from Uc, Ud)
 
 Usage:
-    python preprocess_resq_weights.py --input /path/to/resq_ckpt --output /path/to/output_dir
+    # For fake-quantized checkpoints (default):
+    python preprocess_resq_weights.py -i /path/to/resq_ckpt -o /path/to/output_dir
+    
+    # For real int4/int8 quantized checkpoints:
+    python preprocess_resq_weights.py -i /path/to/resq_ckpt -o /path/to/output_dir --mode dequant
 """
 
 import argparse
@@ -26,9 +43,13 @@ from tqdm import tqdm
 
 
 def dequantize_weight(weight_low, weight_high, scale_low, scale_high, 
-                      offset_low=None, offset_high=None):
+                      offset_low=None, offset_high=None, debug=False, prefix=""):
     """
     Dequantize ResQ mixed-precision weights to bf16.
+    
+    Following project-resq convention:
+        W_l, W_m, W_h = W[:, :low_dim], W[:, low_dim:high_dim], W[:, high_dim:]
+    The channel order is: low (int4) -> middle -> high (int8)
     
     Args:
         weight_low: Int4 weight [out_dim, in_low]
@@ -37,10 +58,23 @@ def dequantize_weight(weight_low, weight_high, scale_low, scale_high,
         scale_high: Scale for int8 [out_dim, 1] or [out_dim]
         offset_low: Optional offset for int4 (asymmetric)
         offset_high: Optional offset for int8 (asymmetric)
+        debug: If True, print debug info
+        prefix: Prefix for debug output
     
     Returns:
-        bf16 weight [out_dim, in_high + in_low] (int8 channels first)
+        bf16 weight [out_dim, in_low + in_high] (int4 channels first, then int8)
     """
+    if debug:
+        print(f"\n[DEBUG] Dequantizing {prefix}")
+        print(f"  weight_high: shape={weight_high.shape}, dtype={weight_high.dtype}, min={weight_high.min()}, max={weight_high.max()}")
+        print(f"  weight_low: shape={weight_low.shape}, dtype={weight_low.dtype}, min={weight_low.min()}, max={weight_low.max()}")
+        print(f"  scale_high: shape={scale_high.shape}, dtype={scale_high.dtype}, min={scale_high.min():.6f}, max={scale_high.max():.6f}")
+        print(f"  scale_low: shape={scale_low.shape}, dtype={scale_low.dtype}, min={scale_low.min():.6f}, max={scale_low.max():.6f}")
+        if offset_high is not None:
+            print(f"  offset_high: shape={offset_high.shape}, min={offset_high.min()}, max={offset_high.max()}")
+        if offset_low is not None:
+            print(f"  offset_low: shape={offset_low.shape}, min={offset_low.min()}, max={offset_low.max()}")
+    
     # Reshape scales to [out_dim, 1] for broadcasting
     if scale_low.dim() == 1:
         scale_low = scale_low.view(-1, 1)
@@ -78,14 +112,64 @@ def dequantize_weight(weight_low, weight_high, scale_low, scale_high,
             scale_low = scale_low[:w_low.shape[0]]
         dequant_low = w_low * scale_low.float()
     
-    # Concatenate: int8 (high precision) channels first, then int4
-    full_weight = torch.cat([dequant_high, dequant_low], dim=1).to(torch.bfloat16)
+    if debug:
+        print(f"  dequant_low (int4): shape={dequant_low.shape}, min={dequant_low.min():.6f}, max={dequant_low.max():.6f}")
+        print(f"  dequant_high (int8): shape={dequant_high.shape}, min={dequant_high.min():.6f}, max={dequant_high.max():.6f}")
+    
+    # Concatenate following project-resq order: low (int4) first, then high (int8)
+    full_weight = torch.cat([dequant_low, dequant_high], dim=1).to(torch.bfloat16)
     return full_weight
 
 
-def process_checkpoint(input_dir, output_dir):
+def concat_fake_quant_weight(weight_low, weight_high, debug=False, prefix=""):
     """
-    Process all safetensor files in input_dir and save dequantized weights to output_dir.
+    Concat fake-quantized ResQ weights to bf16.
+    
+    For fake-quantized checkpoints, weight_low and weight_high are already
+    in float format (bf16/fp16/fp32) after fake quantization. No scale/offset
+    dequantization is needed - just concat them.
+    
+    Following project-resq convention:
+        W_l, W_m, W_h = W[:, :low_dim], W[:, low_dim:high_dim], W[:, high_dim:]
+    The channel order is: low (int4) -> middle -> high (int8)
+    
+    Args:
+        weight_low: Fake-quantized weight [out_dim, in_low] (already float, int4 precision)
+        weight_high: Fake-quantized weight [out_dim, in_high] (already float, int8 precision)
+        debug: If True, print debug info
+        prefix: Prefix for debug output
+    
+    Returns:
+        bf16 weight [out_dim, in_low + in_high] (low precision first, then high)
+    """
+    if debug:
+        print(f"\n[DEBUG] Concatenating fake-quant weights: {prefix}")
+        print(f"  weight_low (int4): shape={weight_low.shape}, dtype={weight_low.dtype}, "
+              f"min={weight_low.float().min():.6f}, max={weight_low.float().max():.6f}")
+        print(f"  weight_high (int8): shape={weight_high.shape}, dtype={weight_high.dtype}, "
+              f"min={weight_high.float().min():.6f}, max={weight_high.float().max():.6f}")
+    
+    # Concatenate following project-resq order: low (int4) first, then high (int8)
+    full_weight = torch.cat([weight_low.to(torch.bfloat16), 
+                             weight_high.to(torch.bfloat16)], dim=1)
+    
+    if debug:
+        print(f"  result: shape={full_weight.shape}, dtype={full_weight.dtype}, "
+              f"min={full_weight.float().min():.6f}, max={full_weight.float().max():.6f}")
+    
+    return full_weight
+
+
+def process_checkpoint(input_dir, output_dir, mode="dequant"):
+    """
+    Process all safetensor files in input_dir and save processed weights to output_dir.
+    
+    Args:
+        input_dir: Input checkpoint directory
+        output_dir: Output directory
+        mode: Processing mode
+            - "dequant": Dequantize int4/int8 weights using scale/offset (v1)
+            - "concat": Just concat fake-quantized float weights (v2)
     """
     os.makedirs(output_dir, exist_ok=True)
     
@@ -95,6 +179,7 @@ def process_checkpoint(input_dir, output_dir):
         raise ValueError(f"No safetensor files found in {input_dir}")
     
     print(f"Found {len(safetensor_files)} safetensor files")
+    print(f"Processing mode: {mode}")
     
     # Collect all weights
     all_weights = {}
@@ -163,7 +248,7 @@ def process_checkpoint(input_dir, output_dir):
     
     print(f"Found {len(layer_weights)} quantized layers, {len(rotation_weights)} rotation matrices, {len(other_weights)} other weights")
     
-    # Dequantize and create output
+    # Process and create output
     output_weights = {}
     
     # Add rotation matrices
@@ -176,28 +261,50 @@ def process_checkpoint(input_dir, output_dir):
             tensor = tensor.to(torch.bfloat16)
         output_weights[key] = tensor
     
-    # Dequantize quantized layers
-    for prefix, weights in tqdm(layer_weights.items(), desc="Dequantizing"):
+    # Process quantized layers
+    debug_count = 0
+    desc = "Dequantizing" if mode == "dequant" else "Concatenating"
+    
+    for prefix, weights in tqdm(layer_weights.items(), desc=desc):
         if "weight_low" not in weights or "weight_high" not in weights:
             print(f"Warning: Incomplete quantized layer {prefix}, skipping")
             continue
-        if "scale_low" not in weights or "scale_high" not in weights:
-            print(f"Warning: Missing scales for {prefix}, skipping")
-            continue
         
-        dequant = dequantize_weight(
-            weights["weight_low"],
-            weights["weight_high"],
-            weights["scale_low"],
-            weights["scale_high"],
-            weights.get("offset_low"),
-            weights.get("offset_high"),
-        )
+        # Debug first 3 layers to understand the data
+        should_debug = debug_count < 3
+        debug_count += 1
+        
+        if mode == "dequant":
+            # V1: Full dequantization with scale/offset
+            if "scale_low" not in weights or "scale_high" not in weights:
+                print(f"Warning: Missing scales for {prefix}, skipping")
+                continue
+            
+            result = dequantize_weight(
+                weights["weight_low"],
+                weights["weight_high"],
+                weights["scale_low"],
+                weights["scale_high"],
+                weights.get("offset_low"),
+                weights.get("offset_high"),
+                debug=should_debug,
+                prefix=prefix,
+            )
+        else:
+            # V2: Just concat fake-quantized weights (already float)
+            result = concat_fake_quant_weight(
+                weights["weight_low"],
+                weights["weight_high"],
+                debug=should_debug,
+                prefix=prefix,
+            )
         
         # Output key: original prefix + ".weight"
         output_key = prefix + ".weight"
-        output_weights[output_key] = dequant
-        print(f"  {output_key}: {dequant.shape}")
+        output_weights[output_key] = result
+        
+        # Print summary for all layers
+        print(f"  {output_key}: shape={result.shape}, min={result.float().min():.6f}, max={result.float().max():.6f}")
     
     # Save output
     output_file = os.path.join(output_dir, "model.safetensors")
@@ -220,9 +327,13 @@ def main():
     parser = argparse.ArgumentParser(description="Preprocess ResQ weights to bf16")
     parser.add_argument("--input", "-i", required=True, help="Input ResQ checkpoint directory")
     parser.add_argument("--output", "-o", required=True, help="Output directory for bf16 checkpoint")
+    parser.add_argument("--mode", "-m", choices=["dequant", "concat"], default="concat",
+                        help="Processing mode: "
+                             "'dequant' = dequantize int4/int8 with scale/offset (v1), "
+                             "'concat' = just concat fake-quantized float weights (v2, default)")
     args = parser.parse_args()
     
-    process_checkpoint(args.input, args.output)
+    process_checkpoint(args.input, args.output, mode=args.mode)
 
 
 if __name__ == "__main__":
