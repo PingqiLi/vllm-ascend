@@ -10,11 +10,11 @@ Key differences from standard Qwen3:
 3. Optional W4A4 fake quantization for accuracy testing
 
 Usage:
-    # Without fake quantization (default, for debugging rotations):
-    RESQ_FAKE_QUANT = False
+    # Without fake quantization (for debugging rotations):
+    RESQ_FAKE_QUANT=0 vllm serve ...
     
-    # With fake quantization (for W4A4 accuracy testing):
-    RESQ_FAKE_QUANT = True
+    # With fake quantization (for W4A4 accuracy testing, default):
+    RESQ_FAKE_QUANT=1 vllm serve ...
 """
 from typing import Iterable, Optional
 import torch
@@ -33,11 +33,6 @@ from vllm.model_executor.models.utils import maybe_prefix, PPMissingLayer
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.attention import Attention
 
-# Import rotation and fake quant functions
-from vllm_ascend.quantization.w4a4_resq_dynamic import (
-    apply_rotation, fake_quantize_per_token
-)
-
 # Setup logger for ResQ debugging
 logger = logging.getLogger(__name__)
 
@@ -49,10 +44,87 @@ RESQ_LOW_BITS = int(os.environ.get("RESQ_LOW_BITS", "4"))
 RESQ_HIGH_FRACTION = float(os.environ.get("RESQ_HIGH_FRACTION", "0.125"))
 
 
+# ============================================================================
+# Utility Functions for ResQ
+# ============================================================================
+
+def apply_rotation(x: torch.Tensor, rotation_matrix: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """
+    Apply rotation to input tensor using block-wise approach.
+    
+    If rotation_matrix is None, return x unchanged.
+    If rotation_matrix is provided, apply block-wise MatMul:
+        1. Reshape x from [..., N] to [..., N/K, K] where K is rotation block size
+        2. Matmul with R [K, K]
+        3. Reshape back to [..., N]
+    
+    This is mathematically equivalent to multiplying by a block-diagonal matrix.
+    """
+    if rotation_matrix is None:
+        return x
+    
+    R = rotation_matrix.to(device=x.device, dtype=x.dtype)
+    K = R.shape[0]  # Block size (e.g., 128 or 256)
+    
+    original_shape = x.shape
+    N = original_shape[-1]
+    
+    if N == K:
+        return torch.matmul(x, R)
+    
+    if N % K != 0:
+        raise ValueError(f"Feature dim {N} must be divisible by rotation block size {K}")
+    
+    num_blocks = N // K
+    x_blocked = x.view(*original_shape[:-1], num_blocks, K)
+    x_rotated = torch.matmul(x_blocked, R)
+    return x_rotated.view(*original_shape)
+
+
+def fake_quantize_per_token(x: torch.Tensor, bits: int = 8, sym: bool = True) -> torch.Tensor:
+    """
+    Apply per-token fake quantization to tensor.
+    
+    Args:
+        x: Input tensor [..., hidden_dim]
+        bits: Number of bits for quantization (default 8)
+        sym: Whether to use symmetric quantization (default True)
+    
+    Returns:
+        Fake-quantized tensor (same shape and dtype as input)
+    """
+    if bits >= 16:
+        return x
+    
+    original_dtype = x.dtype
+    x_float = x.float()
+    
+    if sym:
+        qmax = (1 << (bits - 1)) - 1
+        x_abs_max = x_float.abs().amax(dim=-1, keepdim=True).clamp(min=1e-10)
+        scale = x_abs_max / qmax
+        x_quant = (x_float / scale).round().clamp(-qmax, qmax)
+        x_dequant = x_quant * scale
+    else:
+        qmax = (1 << bits) - 1
+        x_min = x_float.amin(dim=-1, keepdim=True)
+        x_max = x_float.amax(dim=-1, keepdim=True)
+        scale = (x_max - x_min).clamp(min=1e-10) / qmax
+        zero_point = (-x_min / scale).round()
+        x_quant = ((x_float / scale) + zero_point).round().clamp(0, qmax)
+        x_dequant = (x_quant - zero_point) * scale
+    
+    return x_dequant.to(original_dtype)
+
+
 def apply_mixed_precision_fake_quant(x: torch.Tensor, high_fraction: float = 0.125,
                                       high_bits: int = 8, low_bits: int = 4) -> torch.Tensor:
     """
     Apply mixed-precision fake quantization to activation tensor.
+    
+    Channel layout (matching msit quantization code):
+    - First (1 - high_fraction) channels: low precision (4-bit)
+    - Last high_fraction channels: high precision (8-bit)
     
     Args:
         x: Input tensor [..., hidden_dim]
@@ -65,12 +137,14 @@ def apply_mixed_precision_fake_quant(x: torch.Tensor, high_fraction: float = 0.1
     """
     hidden_dim = x.shape[-1]
     k_high = int(hidden_dim * high_fraction)
+    k_low = hidden_dim - k_high
     
-    if k_high > 0 and k_high < hidden_dim:
-        # Split, fake quantize with different bits, concat back
-        x_high = fake_quantize_per_token(x[..., :k_high], bits=high_bits)
-        x_low = fake_quantize_per_token(x[..., k_high:], bits=low_bits)
-        return torch.cat([x_high, x_low], dim=-1)
+    if k_high > 0 and k_low > 0:
+        # Split: first part is low (4-bit), last part is high (8-bit)
+        # This matches msit: weight_low = weight[:, :low_dim], weight_high = weight[:, low_dim:]
+        x_low = fake_quantize_per_token(x[..., :k_low], bits=low_bits)
+        x_high = fake_quantize_per_token(x[..., k_low:], bits=high_bits)
+        return torch.cat([x_low, x_high], dim=-1)
     else:
         # No split, use single precision
         return fake_quantize_per_token(x, bits=high_bits)
