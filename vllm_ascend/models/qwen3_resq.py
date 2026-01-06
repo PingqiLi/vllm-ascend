@@ -6,13 +6,21 @@ Assumes weights have been preprocessed to bf16 using preprocess_resq_weights.py.
 
 Key differences from standard Qwen3:
 1. Qwen3ResQAttention: Applies R3 rotation to Q/K after RoPE
-2. Qwen3ResQDecoderLayer: Marks down_proj for R4 rotation, registers rotation parameters
-3. Qwen3ResQForCausalLM: Uses WeightsMapper for rotation parameter naming
+2. Qwen3ResQMLP: Applies R4 rotation before down_proj
+3. Optional W4A4 fake quantization for accuracy testing
+
+Usage:
+    # Without fake quantization (default, for debugging rotations):
+    RESQ_FAKE_QUANT = False
+    
+    # With fake quantization (for W4A4 accuracy testing):
+    RESQ_FAKE_QUANT = True
 """
 from typing import Iterable, Optional
 import torch
 import torch.nn as nn
 import logging
+import os
 
 from transformers import Qwen2Config as Qwen3Config
 
@@ -25,19 +33,53 @@ from vllm.model_executor.models.utils import maybe_prefix, PPMissingLayer
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.attention import Attention
 
-# Import rotation function
-from vllm_ascend.quantization.w4a4_resq_dynamic import apply_rotation
+# Import rotation and fake quant functions
+from vllm_ascend.quantization.w4a4_resq_dynamic import (
+    apply_rotation, fake_quantize_per_token
+)
 
 # Setup logger for ResQ debugging
 logger = logging.getLogger(__name__)
 
-# Debug flag - set to True to enable detailed logging
-RESQ_DEBUG = True
+# Configuration flags (can be set via environment variables)
+RESQ_DEBUG = os.environ.get("RESQ_DEBUG", "0") == "1"
+RESQ_FAKE_QUANT = os.environ.get("RESQ_FAKE_QUANT", "1") == "1"
+RESQ_HIGH_BITS = int(os.environ.get("RESQ_HIGH_BITS", "8"))
+RESQ_LOW_BITS = int(os.environ.get("RESQ_LOW_BITS", "4"))
+RESQ_HIGH_FRACTION = float(os.environ.get("RESQ_HIGH_FRACTION", "0.125"))
+
+
+def apply_mixed_precision_fake_quant(x: torch.Tensor, high_fraction: float = 0.125,
+                                      high_bits: int = 8, low_bits: int = 4) -> torch.Tensor:
+    """
+    Apply mixed-precision fake quantization to activation tensor.
+    
+    Args:
+        x: Input tensor [..., hidden_dim]
+        high_fraction: Fraction of channels using high precision (default 0.125 = 12.5%)
+        high_bits: Bits for high-precision part (default 8)
+        low_bits: Bits for low-precision part (default 4)
+    
+    Returns:
+        Fake-quantized tensor (same shape as input)
+    """
+    hidden_dim = x.shape[-1]
+    k_high = int(hidden_dim * high_fraction)
+    
+    if k_high > 0 and k_high < hidden_dim:
+        # Split, fake quantize with different bits, concat back
+        x_high = fake_quantize_per_token(x[..., :k_high], bits=high_bits)
+        x_low = fake_quantize_per_token(x[..., k_high:], bits=low_bits)
+        return torch.cat([x_high, x_low], dim=-1)
+    else:
+        # No split, use single precision
+        return fake_quantize_per_token(x, bits=high_bits)
 
 
 class Qwen3ResQAttention(Qwen3Attention):
     """
     Qwen3 Attention with ResQ R3 rotation applied after RoPE.
+    Optionally applies W4A4 fake quantization when RESQ_FAKE_QUANT=1.
     """
     _debug_logged = False  # Class-level flag to log only once
     
@@ -62,18 +104,20 @@ class Qwen3ResQAttention(Qwen3Attention):
         if RESQ_DEBUG and not Qwen3ResQAttention._debug_logged:
             Qwen3ResQAttention._debug_logged = True
             logger.warning(f"[ResQ] Qwen3ResQAttention.forward called")
+            logger.warning(f"[ResQ]   RESQ_FAKE_QUANT={RESQ_FAKE_QUANT}, HIGH_BITS={RESQ_HIGH_BITS}, LOW_BITS={RESQ_LOW_BITS}")
             logger.warning(f"[ResQ]   rotation_R3.numel()={self.rotation_R3.numel()}, shape={self.rotation_R3.shape}")
             logger.warning(f"[ResQ]   hidden_states: shape={hidden_states.shape}, dtype={hidden_states.dtype}")
             if self.rotation_R3.numel() > 0:
-                logger.warning(f"[ResQ]   rotation_R3 stats: min={self.rotation_R3.min():.4f}, max={self.rotation_R3.max():.4f}, mean={self.rotation_R3.mean():.4f}")
-            # Check qkv_proj weight
+                logger.warning(f"[ResQ]   rotation_R3 stats: min={self.rotation_R3.min():.4f}, max={self.rotation_R3.max():.4f}")
             if hasattr(self.qkv_proj, 'weight'):
                 w = self.qkv_proj.weight
-                logger.warning(f"[ResQ]   qkv_proj.weight: shape={w.shape}, dtype={w.dtype}, min={w.min():.4f}, max={w.max():.4f}")
-                if torch.isnan(w).any():
-                    logger.error(f"[ResQ] ERROR: qkv_proj.weight contains NaN!")
-                if torch.isinf(w).any():
-                    logger.error(f"[ResQ] ERROR: qkv_proj.weight contains Inf!")
+                logger.warning(f"[ResQ]   qkv_proj.weight: shape={w.shape}, min={w.min():.4f}, max={w.max():.4f}")
+        
+        # Apply fake quantization to input (simulating dynamic activation quantization)
+        if RESQ_FAKE_QUANT:
+            hidden_states = apply_mixed_precision_fake_quant(
+                hidden_states, RESQ_HIGH_FRACTION, RESQ_HIGH_BITS, RESQ_LOW_BITS
+            )
         
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -99,6 +143,13 @@ class Qwen3ResQAttention(Qwen3Attention):
             k = apply_rotation(k, rot_mat)
 
         attn_output = self.attn(q, k, v)
+        
+        # Apply fake quantization to o_proj input
+        if RESQ_FAKE_QUANT:
+            attn_output = apply_mixed_precision_fake_quant(
+                attn_output, RESQ_HIGH_FRACTION, RESQ_HIGH_BITS, RESQ_LOW_BITS
+            )
+        
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -106,6 +157,7 @@ class Qwen3ResQAttention(Qwen3Attention):
 class Qwen3ResQMLP(Qwen3MLP):
     """
     Qwen3 MLP with ResQ R4 rotation applied before down_proj.
+    Optionally applies W4A4 fake quantization when RESQ_FAKE_QUANT=1.
     """
     _debug_logged = False  # Class-level flag to log only once
     
@@ -129,17 +181,22 @@ class Qwen3ResQMLP(Qwen3MLP):
         if RESQ_DEBUG and not Qwen3ResQMLP._debug_logged:
             Qwen3ResQMLP._debug_logged = True
             logger.warning(f"[ResQ] Qwen3ResQMLP.forward called")
+            logger.warning(f"[ResQ]   RESQ_FAKE_QUANT={RESQ_FAKE_QUANT}")
             logger.warning(f"[ResQ]   rotation_R4.numel()={self.rotation_R4.numel()}, shape={self.rotation_R4.shape}")
             if self.rotation_R4.numel() > 0:
                 logger.warning(f"[ResQ]   rotation_R4 stats: min={self.rotation_R4.min():.4f}, max={self.rotation_R4.max():.4f}")
-            # Check gate_up_proj weight
             if hasattr(self.gate_up_proj, 'weight'):
                 w = self.gate_up_proj.weight
-                logger.warning(f"[ResQ]   gate_up_proj.weight: shape={w.shape}, dtype={w.dtype}, min={w.min():.4f}, max={w.max():.4f}")
-            # Check down_proj weight
+                logger.warning(f"[ResQ]   gate_up_proj.weight: shape={w.shape}, min={w.min():.4f}, max={w.max():.4f}")
             if hasattr(self.down_proj, 'weight'):
                 w = self.down_proj.weight
-                logger.warning(f"[ResQ]   down_proj.weight: shape={w.shape}, dtype={w.dtype}, min={w.min():.4f}, max={w.max():.4f}")
+                logger.warning(f"[ResQ]   down_proj.weight: shape={w.shape}, min={w.min():.4f}, max={w.max():.4f}")
+        
+        # Apply fake quantization to gate_up_proj input
+        if RESQ_FAKE_QUANT:
+            x = apply_mixed_precision_fake_quant(
+                x, RESQ_HIGH_FRACTION, RESQ_HIGH_BITS, RESQ_LOW_BITS
+            )
         
         # gate_up_proj: [batch, seq, hidden] -> [batch, seq, 2 * intermediate]
         gate_up, _ = self.gate_up_proj(x)
@@ -150,12 +207,17 @@ class Qwen3ResQMLP(Qwen3MLP):
         up = gate_up[..., i:]
         
         # SiLU(gate) * up
-        from vllm.model_executor.layers.activation import SiluAndMul
         intermediate = torch.nn.functional.silu(gate) * up
         
         # Apply R4 rotation before down_proj
         if self.rotation_R4.numel() > 0:
             intermediate = apply_rotation(intermediate, self.rotation_R4)
+        
+        # Apply fake quantization to down_proj input (after R4 rotation)
+        if RESQ_FAKE_QUANT:
+            intermediate = apply_mixed_precision_fake_quant(
+                intermediate, RESQ_HIGH_FRACTION, RESQ_HIGH_BITS, RESQ_LOW_BITS
+            )
         
         # down_proj
         output, _ = self.down_proj(intermediate)
