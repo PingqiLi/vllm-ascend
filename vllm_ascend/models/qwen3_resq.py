@@ -12,6 +12,7 @@ Key differences from standard Qwen3:
 from typing import Iterable, Optional
 import torch
 import torch.nn as nn
+import logging
 
 from transformers import Qwen2Config as Qwen3Config
 
@@ -27,11 +28,19 @@ from vllm.attention import Attention
 # Import rotation function
 from vllm_ascend.quantization.w4a4_resq_dynamic import apply_rotation
 
+# Setup logger for ResQ debugging
+logger = logging.getLogger(__name__)
+
+# Debug flag - set to True to enable detailed logging
+RESQ_DEBUG = True
+
 
 class Qwen3ResQAttention(Qwen3Attention):
     """
     Qwen3 Attention with ResQ R3 rotation applied after RoPE.
     """
+    _debug_logged = False  # Class-level flag to log only once
+    
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.apply_resq_rotation = True
@@ -40,6 +49,8 @@ class Qwen3ResQAttention(Qwen3Attention):
         self.register_parameter("rotation_R3", nn.Parameter(torch.empty(0), requires_grad=False))
         # Custom loader to handle empty -> actual shape
         def rotation_loader(param, loaded_weight):
+            if RESQ_DEBUG:
+                logger.warning(f"[ResQ] Loading rotation_R3: loaded_weight.shape={loaded_weight.shape}")
             if param.data.shape != loaded_weight.shape:
                 param.data = loaded_weight.clone()
             else:
@@ -47,6 +58,23 @@ class Qwen3ResQAttention(Qwen3Attention):
         setattr(self.rotation_R3, "weight_loader", rotation_loader)
 
     def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
+        # Debug logging (only once)
+        if RESQ_DEBUG and not Qwen3ResQAttention._debug_logged:
+            Qwen3ResQAttention._debug_logged = True
+            logger.warning(f"[ResQ] Qwen3ResQAttention.forward called")
+            logger.warning(f"[ResQ]   rotation_R3.numel()={self.rotation_R3.numel()}, shape={self.rotation_R3.shape}")
+            logger.warning(f"[ResQ]   hidden_states: shape={hidden_states.shape}, dtype={hidden_states.dtype}")
+            if self.rotation_R3.numel() > 0:
+                logger.warning(f"[ResQ]   rotation_R3 stats: min={self.rotation_R3.min():.4f}, max={self.rotation_R3.max():.4f}, mean={self.rotation_R3.mean():.4f}")
+            # Check qkv_proj weight
+            if hasattr(self.qkv_proj, 'weight'):
+                w = self.qkv_proj.weight
+                logger.warning(f"[ResQ]   qkv_proj.weight: shape={w.shape}, dtype={w.dtype}, min={w.min():.4f}, max={w.max():.4f}")
+                if torch.isnan(w).any():
+                    logger.error(f"[ResQ] ERROR: qkv_proj.weight contains NaN!")
+                if torch.isinf(w).any():
+                    logger.error(f"[ResQ] ERROR: qkv_proj.weight contains Inf!")
+        
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         
@@ -79,6 +107,8 @@ class Qwen3ResQMLP(Qwen3MLP):
     """
     Qwen3 MLP with ResQ R4 rotation applied before down_proj.
     """
+    _debug_logged = False  # Class-level flag to log only once
+    
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         
@@ -86,6 +116,8 @@ class Qwen3ResQMLP(Qwen3MLP):
         self.register_parameter("rotation_R4", nn.Parameter(torch.empty(0), requires_grad=False))
         # Custom loader to handle empty -> actual shape
         def rotation_loader(param, loaded_weight):
+            if RESQ_DEBUG:
+                logger.warning(f"[ResQ] Loading rotation_R4: loaded_weight.shape={loaded_weight.shape}")
             if param.data.shape != loaded_weight.shape:
                 param.data = loaded_weight.clone()
             else:
@@ -93,6 +125,22 @@ class Qwen3ResQMLP(Qwen3MLP):
         setattr(self.rotation_R4, "weight_loader", rotation_loader)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Debug logging (only once)
+        if RESQ_DEBUG and not Qwen3ResQMLP._debug_logged:
+            Qwen3ResQMLP._debug_logged = True
+            logger.warning(f"[ResQ] Qwen3ResQMLP.forward called")
+            logger.warning(f"[ResQ]   rotation_R4.numel()={self.rotation_R4.numel()}, shape={self.rotation_R4.shape}")
+            if self.rotation_R4.numel() > 0:
+                logger.warning(f"[ResQ]   rotation_R4 stats: min={self.rotation_R4.min():.4f}, max={self.rotation_R4.max():.4f}")
+            # Check gate_up_proj weight
+            if hasattr(self.gate_up_proj, 'weight'):
+                w = self.gate_up_proj.weight
+                logger.warning(f"[ResQ]   gate_up_proj.weight: shape={w.shape}, dtype={w.dtype}, min={w.min():.4f}, max={w.max():.4f}")
+            # Check down_proj weight
+            if hasattr(self.down_proj, 'weight'):
+                w = self.down_proj.weight
+                logger.warning(f"[ResQ]   down_proj.weight: shape={w.shape}, dtype={w.dtype}, min={w.min():.4f}, max={w.max():.4f}")
+        
         # gate_up_proj: [batch, seq, hidden] -> [batch, seq, 2 * intermediate]
         gate_up, _ = self.gate_up_proj(x)
         
@@ -241,12 +289,28 @@ class Qwen3ResQForCausalLM(Qwen3ForCausalLM):
         """
         from vllm.model_executor.models.utils import AutoWeightsLoader
         
-        # Custom weight loader that handles empty rotation parameters
-        def rotation_param_loader(param, loaded_weight):
-            if param.data.shape != loaded_weight.shape:
-                param.data = loaded_weight.clone()
-            else:
-                param.data.copy_(loaded_weight)
+        if RESQ_DEBUG:
+            logger.warning("[ResQ] load_weights called")
+            # Log first few weight names and shapes
+            weights_list = list(weights)
+            logger.warning(f"[ResQ] Total weights in checkpoint: {len(weights_list)}")
+            
+            # Check for rotation weights
+            rotation_count = 0
+            sample_weights = []
+            for name, tensor in weights_list[:20]:
+                sample_weights.append(f"  {name}: shape={tensor.shape}, dtype={tensor.dtype}")
+            for name, tensor in weights_list:
+                if "rotation" in name:
+                    rotation_count += 1
+                    logger.warning(f"[ResQ] Found rotation weight: {name}, shape={tensor.shape}")
+            logger.warning(f"[ResQ] Sample weights (first 20):")
+            for s in sample_weights:
+                logger.warning(f"[ResQ] {s}")
+            logger.warning(f"[ResQ] Total rotation weights found: {rotation_count}")
+            
+            # Convert back to iterator for loader
+            weights = iter(weights_list)
         
         # Set custom loader on rotation parameters after loading
         loader = AutoWeightsLoader(
@@ -254,4 +318,13 @@ class Qwen3ResQForCausalLM(Qwen3ForCausalLM):
             skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
         )
         
-        return loader.load_weights(weights)
+        loaded_keys = loader.load_weights(weights)
+        
+        if RESQ_DEBUG:
+            logger.warning(f"[ResQ] Loaded {len(loaded_keys)} weight keys")
+            # Check if rotation parameters were loaded by checking their sizes
+            for name, param in self.named_parameters():
+                if "rotation" in name:
+                    logger.warning(f"[ResQ] After loading - {name}: numel={param.numel()}, shape={param.shape}")
+        
+        return loaded_keys
