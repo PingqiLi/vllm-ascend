@@ -111,7 +111,7 @@ def matmul_hadU(x: torch.Tensor, hadK: Optional[torch.Tensor], K: int) -> torch.
     
     # Reshape to apply block-wise transform: [..., n] -> [-1, K, n/K]
     original_shape = x.shape
-    input_tensor = x.view(-1, K, n // K)
+    input_tensor = x.reshape(-1, K, n // K)
     
     # Apply fast Hadamard to the n/K dimension (butterfly algorithm)
     input_tensor = hadamard_transform(input_tensor.contiguous()) / math.sqrt(n)
@@ -155,10 +155,134 @@ def apply_rotation(x: torch.Tensor, rotation_matrix: Optional[torch.Tensor] = No
         raise ValueError(f"Feature dim {N} must be divisible by rotation block size {K}")
     
     num_blocks = N // K
-    x_blocked = x.view(*original_shape[:-1], num_blocks, K)
+    x_blocked = x.reshape(*original_shape[:-1], num_blocks, K)
     x_rotated = torch.matmul(x_blocked, R)
-    return x_rotated.view(*original_shape)
+    return x_rotated.reshape(*original_shape)
 
+
+def apply_resq_hadamard_rotation_tp(
+    x: torch.Tensor,
+    Pd: Optional[torch.Tensor] = None,
+    Hd: Optional[torch.Tensor] = None,
+    Hd_K: int = 1,
+    blocksize: int = 256,
+    tp_size: int = 1,
+    tp_rank: int = 0,
+) -> torch.Tensor:
+    """
+    Apply ResQ Hadamard rotation with Tensor Parallelism support.
+    
+    Weight transformation in msmodelslim:
+        W'_d = Ua.T @ Wd @ block_diag(Pd.T) @ H
+    
+    For correct forward pass with TP:
+        1. Apply block_diag(Pd.T) locally (each block is independent)
+        2. Apply H_butterfly locally to each blocksize-dim block
+        3. All-gather across TP ranks
+        4. Apply Hd to mix all K blocks
+        5. Slice back to local portion
+    
+    Args:
+        x: Input tensor [..., local_intermediate_size]
+        Pd: Block rotation matrix [blocksize, blocksize]
+        Hd: Hadamard block matrix [K, K]
+        Hd_K: Global K for Hadamard factorization
+        blocksize: Block size for Pd (e.g., 256)
+        tp_size: Tensor parallelism size
+        tp_rank: Current TP rank
+    
+    Returns:
+        Rotated tensor [..., local_intermediate_size]
+    """
+    if Pd is None and Hd is None:
+        return x
+    
+    original_shape = x.shape
+    n_local = original_shape[-1]  # local intermediate_size
+    num_local_blocks = n_local // blocksize
+    
+    # Step 1: Apply block_diag(Pd.T) locally
+    # Each blocksize-dim block is independent, so this works with TP
+    if Pd is not None:
+        Pd = Pd.to(device=x.device, dtype=x.dtype)
+        
+        # Reshape: [..., n_local] -> [..., num_local_blocks, blocksize]
+        x = x.reshape(*original_shape[:-1], num_local_blocks, blocksize)
+        # Apply Pd.T to each block
+        x = torch.matmul(x, Pd.T)
+        # Reshape back
+        x = x.reshape(*original_shape)
+    
+    # Step 2: Apply H = Hd ⊗ H_butterfly with TP handling
+    if Hd is not None and Hd_K > 1:
+        # H = Hd ⊗ H_butterfly where:
+        #   - H_butterfly is [blocksize, blocksize] applied to each block locally
+        #   - Hd is [K, K] mixing all K blocks (requires all-gather for TP)
+        
+        # First, apply H_butterfly locally to each blocksize-dim block
+        x = x.reshape(*original_shape[:-1], num_local_blocks, blocksize)
+        x = hadamard_transform(x.contiguous())  # Apply to last dim (blocksize)
+        
+        # Global normalization factor
+        n_global = n_local * tp_size
+        x = x / math.sqrt(n_global)
+        
+        if tp_size > 1:
+            # All-gather across TP ranks to get full [..., K, blocksize] tensor
+            from vllm.distributed.communication_op import tensor_model_parallel_all_gather
+            
+            # x shape: [..., num_local_blocks, blocksize]
+            # Flatten batch dimensions for all-gather
+            batch_shape = x.shape[:-2]
+            batch_size = 1
+            for dim in batch_shape:
+                batch_size *= dim
+            x_flat = x.reshape(batch_size, num_local_blocks, blocksize)
+            
+            # All-gather along the blocks dimension (dim=1)
+            # Input: [batch, local_blocks, blocksize]
+            # Output: [batch, K, blocksize] where K = local_blocks * tp_size
+            gathered = tensor_model_parallel_all_gather(x_flat, dim=1)
+            
+            # Apply Hd to mix all K blocks
+            Hd = Hd.to(device=x.device, dtype=x.dtype)
+            # Hd: [K, K], gathered: [batch, K, blocksize]
+            # mixed[b, i, k] = sum_j Hd[i, j] * gathered[b, j, k]
+            mixed = torch.einsum('ij,bjk->bik', Hd, gathered)
+            
+            # Slice back to local portion
+            blocks_per_rank = Hd_K // tp_size
+            start_block = tp_rank * blocks_per_rank
+            end_block = start_block + blocks_per_rank
+            x = mixed[:, start_block:end_block, :].contiguous()  # Make contiguous after slice
+            
+            # Reshape back to original batch dimensions
+            x = x.reshape(*batch_shape, num_local_blocks, blocksize)
+        else:
+            # No TP, apply Hd directly
+            Hd = Hd.to(device=x.device, dtype=x.dtype)
+            # x: [..., K, blocksize], Hd: [K, K]
+            # Reshape for matmul: [..., K, blocksize] -> [batch, K, blocksize]
+            batch_shape = x.shape[:-2]
+            batch_size = 1
+            for dim in batch_shape:
+                batch_size *= dim
+            x = x.reshape(batch_size, Hd_K, blocksize)
+            x = torch.einsum('ij,bjk->bik', Hd, x)
+            x = x.reshape(*batch_shape, Hd_K, blocksize)
+        
+        # Reshape back to [..., n_local]
+        x = x.reshape(*original_shape)
+    
+    elif Hd_K == 1 or Hd is None:
+        # Pure power-of-2: just apply butterfly Hadamard locally
+        n_global = n_local * tp_size
+        x = hadamard_transform(x.contiguous()) / math.sqrt(n_global)
+    
+    return x
+
+
+_RESQ_ROTATION_DEBUG_LOGGED = False
 
 def apply_resq_hadamard_rotation(
     x: torch.Tensor,
@@ -167,55 +291,43 @@ def apply_resq_hadamard_rotation(
     Hd_K: int = 1,
 ) -> torch.Tensor:
     """
-    Apply ResQ Hadamard rotation for inference: x @ block_diag(Pd.T) @ H
+    Apply ResQ Hadamard rotation for inference (TP-aware version).
     
-    This is the inverse of the weight transformation.
-    
-    Weight transformation in msmodelslim:
-        W'_d = Ua.T @ Wd @ block_diag(Pd.T) @ H
-    
-    For correct forward pass:
-        y = (x @ T) @ W'_d.T = x @ Wd.T @ Ua
-    
-    Where T = (H.T @ block_diag(Pd))^{-1} = block_diag(Pd.T) @ H
-    
-    The key insight: we apply Pd.T (transpose of Pd), not Pd!
-    This ensures Pd.T @ Pd = I for orthonormal Pd.
-    
-    Args:
-        x: Input tensor [..., intermediate_size]
-        Pd: Block rotation matrix [blocksize, blocksize] (eigenvector basis from checkpoint)
-        Hd: Hadamard block matrix [K, K] (may be None for power-of-2)
-        Hd_K: Block size for Hadamard factorization
-    
-    Returns:
-        Rotated tensor [..., intermediate_size]
+    Detects TP configuration automatically and routes to appropriate implementation.
     """
-    if Pd is None and Hd is None:
-        return x
+    global _RESQ_ROTATION_DEBUG_LOGGED
     
-    original_shape = x.shape
-    n = original_shape[-1]  # intermediate_size
+    from vllm.distributed import get_tensor_model_parallel_world_size, get_tensor_model_parallel_rank
     
-    # Step 1: Apply block_diag(Pd.T) - use TRANSPOSE of Pd
-    # This is critical: weight has Pd.T, so we need Pd.T @ Pd = I to cancel
-    if Pd is not None:
-        Pd = Pd.to(device=x.device, dtype=x.dtype)
-        blocksize = Pd.shape[0]
-        num_blocks = n // blocksize
-        
-        # Reshape: [..., n] -> [..., num_blocks, blocksize]
-        x = x.view(*original_shape[:-1], num_blocks, blocksize)
-        # Apply Pd.T to each block: [..., num_blocks, blocksize] @ [blocksize, blocksize]
-        x = torch.matmul(x, Pd.T)  # Use Pd.T, not Pd!
-        # Reshape back: [..., num_blocks, blocksize] -> [..., n]
-        x = x.view(*original_shape)
+    tp_size = get_tensor_model_parallel_world_size()
+    tp_rank = get_tensor_model_parallel_rank()
     
-    # Step 2: Apply H = Hd ⊗ H_butterfly
-    if Hd is not None or Hd_K > 0:
-        x = matmul_hadU(x, Hd, Hd_K)
+    # Get blocksize from Pd
+    blocksize = Pd.shape[0] if Pd is not None else 256
     
-    return x
+    # Debug logging (only once)
+    if RESQ_DEBUG and not _RESQ_ROTATION_DEBUG_LOGGED:
+        _RESQ_ROTATION_DEBUG_LOGGED = True
+        n_local = x.shape[-1]
+        num_local_blocks = n_local // blocksize
+        n_global = n_local * tp_size
+        global_K = Hd_K
+        logger.warning(f"[ResQ Rotation] TP Configuration:")
+        logger.warning(f"  tp_size={tp_size}, tp_rank={tp_rank}")
+        logger.warning(f"  x.shape={x.shape}, n_local={n_local}")
+        logger.warning(f"  blocksize={blocksize}, num_local_blocks={num_local_blocks}")
+        logger.warning(f"  n_global={n_global}, global_K={global_K}")
+        logger.warning(f"  Pd.shape={Pd.shape if Pd is not None else None}")
+        logger.warning(f"  Hd.shape={Hd.shape if Hd is not None else None}")
+        if Hd is not None and Hd_K > 1:
+            blocks_per_rank = Hd_K // tp_size
+            logger.warning(f"  blocks_per_rank={blocks_per_rank}")
+            if Hd_K % tp_size != 0:
+                logger.warning(f"  WARNING: Hd_K ({Hd_K}) not divisible by tp_size ({tp_size})!")
+    
+    return apply_resq_hadamard_rotation_tp(
+        x, Pd, Hd, Hd_K, blocksize, tp_size, tp_rank
+    )
 
 
 def fake_quantize_per_token(x: torch.Tensor, bits: int = 8, sym: bool = True) -> torch.Tensor:
@@ -334,13 +446,15 @@ class Qwen3ResQAttention(Qwen3Attention):
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         
         # QK norm
-        q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
+        q_shape = q.shape
+        q_by_head = q.reshape(*q_shape[:-1], q_shape[-1] // self.head_dim, self.head_dim)
         q_by_head = self.q_norm(q_by_head)
-        q = q_by_head.view(q.shape)
+        q = q_by_head.reshape(q_shape)
         
-        k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim)
+        k_shape = k.shape
+        k_by_head = k.reshape(*k_shape[:-1], k_shape[-1] // self.head_dim, self.head_dim)
         k_by_head = self.k_norm(k_by_head)
-        k = k_by_head.view(k.shape)
+        k = k_by_head.reshape(k_shape)
 
         # Apply RoPE
         q, k = self.rotary_emb(positions, q, k)
