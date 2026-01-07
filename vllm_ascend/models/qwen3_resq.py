@@ -6,7 +6,7 @@ Assumes weights have been preprocessed to bf16 using preprocess_resq_weights.py.
 
 Key differences from standard Qwen3:
 1. Qwen3ResQAttention: Applies R3 rotation to Q/K after RoPE
-2. Qwen3ResQMLP: Applies R4 rotation before down_proj
+2. Qwen3ResQMLP: Applies Hadamard rotation before down_proj
 3. Optional W4A4 fake quantization for accuracy testing
 
 Usage:
@@ -16,7 +16,8 @@ Usage:
     # With fake quantization (for W4A4 accuracy testing, default):
     RESQ_FAKE_QUANT=1 vllm serve ...
 """
-from typing import Iterable, Optional
+from typing import Iterable, Optional, Tuple
+import math
 import torch
 import torch.nn as nn
 import logging
@@ -42,6 +43,84 @@ RESQ_FAKE_QUANT = os.environ.get("RESQ_FAKE_QUANT", "1") == "1"
 RESQ_HIGH_BITS = int(os.environ.get("RESQ_HIGH_BITS", "8"))
 RESQ_LOW_BITS = int(os.environ.get("RESQ_LOW_BITS", "4"))
 RESQ_HIGH_FRACTION = float(os.environ.get("RESQ_HIGH_FRACTION", "0.125"))
+
+
+# ============================================================================
+# Hadamard Transform Utilities
+# ============================================================================
+
+def is_pow2(n: int) -> bool:
+    """Check if n is a power of 2."""
+    return (n & (n - 1) == 0) and (n > 0)
+
+
+def hadamard_transform(u: torch.Tensor) -> torch.Tensor:
+    """
+    Fast Hadamard transform using butterfly algorithm.
+    
+    Works on CPU/NPU without CUDA kernels.
+    
+    Args:
+        u: Input tensor with last dimension being power of 2
+    
+    Returns:
+        Hadamard transformed tensor (unnormalized)
+    """
+    n = u.shape[-1]
+    assert is_pow2(n), f"Last dimension must be power of 2, got {n}"
+    
+    original_shape = u.shape
+    x = u.reshape(-1, n).clone()
+    
+    h = 1
+    while h < n:
+        x = x.view(-1, n // (2 * h), 2, h)
+        a = x[:, :, 0, :]
+        b = x[:, :, 1, :]
+        x = torch.stack([a + b, a - b], dim=2)
+        x = x.view(-1, n)
+        h *= 2
+    
+    return x.view(original_shape)
+
+
+def matmul_hadU(x: torch.Tensor, hadK: Optional[torch.Tensor], K: int) -> torch.Tensor:
+    """
+    Apply structured Hadamard transform.
+    
+    Computes X @ (hadK ⊗ H)^T where H is Hadamard of n/K dimension.
+    
+    For n = K * 2^m:
+    - hadK is [K, K] block matrix
+    - H_butterfly is [2^m, 2^m] Hadamard via butterfly algorithm
+    - Result is X @ (hadK ⊗ H_butterfly)
+    
+    Args:
+        x: Input tensor of shape [..., n]
+        hadK: Block matrix [K, K] (may be None for pure power-of-2)
+        K: Block size
+    
+    Returns:
+        Transformed tensor
+    """
+    n = x.shape[-1]
+    
+    if K == 1 or hadK is None:
+        # Pure power-of-2: use butterfly Hadamard only
+        return hadamard_transform(x.contiguous()) / math.sqrt(n)
+    
+    # Reshape to apply block-wise transform: [..., n] -> [-1, K, n/K]
+    original_shape = x.shape
+    input_tensor = x.view(-1, K, n // K)
+    
+    # Apply fast Hadamard to the n/K dimension (butterfly algorithm)
+    input_tensor = hadamard_transform(input_tensor.contiguous()) / math.sqrt(n)
+    
+    # Apply hadK block matrix: [K, K] @ [-1, K, n/K]
+    hadK = hadK.to(device=input_tensor.device, dtype=input_tensor.dtype)
+    input_tensor = hadK @ input_tensor
+    
+    return input_tensor.reshape(original_shape)
 
 
 # ============================================================================
@@ -79,6 +158,64 @@ def apply_rotation(x: torch.Tensor, rotation_matrix: Optional[torch.Tensor] = No
     x_blocked = x.view(*original_shape[:-1], num_blocks, K)
     x_rotated = torch.matmul(x_blocked, R)
     return x_rotated.view(*original_shape)
+
+
+def apply_resq_hadamard_rotation(
+    x: torch.Tensor,
+    Pd: Optional[torch.Tensor] = None,
+    Hd: Optional[torch.Tensor] = None,
+    Hd_K: int = 1,
+) -> torch.Tensor:
+    """
+    Apply ResQ Hadamard rotation for inference: x @ block_diag(Pd.T) @ H
+    
+    This is the inverse of the weight transformation.
+    
+    Weight transformation in msmodelslim:
+        W'_d = Ua.T @ Wd @ block_diag(Pd.T) @ H
+    
+    For correct forward pass:
+        y = (x @ T) @ W'_d.T = x @ Wd.T @ Ua
+    
+    Where T = (H.T @ block_diag(Pd))^{-1} = block_diag(Pd.T) @ H
+    
+    The key insight: we apply Pd.T (transpose of Pd), not Pd!
+    This ensures Pd.T @ Pd = I for orthonormal Pd.
+    
+    Args:
+        x: Input tensor [..., intermediate_size]
+        Pd: Block rotation matrix [blocksize, blocksize] (eigenvector basis from checkpoint)
+        Hd: Hadamard block matrix [K, K] (may be None for power-of-2)
+        Hd_K: Block size for Hadamard factorization
+    
+    Returns:
+        Rotated tensor [..., intermediate_size]
+    """
+    if Pd is None and Hd is None:
+        return x
+    
+    original_shape = x.shape
+    n = original_shape[-1]  # intermediate_size
+    
+    # Step 1: Apply block_diag(Pd.T) - use TRANSPOSE of Pd
+    # This is critical: weight has Pd.T, so we need Pd.T @ Pd = I to cancel
+    if Pd is not None:
+        Pd = Pd.to(device=x.device, dtype=x.dtype)
+        blocksize = Pd.shape[0]
+        num_blocks = n // blocksize
+        
+        # Reshape: [..., n] -> [..., num_blocks, blocksize]
+        x = x.view(*original_shape[:-1], num_blocks, blocksize)
+        # Apply Pd.T to each block: [..., num_blocks, blocksize] @ [blocksize, blocksize]
+        x = torch.matmul(x, Pd.T)  # Use Pd.T, not Pd!
+        # Reshape back: [..., num_blocks, blocksize] -> [..., n]
+        x = x.view(*original_shape)
+    
+    # Step 2: Apply H = Hd ⊗ H_butterfly
+    if Hd is not None or Hd_K > 0:
+        x = matmul_hadU(x, Hd, Hd_K)
+    
+    return x
 
 
 def fake_quantize_per_token(x: torch.Tensor, bits: int = 8, sym: bool = True) -> torch.Tensor:
@@ -230,25 +367,44 @@ class Qwen3ResQAttention(Qwen3Attention):
 
 class Qwen3ResQMLP(Qwen3MLP):
     """
-    Qwen3 MLP with ResQ R4 rotation applied before down_proj.
+    Qwen3 MLP with ResQ Hadamard rotation applied before down_proj.
     Optionally applies W4A4 fake quantization when RESQ_FAKE_QUANT=1.
+    
+    Hadamard mode: R = block_diag(Pd) @ H
+    - Pd: per-layer eigenvector basis [blocksize, blocksize]
+    - H = Hd ⊗ H_butterfly (Hd is shared across all layers)
+    
+    Note: Hd is shared across all layers. Each layer stores a reference to
+    the same tensor (set via set_shared_hadamard after loading weights).
     """
     _debug_logged = False  # Class-level flag to log only once
     
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         
-        # Register R4 parameter (will be loaded from checkpoint)
-        self.register_parameter("rotation_R4", nn.Parameter(torch.empty(0), requires_grad=False))
-        # Custom loader to handle empty -> actual shape
-        def rotation_loader(param, loaded_weight):
+        # Hadamard mode: Pd is per-layer, Hd is shared across layers
+        # Pd: per-layer eigenvector basis [blocksize, blocksize]
+        self.register_parameter("rotation_Pd", nn.Parameter(torch.empty(0), requires_grad=False))
+        
+        # Shared Hadamard parameters (set by set_shared_hadamard after loading)
+        # Using instance variables that will reference the same tensor across layers
+        self.shared_Hd: Optional[torch.Tensor] = None
+        self.shared_Hd_K: int = 1
+        
+        # Custom loader for Pd
+        def pd_loader(param, loaded_weight):
             if RESQ_DEBUG:
-                logger.warning(f"[ResQ] Loading rotation_R4: loaded_weight.shape={loaded_weight.shape}")
+                logger.warning(f"[ResQ] Loading rotation_Pd: loaded_weight.shape={loaded_weight.shape}")
             if param.data.shape != loaded_weight.shape:
                 param.data = loaded_weight.clone()
             else:
                 param.data.copy_(loaded_weight)
-        setattr(self.rotation_R4, "weight_loader", rotation_loader)
+        setattr(self.rotation_Pd, "weight_loader", pd_loader)
+    
+    def set_shared_hadamard(self, Hd: Optional[torch.Tensor], Hd_K: int):
+        """Set shared Hadamard matrix reference (same tensor object for all layers)."""
+        self.shared_Hd = Hd  # Store reference, not copy
+        self.shared_Hd_K = Hd_K
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Debug logging (only once)
@@ -256,9 +412,11 @@ class Qwen3ResQMLP(Qwen3MLP):
             Qwen3ResQMLP._debug_logged = True
             logger.warning(f"[ResQ] Qwen3ResQMLP.forward called")
             logger.warning(f"[ResQ]   RESQ_FAKE_QUANT={RESQ_FAKE_QUANT}")
-            logger.warning(f"[ResQ]   rotation_R4.numel()={self.rotation_R4.numel()}, shape={self.rotation_R4.shape}")
-            if self.rotation_R4.numel() > 0:
-                logger.warning(f"[ResQ]   rotation_R4 stats: min={self.rotation_R4.min():.4f}, max={self.rotation_R4.max():.4f}")
+            logger.warning(f"[ResQ]   rotation_Pd.numel()={self.rotation_Pd.numel()}, shape={self.rotation_Pd.shape}")
+            logger.warning(f"[ResQ]   shared_Hd: shape={self.shared_Hd.shape if self.shared_Hd is not None else None}")
+            logger.warning(f"[ResQ]   shared_Hd_K={self.shared_Hd_K}")
+            if self.rotation_Pd.numel() > 0:
+                logger.warning(f"[ResQ]   rotation_Pd stats: min={self.rotation_Pd.min():.4f}, max={self.rotation_Pd.max():.4f}")
             if hasattr(self.gate_up_proj, 'weight'):
                 w = self.gate_up_proj.weight
                 logger.warning(f"[ResQ]   gate_up_proj.weight: shape={w.shape}, min={w.min():.4f}, max={w.max():.4f}")
@@ -283,11 +441,17 @@ class Qwen3ResQMLP(Qwen3MLP):
         # SiLU(gate) * up
         intermediate = torch.nn.functional.silu(gate) * up
         
-        # Apply R4 rotation before down_proj
-        if self.rotation_R4.numel() > 0:
-            intermediate = apply_rotation(intermediate, self.rotation_R4)
+        # Apply Hadamard rotation before down_proj: R = block_diag(Pd) @ H
+        if self.rotation_Pd.numel() > 0:
+            # Use shared Hd (same tensor reference for all layers)
+            intermediate = apply_resq_hadamard_rotation(
+                intermediate,
+                Pd=self.rotation_Pd,
+                Hd=self.shared_Hd,
+                Hd_K=self.shared_Hd_K,
+            )
         
-        # Apply fake quantization to down_proj input (after R4 rotation)
+        # Apply fake quantization to down_proj input (after rotation)
         if RESQ_FAKE_QUANT:
             intermediate = apply_mixed_precision_fake_quant(
                 intermediate, RESQ_HIGH_FRACTION, RESQ_HIGH_BITS, RESQ_LOW_BITS
@@ -335,7 +499,7 @@ class Qwen3ResQDecoderLayer(Qwen3DecoderLayer):
             dual_chunk_attention_config=dual_chunk_attention_config,
         )
         
-        # Use ResQ MLP with R4 rotation
+        # Use ResQ MLP with Hadamard rotation
         self.mlp = Qwen3ResQMLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
@@ -420,23 +584,55 @@ class Qwen3ResQForCausalLM(Qwen3ForCausalLM):
         Load weights with rotation parameter name mapping.
         
         Preprocessed checkpoint uses:
-        - model.layers.X.self_attn.rotation_R3
-        - model.layers.X.mlp.rotation_R4
+        - model.layers.X.self_attn.rotation_R3 (Uc)
+        - model.layers.X.mlp.rotation_Pd (per-layer eigenvector basis)
+        - resq.Hd (global Hadamard block matrix)
+        - resq.Hd_K (global Hadamard block size)
         """
         from vllm.model_executor.models.utils import AutoWeightsLoader
         
+        # Collect weights and extract global ResQ parameters
+        weights_list = list(weights)
+        global_Hd = None
+        global_Hd_K = 1
+        filtered_weights = []
+        
+        # Detect Hadamard mode from checkpoint
+        has_rotation_Pd = False
+        
+        for name, tensor in weights_list:
+            if name == "resq.Hd":
+                global_Hd = tensor
+                if RESQ_DEBUG:
+                    logger.warning(f"[ResQ] Found global resq.Hd: shape={tensor.shape}")
+            elif name == "resq.Hd_K":
+                global_Hd_K = int(tensor.item())
+                if RESQ_DEBUG:
+                    logger.warning(f"[ResQ] Found global resq.Hd_K: {global_Hd_K}")
+            elif name.startswith("resq."):
+                # Skip other resq.* global params (intermediate_size, blocksize)
+                if RESQ_DEBUG:
+                    logger.warning(f"[ResQ] Skipping global param: {name}")
+            else:
+                filtered_weights.append((name, tensor))
+                # Check for rotation_Pd (Hadamard mode)
+                if "rotation_Pd" in name:
+                    has_rotation_Pd = True
+        
+        if RESQ_DEBUG:
+            logger.warning(f"[ResQ] Detected Hadamard mode: has_rotation_Pd={has_rotation_Pd}")
+        
         if RESQ_DEBUG:
             logger.warning("[ResQ] load_weights called")
-            # Log first few weight names and shapes
-            weights_list = list(weights)
             logger.warning(f"[ResQ] Total weights in checkpoint: {len(weights_list)}")
+            logger.warning(f"[ResQ] Filtered weights (excluding resq.*): {len(filtered_weights)}")
             
             # Check for rotation weights
             rotation_count = 0
             sample_weights = []
-            for name, tensor in weights_list[:20]:
+            for name, tensor in filtered_weights[:20]:
                 sample_weights.append(f"  {name}: shape={tensor.shape}, dtype={tensor.dtype}")
-            for name, tensor in weights_list:
+            for name, tensor in filtered_weights:
                 if "rotation" in name:
                     rotation_count += 1
                     logger.warning(f"[ResQ] Found rotation weight: {name}, shape={tensor.shape}")
@@ -444,17 +640,31 @@ class Qwen3ResQForCausalLM(Qwen3ForCausalLM):
             for s in sample_weights:
                 logger.warning(f"[ResQ] {s}")
             logger.warning(f"[ResQ] Total rotation weights found: {rotation_count}")
-            
-            # Convert back to iterator for loader
-            weights = iter(weights_list)
         
-        # Set custom loader on rotation parameters after loading
+        # Build skip prefixes
+        skip_prefixes = []
+        if self.config.tie_word_embeddings:
+            skip_prefixes.append("lm_head.")
+        
+        # Load standard weights using AutoWeightsLoader
         loader = AutoWeightsLoader(
             self,
-            skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
+            skip_prefixes=skip_prefixes if skip_prefixes else None,
         )
         
-        loaded_keys = loader.load_weights(weights)
+        loaded_keys = loader.load_weights(iter(filtered_weights))
+        
+        # Set shared Hadamard parameters (same tensor reference for all MLP layers)
+        if global_Hd is not None or global_Hd_K > 1:
+            if RESQ_DEBUG:
+                logger.warning(f"[ResQ] Setting shared Hd (shape={global_Hd.shape if global_Hd is not None else None}) and Hd_K={global_Hd_K}")
+            
+            # Pass the same tensor reference to all MLP layers (no copies)
+            for layer in self.model.layers:
+                if isinstance(layer, Qwen3ResQDecoderLayer):
+                    mlp = layer.mlp
+                    if isinstance(mlp, Qwen3ResQMLP):
+                        mlp.set_shared_hadamard(global_Hd, global_Hd_K)
         
         if RESQ_DEBUG:
             logger.warning(f"[ResQ] Loaded {len(loaded_keys)} weight keys")

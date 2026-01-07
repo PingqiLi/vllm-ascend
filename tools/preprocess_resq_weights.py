@@ -5,12 +5,14 @@ Preprocess ResQ quantized weights to standard bf16 format.
 This script takes a ResQ checkpoint with:
 - weight_low (int4), weight_high (int8)
 - scale_low, scale_high, offset_low, offset_high
-- Uc, Pd rotation matrices
+- Uc, Pd rotation matrices (Hadamard mode)
+- Global Hd, Hd_K parameters
 
 And produces a standard bf16 checkpoint with:
 - weight (dequantized bf16)
 - model.layers.X.self_attn.rotation_R3 (renamed from resq.layer.X.Uc)
-- model.layers.X.mlp.rotation_R4 (renamed from resq.layer.X.Pd)
+- model.layers.X.mlp.rotation_Pd (renamed from resq.layer.X.Pd)
+- resq.Hd, resq.Hd_K (preserved for Hadamard transform)
 
 Two modes are supported:
 - dequant: Dequantize int4/int8 weights using scales and offsets, then concat
@@ -156,11 +158,18 @@ def process_checkpoint(input_dir, output_dir, mode="dequant"):
             rotation_weights[new_key] = tensor
             continue
         elif key.endswith(".Pd"):
-            # resq.layer.X.Pd -> model.layers.X.mlp.rotation_R4
-            # (rotation_R4 is registered on Qwen3ResQMLP, not on down_proj)
+            # Hadamard mode: resq.layer.X.Pd -> model.layers.X.mlp.rotation_Pd
             new_key = key.replace("resq.layer.", "model.layers.")
-            new_key = new_key.replace(".Pd", ".mlp.rotation_R4")
+            new_key = new_key.replace(".Pd", ".mlp.rotation_Pd")
             rotation_weights[new_key] = tensor
+            continue
+        elif key.endswith(".Ud"):
+            # Random mode Ud is not supported, skip
+            print(f"  Skipping random mode parameter: {key}")
+            continue
+        elif key == "resq.Hd" or key == "resq.Hd_K" or key == "resq.intermediate_size" or key == "resq.down_proj_blocksize":
+            # Global Hadamard parameters - pass through as-is
+            rotation_weights[key] = tensor
             continue
         
         # Handle quantized weights
@@ -246,8 +255,12 @@ def process_checkpoint(input_dir, output_dir, mode="dequant"):
         output_weights[output_key] = processed
         print(f"  {output_key}: {processed.shape}")
     
-    # Filter out parameters starting with "resq."
-    output_weights = {k: v for k, v in output_weights.items() if not k.startswith("resq.")}
+    # Filter out intermediate resq.* parameters that shouldn't be in final checkpoint
+    # Keep: resq.Hd, resq.Hd_K (needed for Hadamard rotation at inference)
+    # Remove: other resq.* params (e.g., resq.intermediate_size, resq.down_proj_blocksize - only used during preprocessing)
+    keep_resq_keys = {"resq.Hd", "resq.Hd_K"}
+    output_weights = {k: v for k, v in output_weights.items() 
+                      if not k.startswith("resq.") or k in keep_resq_keys}
 
     # Save output
     output_file = os.path.join(output_dir, "model.safetensors")
