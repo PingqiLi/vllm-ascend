@@ -40,9 +40,55 @@ logger = logging.getLogger(__name__)
 # Configuration flags (can be set via environment variables)
 RESQ_DEBUG = os.environ.get("RESQ_DEBUG", "0") == "1"
 RESQ_FAKE_QUANT = os.environ.get("RESQ_FAKE_QUANT", "1") == "1"
+RESQ_SKIP_ROTATION = os.environ.get("RESQ_SKIP_ROTATION", "0") == "1"  # Skip all rotation for debugging
+RESQ_SKIP_PD = os.environ.get("RESQ_SKIP_PD", "0") == "1"  # Skip Pd, only apply Hadamard
+RESQ_SKIP_HADAMARD = os.environ.get("RESQ_SKIP_HADAMARD", "0") == "1"  # Skip Hadamard, only apply Pd
+RESQ_SKIP_R3 = os.environ.get("RESQ_SKIP_R3", "0") == "1"  # Skip R3/Uc rotation in Attention (Q/K post-RoPE)
 RESQ_HIGH_BITS = int(os.environ.get("RESQ_HIGH_BITS", "8"))
 RESQ_LOW_BITS = int(os.environ.get("RESQ_LOW_BITS", "4"))
 RESQ_HIGH_FRACTION = float(os.environ.get("RESQ_HIGH_FRACTION", "0.125"))
+RESQ_LOG_FILE = os.environ.get("RESQ_LOG_FILE", "/tmp/resq_debug.log")  # Debug log file path
+
+# Debug log file handle (only rank 0 writes)
+_resq_log_file = None
+
+def resq_log(msg: str, rank: int = 0, all_ranks: bool = False) -> None:
+    """Write debug message to per-rank log file.
+    
+    Each rank writes to its own file: /tmp/resq_debug_rank{N}.log
+    
+    Args:
+        msg: Message to log
+        rank: Rank filter - only log if current rank matches (unless all_ranks=True)
+        all_ranks: If True, log from all ranks
+    """
+    global _resq_log_file
+    if not RESQ_DEBUG:
+        return
+    
+    from vllm.distributed import get_tensor_model_parallel_rank
+    current_rank = get_tensor_model_parallel_rank()
+    
+    if not all_ranks and rank != current_rank:
+        return
+    
+    if _resq_log_file is None:
+        try:
+            # Each rank gets its own log file
+            log_path = RESQ_LOG_FILE.replace('.log', f'_rank{current_rank}.log')
+            if not log_path.endswith(f'_rank{current_rank}.log'):
+                log_path = f"{RESQ_LOG_FILE}_rank{current_rank}"
+            _resq_log_file = open(log_path, 'w')
+            _resq_log_file.write(f"=== ResQ Debug Log (Rank {current_rank}) ===\n\n")
+        except Exception as e:
+            logger.warning(f"[ResQ] Failed to open log file: {e}")
+            return
+    
+    try:
+        _resq_log_file.write(msg + "\n")
+        _resq_log_file.flush()
+    except Exception:
+        pass
 
 
 # ============================================================================
@@ -95,6 +141,9 @@ def matmul_hadU(x: torch.Tensor, hadK: Optional[torch.Tensor], K: int) -> torch.
     - H_butterfly is [2^m, 2^m] Hadamard via butterfly algorithm
     - Result is X @ (hadK ⊗ H_butterfly)
     
+    Note: This function auto-detects if hadK is normalized (elements ~±1/sqrt(K))
+    or unnormalized (elements ~±1) and adjusts normalization accordingly.
+    
     Args:
         x: Input tensor of shape [..., n]
         hadK: Block matrix [K, K] (may be None for pure power-of-2)
@@ -104,19 +153,32 @@ def matmul_hadU(x: torch.Tensor, hadK: Optional[torch.Tensor], K: int) -> torch.
         Transformed tensor
     """
     n = x.shape[-1]
+    blocksize = n // K if K > 1 else n
     
     if K == 1 or hadK is None:
         # Pure power-of-2: use butterfly Hadamard only
         return hadamard_transform(x.contiguous()) / math.sqrt(n)
     
+    # Check if hadK is already normalized
+    hadk_max = hadK.abs().max().item()
+    hadk_is_normalized = hadk_max < 0.5  # If max < 0.5, it's normalized
+    
     # Reshape to apply block-wise transform: [..., n] -> [-1, K, n/K]
     original_shape = x.shape
-    input_tensor = x.reshape(-1, K, n // K)
+    input_tensor = x.reshape(-1, K, blocksize)
     
-    # Apply fast Hadamard to the n/K dimension (butterfly algorithm)
-    input_tensor = hadamard_transform(input_tensor.contiguous()) / math.sqrt(n)
+    # Apply fast Hadamard to the blocksize dimension (butterfly algorithm)
+    input_tensor = hadamard_transform(input_tensor.contiguous())
     
-    # Apply hadK block matrix: [K, K] @ [-1, K, n/K]
+    # Normalization depends on whether hadK is already normalized
+    if hadk_is_normalized:
+        # hadK already has 1/sqrt(K) normalization, only need 1/sqrt(blocksize) for H_butterfly
+        input_tensor = input_tensor / math.sqrt(blocksize)
+    else:
+        # hadK is unnormalized, need full 1/sqrt(n) normalization
+        input_tensor = input_tensor / math.sqrt(n)
+    
+    # Apply hadK block matrix: [K, K] @ [-1, K, blocksize]
     hadK = hadK.to(device=input_tensor.device, dtype=input_tensor.dtype)
     input_tensor = hadK @ input_tensor
     
@@ -138,26 +200,31 @@ def apply_rotation(x: torch.Tensor, rotation_matrix: Optional[torch.Tensor] = No
         3. Reshape back to [..., N]
     
     This is mathematically equivalent to multiplying by a block-diagonal matrix.
+    Uses float32 for rotation to maintain precision.
     """
     if rotation_matrix is None:
         return x
     
-    R = rotation_matrix.to(device=x.device, dtype=x.dtype)
-    K = R.shape[0]  # Block size (e.g., 128 or 256)
+    original_dtype = x.dtype
+    K = rotation_matrix.shape[0]  # Block size (e.g., 128 or 256)
+    
+    # Use float32 for rotation precision
+    R = rotation_matrix.to(device=x.device, dtype=torch.float32)
+    x_f32 = x.float()
     
     original_shape = x.shape
     N = original_shape[-1]
     
     if N == K:
-        return torch.matmul(x, R)
+        return torch.matmul(x_f32, R).to(original_dtype)
     
     if N % K != 0:
         raise ValueError(f"Feature dim {N} must be divisible by rotation block size {K}")
     
     num_blocks = N // K
-    x_blocked = x.reshape(*original_shape[:-1], num_blocks, K)
+    x_blocked = x_f32.reshape(*original_shape[:-1], num_blocks, K)
     x_rotated = torch.matmul(x_blocked, R)
-    return x_rotated.reshape(*original_shape)
+    return x_rotated.reshape(*original_shape).to(original_dtype)
 
 
 def apply_resq_hadamard_rotation_tp(
@@ -197,35 +264,71 @@ def apply_resq_hadamard_rotation_tp(
     if Pd is None and Hd is None:
         return x
     
+    # Skip rotation entirely for debugging
+    if RESQ_SKIP_ROTATION:
+        return x
+    
     original_shape = x.shape
     n_local = original_shape[-1]  # local intermediate_size
     num_local_blocks = n_local // blocksize
     
+    # Debug: track input stats
+    if RESQ_DEBUG:
+        x_in_stats = f"min={x.min().item():.4f}, max={x.max().item():.4f}, mean={x.mean().item():.4f}"
+    
     # Step 1: Apply block_diag(Pd.T) locally
     # Each blocksize-dim block is independent, so this works with TP
-    if Pd is not None:
-        Pd = Pd.to(device=x.device, dtype=x.dtype)
+    # Use float32 for rotation to avoid bfloat16 precision loss
+    if Pd is not None and not RESQ_SKIP_PD:
+        original_dtype = x.dtype
+        Pd_f32 = Pd.to(device=x.device, dtype=torch.float32)
+        x_f32 = x.float()
         
         # Reshape: [..., n_local] -> [..., num_local_blocks, blocksize]
-        x = x.reshape(*original_shape[:-1], num_local_blocks, blocksize)
+        x_f32 = x_f32.reshape(*original_shape[:-1], num_local_blocks, blocksize)
         # Apply Pd.T to each block
-        x = torch.matmul(x, Pd.T)
-        # Reshape back
-        x = x.reshape(*original_shape)
+        x_f32 = torch.matmul(x_f32, Pd_f32.T)
+        # Reshape back and convert to original dtype
+        x = x_f32.reshape(*original_shape).to(original_dtype)
+        
+        if RESQ_DEBUG:
+            x_after_pd_stats = f"min={x.min().item():.4f}, max={x.max().item():.4f}, mean={x.mean().item():.4f}"
+            # Log per-rank stats after Pd.T (all ranks write)
+            x_norm_after_pd = x.norm().item()
+            resq_log(f"  [Rank {tp_rank}] After Pd.T: norm={x_norm_after_pd:.4f}, min={x.min().item():.4f}, max={x.max().item():.4f}", all_ranks=True)
     
     # Step 2: Apply H = Hd ⊗ H_butterfly with TP handling
-    if Hd is not None and Hd_K > 1:
+    # Use float32 for all Hadamard operations to maintain precision
+    #
+    # IMPORTANT: msmodelslim's Hd is NORMALIZED by 1/sqrt(K), but original ResQ's Hd is not!
+    # This means msmodelslim's matmul_hadU_cpu has an extra 1/sqrt(K) scaling factor.
+    # We need to multiply by sqrt(K) to compensate.
+    #
+    if Hd is not None and Hd_K > 1 and not RESQ_SKIP_HADAMARD:
         # H = Hd ⊗ H_butterfly where:
         #   - H_butterfly is [blocksize, blocksize] applied to each block locally
         #   - Hd is [K, K] mixing all K blocks (requires all-gather for TP)
+        
+        original_dtype = x.dtype
+        x = x.float()  # Convert to float32 for precision
         
         # First, apply H_butterfly locally to each blocksize-dim block
         x = x.reshape(*original_shape[:-1], num_local_blocks, blocksize)
         x = hadamard_transform(x.contiguous())  # Apply to last dim (blocksize)
         
-        # Global normalization factor
+        # CRITICAL: msit's matmul_hadU_cpu divides by sqrt(n_global) regardless of whether
+        # Hd is normalized. The normalized Hd (elements ±1/sqrt(K)) then provides an 
+        # additional 1/sqrt(K) factor, so the complete normalization is:
+        # - HadamardTransform / sqrt(n_global) * Hd_normalized = H_full / sqrt(K)
+        # To match msit exactly, we must also divide by sqrt(n_global)
         n_global = n_local * tp_size
         x = x / math.sqrt(n_global)
+        
+        if RESQ_DEBUG:
+            x_after_hbutterfly_stats = f"min={x.min().item():.4f}, max={x.max().item():.4f}, mean={x.mean().item():.4f}"
+            # Log per-rank stats to debug TP differences (all ranks write)
+            x_norm_local = x.norm().item()
+            resq_log(f"  [Rank {tp_rank}] After H_butterfly: norm={x_norm_local:.4f}, min={x.min().item():.4f}, max={x.max().item():.4f}", all_ranks=True)
         
         if tp_size > 1:
             # All-gather across TP ranks to get full [..., K, blocksize] tensor
@@ -244,11 +347,23 @@ def apply_resq_hadamard_rotation_tp(
             # Output: [batch, K, blocksize] where K = local_blocks * tp_size
             gathered = tensor_model_parallel_all_gather(x_flat, dim=1)
             
-            # Apply Hd to mix all K blocks
-            Hd = Hd.to(device=x.device, dtype=x.dtype)
+            if RESQ_DEBUG:
+                gathered_stats = f"shape={gathered.shape}, min={gathered.min().item():.4f}, max={gathered.max().item():.4f}"
+            
+            # Apply Hd to mix all K blocks (use float32)
+            Hd_f32 = Hd.to(device=x.device, dtype=torch.float32)
             # Hd: [K, K], gathered: [batch, K, blocksize]
             # mixed[b, i, k] = sum_j Hd[i, j] * gathered[b, j, k]
-            mixed = torch.einsum('ij,bjk->bik', Hd, gathered)
+            mixed = torch.einsum('ij,bjk->bik', Hd_f32, gathered)
+            
+            if RESQ_DEBUG:
+                mixed_stats = f"shape={mixed.shape}, min={mixed.min().item():.4f}, max={mixed.max().item():.4f}"
+            
+            # Compensate for msmodelslim's extra 1/sqrt(K) normalization on Hd
+            # Original ResQ: Hd elements are ±1, msmodelslim: Hd elements are ±1/sqrt(K)
+            # BOTH weights and activations were scaled by 1/sqrt(K), so we need to multiply by K
+            # to compensate for the total 1/K scaling in the output
+            mixed = mixed * Hd_K
             
             # Slice back to local portion
             blocks_per_rank = Hd_K // tp_size
@@ -256,11 +371,14 @@ def apply_resq_hadamard_rotation_tp(
             end_block = start_block + blocks_per_rank
             x = mixed[:, start_block:end_block, :].contiguous()  # Make contiguous after slice
             
+            if RESQ_DEBUG:
+                x_sliced_stats = f"shape={x.shape}, slice=[{start_block}:{end_block}], min={x.min().item():.4f}, max={x.max().item():.4f}"
+            
             # Reshape back to original batch dimensions
             x = x.reshape(*batch_shape, num_local_blocks, blocksize)
         else:
-            # No TP, apply Hd directly
-            Hd = Hd.to(device=x.device, dtype=x.dtype)
+            # No TP, apply Hd directly (use float32)
+            Hd_f32 = Hd.to(device=x.device, dtype=torch.float32)
             # x: [..., K, blocksize], Hd: [K, K]
             # Reshape for matmul: [..., K, blocksize] -> [batch, K, blocksize]
             batch_shape = x.shape[:-2]
@@ -268,8 +386,16 @@ def apply_resq_hadamard_rotation_tp(
             for dim in batch_shape:
                 batch_size *= dim
             x = x.reshape(batch_size, Hd_K, blocksize)
-            x = torch.einsum('ij,bjk->bik', Hd, x)
+            x = torch.einsum('ij,bjk->bik', Hd_f32, x)
+            
+            # Compensate for msmodelslim's extra 1/sqrt(K) normalization on Hd
+            # BOTH weights and activations were scaled by 1/sqrt(K), so multiply by K
+            x = x * Hd_K
+            
             x = x.reshape(*batch_shape, Hd_K, blocksize)
+        
+        # Convert back to original dtype
+        x = x.to(original_dtype)
         
         # Reshape back to [..., n_local]
         x = x.reshape(*original_shape)
@@ -279,10 +405,35 @@ def apply_resq_hadamard_rotation_tp(
         n_global = n_local * tp_size
         x = hadamard_transform(x.contiguous()) / math.sqrt(n_global)
     
+    # Debug: print rotation stats (only rank 0, write to file)
+    if RESQ_DEBUG and tp_rank == 0:
+        global _RESQ_ROTATION_STATS_LOGGED
+        if not _RESQ_ROTATION_STATS_LOGGED:
+            _RESQ_ROTATION_STATS_LOGGED = True
+            resq_log(f"[MLP Hadamard Rotation] tp_rank={tp_rank}, tp_size={tp_size}", rank=0)
+            resq_log(f"  Input: {x_in_stats}", rank=0)
+            if Pd is not None:
+                resq_log(f"  After Pd.T: {x_after_pd_stats}", rank=0)
+                pd_orth_err = (Pd @ Pd.T - torch.eye(Pd.shape[0], device=Pd.device, dtype=Pd.dtype)).abs().max().item()
+                resq_log(f"  Pd orthogonality: |Pd @ Pd.T - I|_max = {pd_orth_err:.6f}", rank=0)
+            if Hd is not None and Hd_K > 1:
+                hd_max = Hd.abs().max().item()
+                resq_log(f"  Hd stats: shape={Hd.shape}, max_abs={hd_max:.4f}", rank=0)
+                resq_log(f"  Normalization: 1/sqrt(n_global) = 1/sqrt({n_local * tp_size}) to match msit", rank=0)
+                resq_log(f"  After H_butterfly: {x_after_hbutterfly_stats}", rank=0)
+                if tp_size > 1:
+                    resq_log(f"  Gathered: {gathered_stats}", rank=0)
+                    resq_log(f"  After Hd: {mixed_stats}", rank=0)
+                    resq_log(f"  Sliced: {x_sliced_stats}", rank=0)
+            resq_log(f"  Output: min={x.min().item():.4f}, max={x.max().item():.4f}, mean={x.mean().item():.4f}", rank=0)
+    
     return x
 
 
 _RESQ_ROTATION_DEBUG_LOGGED = False
+_RESQ_ROTATION_STATS_LOGGED = False
+_RESQ_R3_DEBUG_LOGGED = False
+_RESQ_MLP_DEBUG_LOGGED = False
 
 def apply_resq_hadamard_rotation(
     x: torch.Tensor,
@@ -305,25 +456,25 @@ def apply_resq_hadamard_rotation(
     # Get blocksize from Pd
     blocksize = Pd.shape[0] if Pd is not None else 256
     
-    # Debug logging (only once)
-    if RESQ_DEBUG and not _RESQ_ROTATION_DEBUG_LOGGED:
+    # Debug logging (only rank 0, to file)
+    if RESQ_DEBUG and not _RESQ_ROTATION_DEBUG_LOGGED and tp_rank == 0:
         _RESQ_ROTATION_DEBUG_LOGGED = True
         n_local = x.shape[-1]
         num_local_blocks = n_local // blocksize
         n_global = n_local * tp_size
         global_K = Hd_K
-        logger.warning(f"[ResQ Rotation] TP Configuration:")
-        logger.warning(f"  tp_size={tp_size}, tp_rank={tp_rank}")
-        logger.warning(f"  x.shape={x.shape}, n_local={n_local}")
-        logger.warning(f"  blocksize={blocksize}, num_local_blocks={num_local_blocks}")
-        logger.warning(f"  n_global={n_global}, global_K={global_K}")
-        logger.warning(f"  Pd.shape={Pd.shape if Pd is not None else None}")
-        logger.warning(f"  Hd.shape={Hd.shape if Hd is not None else None}")
+        resq_log(f"\n[TP Configuration]", rank=0)
+        resq_log(f"  tp_size={tp_size}, tp_rank={tp_rank}", rank=0)
+        resq_log(f"  x.shape={x.shape}, n_local={n_local}", rank=0)
+        resq_log(f"  blocksize={blocksize}, num_local_blocks={num_local_blocks}", rank=0)
+        resq_log(f"  n_global={n_global}, global_K={global_K}", rank=0)
+        resq_log(f"  Pd.shape={Pd.shape if Pd is not None else None}", rank=0)
+        resq_log(f"  Hd.shape={Hd.shape if Hd is not None else None}", rank=0)
         if Hd is not None and Hd_K > 1:
             blocks_per_rank = Hd_K // tp_size
-            logger.warning(f"  blocks_per_rank={blocks_per_rank}")
+            resq_log(f"  blocks_per_rank={blocks_per_rank}", rank=0)
             if Hd_K % tp_size != 0:
-                logger.warning(f"  WARNING: Hd_K ({Hd_K}) not divisible by tp_size ({tp_size})!")
+                resq_log(f"  WARNING: Hd_K ({Hd_K}) not divisible by tp_size ({tp_size})!", rank=0)
     
     return apply_resq_hadamard_rotation_tp(
         x, Pd, Hd, Hd_K, blocksize, tp_size, tp_rank
@@ -423,18 +574,21 @@ class Qwen3ResQAttention(Qwen3Attention):
         setattr(self.rotation_R3, "weight_loader", rotation_loader)
 
     def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
-        # Debug logging (only once)
+        # Debug logging (only once, rank 0 only, to file)
         if RESQ_DEBUG and not Qwen3ResQAttention._debug_logged:
-            Qwen3ResQAttention._debug_logged = True
-            logger.warning(f"[ResQ] Qwen3ResQAttention.forward called")
-            logger.warning(f"[ResQ]   RESQ_FAKE_QUANT={RESQ_FAKE_QUANT}, HIGH_BITS={RESQ_HIGH_BITS}, LOW_BITS={RESQ_LOW_BITS}")
-            logger.warning(f"[ResQ]   rotation_R3.numel()={self.rotation_R3.numel()}, shape={self.rotation_R3.shape}")
-            logger.warning(f"[ResQ]   hidden_states: shape={hidden_states.shape}, dtype={hidden_states.dtype}")
-            if self.rotation_R3.numel() > 0:
-                logger.warning(f"[ResQ]   rotation_R3 stats: min={self.rotation_R3.min():.4f}, max={self.rotation_R3.max():.4f}")
-            if hasattr(self.qkv_proj, 'weight'):
-                w = self.qkv_proj.weight
-                logger.warning(f"[ResQ]   qkv_proj.weight: shape={w.shape}, min={w.min():.4f}, max={w.max():.4f}")
+            from vllm.distributed import get_tensor_model_parallel_rank
+            tp_rank = get_tensor_model_parallel_rank()
+            if tp_rank == 0:
+                Qwen3ResQAttention._debug_logged = True
+                resq_log(f"\n[Attention Forward]", rank=0)
+                resq_log(f"  RESQ_FAKE_QUANT={RESQ_FAKE_QUANT}", rank=0)
+                resq_log(f"  rotation_R3: numel={self.rotation_R3.numel()}, shape={self.rotation_R3.shape}", rank=0)
+                resq_log(f"  hidden_states: shape={hidden_states.shape}, dtype={hidden_states.dtype}", rank=0)
+                if self.rotation_R3.numel() > 0:
+                    resq_log(f"  rotation_R3 stats: min={self.rotation_R3.min():.4f}, max={self.rotation_R3.max():.4f}", rank=0)
+                if hasattr(self.qkv_proj, 'weight'):
+                    w = self.qkv_proj.weight
+                    resq_log(f"  qkv_proj.weight: shape={w.shape}, min={w.min():.4f}, max={w.max():.4f}", rank=0)
         
         # Apply fake quantization to input (simulating dynamic activation quantization)
         if RESQ_FAKE_QUANT:
@@ -460,12 +614,40 @@ class Qwen3ResQAttention(Qwen3Attention):
         q, k = self.rotary_emb(positions, q, k)
         
         # Apply R3 rotation (post-RoPE)
-        if self.apply_resq_rotation:
+        # Can be skipped via RESQ_SKIP_R3=1 environment variable
+        global _RESQ_R3_DEBUG_LOGGED
+        if self.apply_resq_rotation and not RESQ_SKIP_R3:
             rot_mat = None
             if self.rotation_R3.numel() > 0:
                 rot_mat = self.rotation_R3
+            
+            # Debug: log Q/K shape before/after rotation (rank 0 only, to file)
+            from vllm.distributed import get_tensor_model_parallel_rank
+            tp_rank = get_tensor_model_parallel_rank()
+            should_log_r3 = RESQ_DEBUG and not _RESQ_R3_DEBUG_LOGGED and tp_rank == 0
+            
+            if should_log_r3:
+                q_before_min, q_before_max = q.min().item(), q.max().item()
+                k_before_min, k_before_max = k.min().item(), k.max().item()
+            
             q = apply_rotation(q, rot_mat)
             k = apply_rotation(k, rot_mat)
+            
+            if should_log_r3:
+                _RESQ_R3_DEBUG_LOGGED = True
+                resq_log(f"\n[Attention R3 Rotation]", rank=0)
+                resq_log(f"  q.shape={q.shape}, R3.shape={rot_mat.shape if rot_mat is not None else None}", rank=0)
+                resq_log(f"  head_dim={self.head_dim}, num_heads={self.num_heads}", rank=0)
+                resq_log(f"  q before: min={q_before_min:.4f}, max={q_before_max:.4f}", rank=0)
+                resq_log(f"  q after:  min={q.min().item():.4f}, max={q.max().item():.4f}", rank=0)
+                resq_log(f"  k before: min={k_before_min:.4f}, max={k_before_max:.4f}", rank=0)
+                resq_log(f"  k after:  min={k.min().item():.4f}, max={k.max().item():.4f}", rank=0)
+        elif RESQ_SKIP_R3 and RESQ_DEBUG:
+            from vllm.distributed import get_tensor_model_parallel_rank
+            tp_rank = get_tensor_model_parallel_rank()
+            if not _RESQ_R3_DEBUG_LOGGED and tp_rank == 0:
+                _RESQ_R3_DEBUG_LOGGED = True
+                resq_log(f"\n[Attention R3 Rotation] SKIPPED (RESQ_SKIP_R3=1)", rank=0)
 
         attn_output = self.attn(q, k, v)
         
@@ -508,7 +690,8 @@ class Qwen3ResQMLP(Qwen3MLP):
         # Custom loader for Pd
         def pd_loader(param, loaded_weight):
             if RESQ_DEBUG:
-                logger.warning(f"[ResQ] Loading rotation_Pd: loaded_weight.shape={loaded_weight.shape}")
+                pd_max = loaded_weight.abs().max().item()
+                logger.warning(f"[ResQ] Loading rotation_Pd: shape={loaded_weight.shape}, max_abs={pd_max:.4f}")
             if param.data.shape != loaded_weight.shape:
                 param.data = loaded_weight.clone()
             else:
@@ -519,24 +702,30 @@ class Qwen3ResQMLP(Qwen3MLP):
         """Set shared Hadamard matrix reference (same tensor object for all layers)."""
         self.shared_Hd = Hd  # Store reference, not copy
         self.shared_Hd_K = Hd_K
+        if RESQ_DEBUG:
+            hd_max = Hd.abs().max().item() if Hd is not None else 0
+            logger.warning(f"[ResQ] set_shared_hadamard called: Hd_K={Hd_K}, Hd_max_abs={hd_max:.4f}, is_normalized={hd_max < 0.5}")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Debug logging (only once)
+        # Debug logging (only once, rank 0 only, to file)
         if RESQ_DEBUG and not Qwen3ResQMLP._debug_logged:
-            Qwen3ResQMLP._debug_logged = True
-            logger.warning(f"[ResQ] Qwen3ResQMLP.forward called")
-            logger.warning(f"[ResQ]   RESQ_FAKE_QUANT={RESQ_FAKE_QUANT}")
-            logger.warning(f"[ResQ]   rotation_Pd.numel()={self.rotation_Pd.numel()}, shape={self.rotation_Pd.shape}")
-            logger.warning(f"[ResQ]   shared_Hd: shape={self.shared_Hd.shape if self.shared_Hd is not None else None}")
-            logger.warning(f"[ResQ]   shared_Hd_K={self.shared_Hd_K}")
-            if self.rotation_Pd.numel() > 0:
-                logger.warning(f"[ResQ]   rotation_Pd stats: min={self.rotation_Pd.min():.4f}, max={self.rotation_Pd.max():.4f}")
-            if hasattr(self.gate_up_proj, 'weight'):
-                w = self.gate_up_proj.weight
-                logger.warning(f"[ResQ]   gate_up_proj.weight: shape={w.shape}, min={w.min():.4f}, max={w.max():.4f}")
-            if hasattr(self.down_proj, 'weight'):
-                w = self.down_proj.weight
-                logger.warning(f"[ResQ]   down_proj.weight: shape={w.shape}, min={w.min():.4f}, max={w.max():.4f}")
+            from vllm.distributed import get_tensor_model_parallel_rank
+            tp_rank = get_tensor_model_parallel_rank()
+            if tp_rank == 0:
+                Qwen3ResQMLP._debug_logged = True
+                resq_log(f"\n[MLP Forward]", rank=0)
+                resq_log(f"  RESQ_FAKE_QUANT={RESQ_FAKE_QUANT}", rank=0)
+                resq_log(f"  rotation_Pd: numel={self.rotation_Pd.numel()}, shape={self.rotation_Pd.shape}", rank=0)
+                resq_log(f"  shared_Hd: shape={self.shared_Hd.shape if self.shared_Hd is not None else None}", rank=0)
+                resq_log(f"  shared_Hd_K={self.shared_Hd_K}", rank=0)
+                if self.rotation_Pd.numel() > 0:
+                    resq_log(f"  rotation_Pd stats: min={self.rotation_Pd.min():.4f}, max={self.rotation_Pd.max():.4f}", rank=0)
+                if hasattr(self.gate_up_proj, 'weight'):
+                    w = self.gate_up_proj.weight
+                    resq_log(f"  gate_up_proj.weight: shape={w.shape}, min={w.min():.4f}, max={w.max():.4f}", rank=0)
+                if hasattr(self.down_proj, 'weight'):
+                    w = self.down_proj.weight
+                    resq_log(f"  down_proj.weight: shape={w.shape}, min={w.min():.4f}, max={w.max():.4f}, row_norm_mean={w.norm(dim=1).mean():.4f}", rank=0)
         
         # Apply fake quantization to gate_up_proj input
         if RESQ_FAKE_QUANT:
@@ -555,6 +744,17 @@ class Qwen3ResQMLP(Qwen3MLP):
         # SiLU(gate) * up
         intermediate = torch.nn.functional.silu(gate) * up
         
+        # Debug: log intermediate stats before rotation
+        global _RESQ_MLP_DEBUG_LOGGED
+        if RESQ_DEBUG and not _RESQ_MLP_DEBUG_LOGGED:
+            from vllm.distributed import get_tensor_model_parallel_rank
+            if get_tensor_model_parallel_rank() == 0:
+                _RESQ_MLP_DEBUG_LOGGED = True
+                resq_log(f"\n[MLP Intermediate Activation Debug]", rank=0)
+                resq_log(f"  Before rotation: shape={intermediate.shape}", rank=0)
+                resq_log(f"  Before rotation: min={intermediate.min().item():.6f}, max={intermediate.max().item():.6f}, mean={intermediate.mean().item():.6f}", rank=0)
+                resq_log(f"  Before rotation: norm={intermediate.norm().item():.6f}", rank=0)
+        
         # Apply Hadamard rotation before down_proj: R = block_diag(Pd) @ H
         if self.rotation_Pd.numel() > 0:
             # Use shared Hd (same tensor reference for all layers)
@@ -565,8 +765,14 @@ class Qwen3ResQMLP(Qwen3MLP):
                 Hd_K=self.shared_Hd_K,
             )
         
+        # Debug: log intermediate stats after rotation
+        if RESQ_DEBUG and _RESQ_MLP_DEBUG_LOGGED:
+            from vllm.distributed import get_tensor_model_parallel_rank
+            if get_tensor_model_parallel_rank() == 0:
+                resq_log(f"  After rotation: min={intermediate.min().item():.6f}, max={intermediate.max().item():.6f}, mean={intermediate.mean().item():.6f}", rank=0)
+                resq_log(f"  After rotation: norm={intermediate.norm().item():.6f}", rank=0)
+        
         # Apply fake quantization to down_proj input (after rotation)
-        if RESQ_FAKE_QUANT:
             intermediate = apply_mixed_precision_fake_quant(
                 intermediate, RESQ_HIGH_FRACTION, RESQ_HIGH_BITS, RESQ_LOW_BITS
             )
