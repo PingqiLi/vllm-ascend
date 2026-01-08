@@ -165,21 +165,14 @@ class ResQMixedPrecisionLinear(nn.Module):
         
         # Concatenate weights: (in_low, out) + (in_high, out) -> (K, N)
         # Note: stored as (out, in_*), need to transpose
-        # Ensure weights are on same device as input
-        device = x_quant.device
-        weight_low = self.weight_low.to(device)
-        weight_high = self.weight_high.to(device)
-        scale_low = self.scale_low.to(device)
-        scale_high = self.scale_high.to(device)
-        
-        weight = torch.cat([weight_low.T, weight_high.T], dim=0)  # (K, N)
+        weight = torch.cat([self.weight_low.T, self.weight_high.T], dim=0)  # (K, N)
         
         # Call quantized matmul
         output = resq_quant_matmul(
             x_quant,
             weight,
-            scale_low,
-            scale_high,
+            self.scale_low,
+            self.scale_high,
             lxScale,
             rxScale,
             self.in_low,
@@ -660,6 +653,7 @@ class Qwen3ResQTrueQuantForCausalLM(nn.Module):
                 tensor = weights_dict[key]
                 buffer = getattr(linear, suffix)
                 if buffer.shape != tensor.shape:
-                    setattr(linear, suffix, tensor)
+                    # Re-register buffer with correct shape to ensure .to(device) works
+                    linear.register_buffer(suffix, tensor)
                 else:
                     buffer.copy_(tensor)
