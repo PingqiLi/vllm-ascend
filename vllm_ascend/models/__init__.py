@@ -46,9 +46,3 @@ def register_model():
     ModelRegistry.register_model(
         "Qwen3NextForCausalLM",
         "vllm_ascend.models.qwen3_next:CustomQwen3NextForCausalLM")
-
-    # ResQ true quantization - directly loads msmodelslim int4/int8 weights
-    ModelRegistry.register_model(
-        "Qwen3ResQTrueQuantForCausalLM",
-        "vllm_ascend.models.qwen3_resq_truequant:Qwen3ResQTrueQuantForCausalLM"
-    )
