@@ -2,13 +2,20 @@
 """
 Convert msmodelslim ResQ weights to vllm-ascend W8A8 format.
 
-ResQ Format (权重A):
-- weight_low: [out, in_low] int8 (storing int4 values -8~7)
-- weight_high: [out, in_high] int8
-- scale_low, scale_high, offset_low, offset_high
-- resq.Hd, resq.layer.*.Uc, resq.layer.*.Pd (rotation matrices)
+msmodelslim ResQ Output Format (权重A):
+Files:
+- quant_model_weight_resq.safetensors (quantized weights)
+- quant_model_description_resq.json (metadata)
+- resq_basis.pt (optional, basis matrices)
 
-W8A8 Format:
+Weight tensors:
+- model.layers.{i}.*.weight_low: [out, in_low] int8 (storing int4)
+- model.layers.{i}.*.weight_high: [out, in_high] int8
+- model.layers.{i}.*.scale_low, scale_high, offset_low, offset_high
+- resq.layer.{i}.Uc: K cache rotation (key_pos @ R2) [head_dim, head_dim]
+- resq.layer.{i}.Ud: down_proj rotation (down_proj @ Rd) [blocksize, blocksize]
+
+vllm-ascend W8A8 Format:
 - weight: [out, in] int8
 - input_scale: [1] per-tensor
 - input_offset: [1] int8
@@ -20,13 +27,13 @@ W8A8 Format:
 Conversion Strategy:
 1. Dequantize ResQ: bf16 = (int - offset) * scale
 2. Re-quantize to W8A8: int8 = round(bf16 / new_scale)
-3. Compute deq_scale = weight_scale * input_scale
-
-Note: ResQ rotation matrices (Uc, Pd, Hd) are preserved for online rotation.
-A custom model is needed to apply these rotations during inference.
+3. Preserve rotation matrices (Uc, Ud) for online application
 
 Usage:
     python convert_resq_to_w8a8.py /path/to/resq_checkpoint /path/to/output_w8a8
+    
+    # Then run with:
+    vllm serve /path/to/output_w8a8 --quantization ascend
 """
 
 import argparse
@@ -157,10 +164,15 @@ def convert_checkpoint(
         with open(config_path, "w") as f:
             json.dump(config, f, indent=2)
     
-    # Find safetensor files
-    safetensor_files = list(input_path.glob("*.safetensors"))
-    if not safetensor_files:
-        raise ValueError(f"No safetensors files found in {input_path}")
+    # Find safetensor files - prefer msmodelslim naming convention
+    resq_safetensor = input_path / "quant_model_weight_resq.safetensors"
+    if resq_safetensor.exists():
+        safetensor_files = [resq_safetensor]
+        print(f"Found msmodelslim ResQ checkpoint: {resq_safetensor}")
+    else:
+        safetensor_files = list(input_path.glob("*.safetensors"))
+        if not safetensor_files:
+            raise ValueError(f"No safetensors files found in {input_path}")
     
     # Collect all tensors
     all_tensors: Dict[str, torch.Tensor] = {}
@@ -231,6 +243,7 @@ def convert_checkpoint(
         converted += 1
     
     # Copy non-ResQ tensors (embeddings, norms, etc.)
+    rotation_matrices = []
     for key, tensor in all_tensors.items():
         # Skip ResQ-specific tensors
         if any(suffix in key for suffix in [".weight_low", ".weight_high", 
@@ -242,13 +255,21 @@ def convert_checkpoint(
         if any(key.startswith(prefix) for prefix in resq_layers):
             continue
         
-        # Keep ResQ rotation matrices
+        # Keep ResQ rotation matrices (Uc for K cache, Ud for down_proj)
         if key.startswith("resq."):
             output_tensors[key] = tensor
+            rotation_matrices.append(key)
             continue
         
         # Copy other tensors (embeddings, layernorms, lm_head)
         output_tensors[key] = tensor
+    
+    if rotation_matrices:
+        print(f"Preserved {len(rotation_matrices)} rotation matrices:")
+        for rm in rotation_matrices[:5]:
+            print(f"  - {rm}")
+        if len(rotation_matrices) > 5:
+            print(f"  ... and {len(rotation_matrices) - 5} more")
     
     print(f"Converted {converted} layers, total {len(output_tensors)} output tensors")
     
@@ -257,18 +278,28 @@ def convert_checkpoint(
     save_file(output_tensors, str(output_file))
     print(f"Saved to {output_file}")
     
-    # Create quant_description.json
+    # Create quant_description.json (required for --quantization ascend)
     quant_desc = {
         "quant_type": "W8A8",
+        "w_sym": True,  # symmetric weight quantization
+        "a_sym": True,  # symmetric activation quantization
         "converted_from": "ResQ",
-        "has_rotation_matrices": True,
+        "has_rotation_matrices": len(rotation_matrices) > 0,
     }
     with open(output_path / "quant_description.json", "w") as f:
         json.dump(quant_desc, f, indent=2)
     
+    print("\n" + "=" * 60)
     print("Conversion complete!")
-    print("\nNote: ResQ rotation matrices (Uc, Pd, Hd) are preserved.")
-    print("You need a custom model to apply online rotations during inference.")
+    print("=" * 60)
+    print(f"\nOutput saved to: {output_path}")
+    print(f"\nTo run inference:")
+    print(f"  vllm serve {output_path} --quantization ascend")
+    print(f"\nNote: ResQ rotation matrices (Uc, Ud) are preserved but NOT applied!")
+    print("Standard Qwen3 model will NOT apply online rotations.")
+    print("For correct ResQ inference, you need a custom model that applies:")
+    print("  - Uc: Q/K rotation after RoPE")
+    print("  - Ud: intermediate rotation before down_proj")
 
 
 def main():
