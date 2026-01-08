@@ -275,6 +275,54 @@ class ResQVerifier:
         self.results.append(result)
         print(f"  {result}")
     
+    def verify_ab_consistency(self, layer_idx: int) -> bool:
+        """
+        验证 ckpt A 和 ckpt B 的一致性
+        
+        - A 中的 Uc 应该等于 B 中的 Pc @ Rc
+        - A 中的 Hd 应该等于 B 中的 R_d_hadK
+        - A 中的 Pd 应该等于 B 中的 P_d
+        """
+        print(f"\n[Layer {layer_idx}] A/B 一致性验证")
+        all_passed = True
+        
+        # 1. Uc 一致性: A.Uc == B.Pc @ B.Rc
+        Uc_A = self.mgr.ckpt_a.get(f'resq.layer.{layer_idx}.Uc')
+        Pc_B = self.mgr.ckpt_b.get(f'resq.layer.{layer_idx}.P_c')
+        Rc_B = self.mgr.ckpt_b.get(f'resq.layer.{layer_idx}.R_c')
+        
+        if Uc_A is not None and Pc_B is not None and Rc_B is not None:
+            Uc_computed = torch.matmul(Pc_B.float(), Rc_B.float())
+            result = compute_diff(Uc_A.float(), Uc_computed, "Uc: A vs Pc@Rc", 1e-5)
+            self.log(result)
+            all_passed = all_passed and result.passed
+        else:
+            print("  ⚠ 无法验证 Uc 一致性 (缺少数据)")
+        
+        # 2. Hd 一致性: A.Hd == B.R_d_hadK
+        Hd_A = self.mgr.ckpt_a.get('resq.Hd')
+        Hd_B = self.mgr.ckpt_b.get(f'resq.layer.{layer_idx}.R_d_hadK')
+        
+        if Hd_A is not None and Hd_B is not None:
+            result = compute_diff(Hd_A.float(), Hd_B.float(), "Hd: A vs R_d_hadK", 1e-5)
+            self.log(result)
+            all_passed = all_passed and result.passed
+        else:
+            print("  ⚠ 无法验证 Hd 一致性 (缺少数据)")
+        
+        # 3. Pd 一致性: A.Pd == B.P_d
+        Pd_A = self.mgr.ckpt_a.get(f'resq.layer.{layer_idx}.Pd')
+        Pd_B = self.mgr.ckpt_b.get(f'resq.layer.{layer_idx}.P_d')
+        
+        if Pd_A is not None and Pd_B is not None:
+            result = compute_diff(Pd_A.float(), Pd_B.float(), "Pd: A vs P_d", 1e-5)
+            self.log(result)
+            all_passed = all_passed and result.passed
+        else:
+            print("  ⚠ 无法验证 Pd 一致性 (缺少数据)")
+        
+        return all_passed
+    
     def verify_orthogonality(self, layer_idx: int) -> bool:
         """验证旋转矩阵的正交性"""
         print(f"\n[Layer {layer_idx}] 正交性验证")
@@ -628,22 +676,55 @@ class ResQVerifier:
         print("=" * 70)
         print(f"使用 vllm-ascend 实现: {USING_VLLM_IMPL}")
         
+        print("\n" + "-" * 70)
+        print("矩阵计算公式 (从 ckpt B 计算):")
+        print("  Ua = P_a @ R_a      [hidden, hidden]")
+        print("  Ub = P_b @ R_b      [num_heads, head_dim, head_dim]")
+        print("  Uc = P_c @ R_c      [head_dim, head_dim]")
+        print("  Ud = BlockDiag(Pd.T) @ H  (隐式，在 apply_ud_rotation 中)")
+        print("-" * 70)
+        
+        # 0. A/B 一致性验证（验证 A 中的矩阵是否由 B 正确计算得到）
+        print("\n" + "=" * 70)
+        print("阶段 0: A/B 矩阵一致性验证")
+        print("=" * 70)
+        for layer_idx in range(min(num_layers, 64)):
+            self.verify_ab_consistency(layer_idx)
+        
         # 1. Embed 权重融合
+        print("\n" + "=" * 70)
+        print("阶段 1: Embed 权重融合验证")
+        print("=" * 70)
         self.verify_embed_fusion()
         
         # 2. 前几层权重融合
+        print("\n" + "=" * 70)
+        print("阶段 2: 逐层权重融合验证")
+        print("=" * 70)
         for layer_idx in range(min(num_layers, 64)):
             self.verify_orthogonality(layer_idx)
             self.verify_qkv_fusion(layer_idx)
             self.verify_o_proj_fusion(layer_idx)
             self.verify_mlp_fusion(layer_idx)
+        
+        # 3. 旋转函数验证
+        print("\n" + "=" * 70)
+        print("阶段 3: 旋转函数验证 (使用 vllm-ascend 实现)")
+        print("=" * 70)
+        for layer_idx in range(min(num_layers, 64)):
             self.verify_uc_rotation(layer_idx)
             self.verify_ud_rotation(layer_idx)
         
-        # 3. 激活值验证
+        # 4. 激活值验证
+        print("\n" + "=" * 70)
+        print("阶段 4: 激活值验证")
+        print("=" * 70)
         self.verify_activation_with_rotation(tokenizer, prompt)
         
-        # 4. 最终 logits
+        # 5. 最终 logits
+        print("\n" + "=" * 70)
+        print("阶段 5: 最终输出参考")
+        print("=" * 70)
         self.verify_final_logits(tokenizer, prompt)
         
         # 汇总
