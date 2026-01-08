@@ -283,13 +283,24 @@ class Qwen3ResQW8A8ForCausalLM(Qwen3ForCausalLM):
         for name, tensor in weights:
             weights_dict[name] = tensor
         
-        # Load global ResQ parameters
+        # Load global ResQ parameters (handle both naming conventions)
         if 'resq.Hd' in weights_dict:
             self.resq_Hd = weights_dict.pop('resq.Hd')
         if 'resq.Hd_K' in weights_dict:
             self.resq_Hd_K = int(weights_dict.pop('resq.Hd_K').item())
-        if 'resq.blocksize' in weights_dict:
-            self.resq_blocksize = int(weights_dict.pop('resq.blocksize').item())
+        
+        # blocksize might be named differently
+        for blocksize_key in ['resq.blocksize', 'resq.down_proj_blocksize']:
+            if blocksize_key in weights_dict:
+                self.resq_blocksize = int(weights_dict.pop(blocksize_key).item())
+                break
+        
+        # Remove other global ResQ metadata (not needed at runtime)
+        for key in list(weights_dict.keys()):
+            if key.startswith('resq.') and not key.startswith('resq.layer.'):
+                if RESQ_DEBUG:
+                    logger.warning(f"[ResQ] Ignoring global param: {key}")
+                weights_dict.pop(key)
         
         # Load per-layer rotation matrices
         for i, layer in enumerate(self.model.layers):
@@ -301,19 +312,27 @@ class Qwen3ResQW8A8ForCausalLM(Qwen3ForCausalLM):
                     if RESQ_DEBUG:
                         logger.warning(f"[ResQ] Loaded Uc for layer {i}: {layer.self_attn.rotation_Uc.shape}")
             
-            # Load Ud for MLP
-            ud_key = f'resq.layer.{i}.Ud'
-            if ud_key in weights_dict:
-                if hasattr(layer.mlp, 'rotation_Ud'):
-                    layer.mlp.rotation_Ud = weights_dict.pop(ud_key)
-                    if RESQ_DEBUG:
-                        logger.warning(f"[ResQ] Loaded Ud for layer {i}: {layer.mlp.rotation_Ud.shape}")
+            # Load Ud/Pd for MLP (msmodelslim uses 'Pd', we use 'Ud')
+            for ud_key in [f'resq.layer.{i}.Ud', f'resq.layer.{i}.Pd']:
+                if ud_key in weights_dict:
+                    if hasattr(layer.mlp, 'rotation_Ud'):
+                        layer.mlp.rotation_Ud = weights_dict.pop(ud_key)
+                        if RESQ_DEBUG:
+                            logger.warning(f"[ResQ] Loaded Ud from {ud_key} for layer {i}: {layer.mlp.rotation_Ud.shape}")
+                    break
             
             # Set shared Hadamard references
             if hasattr(layer.mlp, 'shared_Hd'):
                 layer.mlp.shared_Hd = self.resq_Hd if self.resq_Hd.numel() > 0 else None
                 layer.mlp.shared_Hd_K = self.resq_Hd_K
                 layer.mlp.blocksize = self.resq_blocksize
+        
+        # Remove any remaining resq.* keys that parent loader won't recognize
+        remaining_resq_keys = [k for k in weights_dict.keys() if k.startswith('resq.')]
+        for key in remaining_resq_keys:
+            if RESQ_DEBUG:
+                logger.warning(f"[ResQ] Removing unhandled key: {key}")
+            weights_dict.pop(key)
         
         # Load remaining weights using parent's loader
         remaining_weights = [(k, v) for k, v in weights_dict.items()]
