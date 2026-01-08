@@ -539,56 +539,52 @@ class Qwen3ResQTrueQuantForCausalLM(nn.Module):
         logits = self.lm_head(hidden_states)
         return self.logits_processor(self.lm_head, hidden_states, sampling_metadata)
     
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """
-        Load weights from msmodelslim ResQ checkpoint (权重A format).
+    def _ckpt_to_model_key(self, ckpt_key: str) -> str:
+        """Convert checkpoint key to model state_dict key.
         
-        Expected weight names:
-        - resq.Hd, resq.Hd_K, resq.down_proj_blocksize
-        - resq.layer.{i}.Uc  -> self.layers[i].self_attn.rotation_R3
-        - resq.layer.{i}.Pd  -> self.layers[i].mlp.rotation_Pd
-        - model.layers.{i}.self_attn.q_proj.weight_low/high/scale_low/scale_high/...
-        - etc.
+        Checkpoint uses 'model.' prefix, model state_dict doesn't.
+        e.g., 'model.layers.0.input_layernorm.weight' -> 'layers.0.input_layernorm.weight'
         """
+        if ckpt_key.startswith('model.'):
+            return ckpt_key[6:]  # Remove 'model.' prefix
+        return ckpt_key
+    
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        """Load weights from msmodelslim ResQ checkpoint."""
+        # Normalize keys: remove 'model.' prefix
         weights_dict: Dict[str, torch.Tensor] = {}
         for name, tensor in weights:
-            weights_dict[name] = tensor
+            key = self._ckpt_to_model_key(name)
+            weights_dict[key] = tensor
         
         loaded_keys = set()
         
-        # Load global ResQ parameters
+        # Load global ResQ parameters (stored as attributes, not in state_dict)
         if 'resq.Hd' in weights_dict:
             self.resq_Hd = weights_dict['resq.Hd']
-            loaded_keys.add('resq.Hd')
         if 'resq.Hd_K' in weights_dict:
             self.resq_Hd_K = int(weights_dict['resq.Hd_K'].item())
-            loaded_keys.add('resq.Hd_K')
         if 'resq.down_proj_blocksize' in weights_dict:
             self.resq_blocksize = int(weights_dict['resq.down_proj_blocksize'].item())
-            loaded_keys.add('resq.down_proj_blocksize')
         
         # Load embedding
-        if 'model.embed_tokens.weight' in weights_dict:
-            self.embed_tokens.weight.data.copy_(weights_dict['model.embed_tokens.weight'])
-            loaded_keys.add('model.embed_tokens.weight')
+        if 'embed_tokens.weight' in weights_dict:
+            self.embed_tokens.weight.data.copy_(weights_dict['embed_tokens.weight'])
+            loaded_keys.add('embed_tokens.weight')
         
         # Load layers
         for i, layer in enumerate(self.layers):
-            prefix = f'model.layers.{i}'
+            prefix = f'layers.{i}'
             
-            # Load Uc rotation
+            # Load rotations (stored as attributes)
             uc_key = f'resq.layer.{i}.Uc'
             if uc_key in weights_dict:
                 layer.self_attn.rotation_R3 = weights_dict[uc_key]
-                loaded_keys.add(uc_key)
             
-            # Load Pd rotation
             pd_key = f'resq.layer.{i}.Pd'
             if pd_key in weights_dict:
                 layer.mlp.rotation_Pd = weights_dict[pd_key]
-                loaded_keys.add(pd_key)
             
-            # Set shared Hadamard
             layer.mlp.set_shared_hadamard(self.resq_Hd, self.resq_Hd_K, self.resq_blocksize)
             
             # Load attention projections
@@ -604,30 +600,22 @@ class Qwen3ResQTrueQuantForCausalLM(nn.Module):
                 loaded_keys.update(self._load_resq_linear(proj, proj_prefix, weights_dict))
             
             # Load layer norms
-            input_ln_key = f'{prefix}.input_layernorm.weight'
-            if input_ln_key in weights_dict:
-                layer.input_layernorm.weight.data.copy_(weights_dict[input_ln_key])
-                loaded_keys.add(input_ln_key)
-            
-            post_ln_key = f'{prefix}.post_attention_layernorm.weight'
-            if post_ln_key in weights_dict:
-                layer.post_attention_layernorm.weight.data.copy_(weights_dict[post_ln_key])
-                loaded_keys.add(post_ln_key)
+            for ln_name in ['input_layernorm', 'post_attention_layernorm']:
+                ln_key = f'{prefix}.{ln_name}.weight'
+                if ln_key in weights_dict:
+                    getattr(layer, ln_name).weight.data.copy_(weights_dict[ln_key])
+                    loaded_keys.add(ln_key)
         
         # Load final norm
-        if 'model.norm.weight' in weights_dict:
-            self.norm.weight.data.copy_(weights_dict['model.norm.weight'])
-            loaded_keys.add('model.norm.weight')
+        if 'norm.weight' in weights_dict:
+            self.norm.weight.data.copy_(weights_dict['norm.weight'])
+            loaded_keys.add('norm.weight')
         
         # Load LM head
         if 'lm_head.weight' in weights_dict:
             if hasattr(self.lm_head, 'weight'):
                 self.lm_head.weight.data.copy_(weights_dict['lm_head.weight'])
             loaded_keys.add('lm_head.weight')
-        elif 'model.lm_head.weight' in weights_dict:
-            if hasattr(self.lm_head, 'weight'):
-                self.lm_head.weight.data.copy_(weights_dict['model.lm_head.weight'])
-            loaded_keys.add('model.lm_head.weight')
         
         if RESQ_DEBUG:
             logger.warning(f"[ResQ TrueQuant] Loaded {len(loaded_keys)} keys")
