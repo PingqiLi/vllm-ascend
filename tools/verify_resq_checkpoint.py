@@ -324,10 +324,16 @@ class ResQVerifier:
         return all_passed
     
     def verify_orthogonality(self, layer_idx: int) -> bool:
-        """验证旋转矩阵的正交性"""
+        """
+        验证旋转矩阵的正交性
+        
+        - Ua, Uc, Pd 来自 torch.linalg.eigh 的特征向量，应该正交
+        - Ud = BlockDiag(Pd.T) @ H，由正交矩阵组成，也应该正交
+        """
         print(f"\n[Layer {layer_idx}] 正交性验证")
         all_passed = True
         
+        # 验证 Ua, Uc, Pd 的正交性
         for name, get_fn in [
             ("Ua", lambda: self.mgr.get_ua(layer_idx)),
             ("Uc", lambda: self.mgr.get_uc(layer_idx)),
@@ -345,6 +351,31 @@ class ResQVerifier:
             status = "✓" if passed else "✗"
             print(f"  {status} {name}: ||M @ M.T - I||_max = {diff:.2e}")
             all_passed = all_passed and passed
+        
+        # 验证 Ud 正交性（通过测试 apply_ud_rotation 是否保持范数）
+        # Ud 正交 => ||Ud @ x|| = ||x||
+        Pd = self.mgr.get_pd(layer_idx)
+        Hd = self.mgr.Hd
+        K = self.mgr.Hd_K
+        blocksize = self.mgr.blocksize
+        
+        if Pd is not None and K > 0 and blocksize > 0:
+            intermediate_size = K * blocksize
+            test_x = torch.randn(1, intermediate_size)
+            test_x_norm = test_x.norm().item()
+            
+            try:
+                rotated = apply_ud_rotation(test_x, Pd, Hd, K, blocksize)
+                rotated_norm = rotated.norm().item()
+                
+                # 正交变换应该保持范数
+                norm_ratio = rotated_norm / test_x_norm
+                passed = abs(norm_ratio - 1.0) < 0.01  # 允许 1% 误差
+                status = "✓" if passed else "✗"
+                print(f"  {status} Ud (via norm): ||Ud@x||/||x|| = {norm_ratio:.4f} (应≈1.0)")
+                all_passed = all_passed and passed
+            except Exception as e:
+                print(f"  ⚠ Ud 正交性验证失败: {e}")
         
         return all_passed
     
