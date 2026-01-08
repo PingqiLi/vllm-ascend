@@ -114,6 +114,9 @@ class AscendRMSNorm(RMSNorm):
                 self, x, residual, self.next_need_quant_fusion_linear,
                 self.bias)
             return x, residual
+        # DEBUG: Check device right before npu_rms_norm call
+        if x.device != self.weight.device:
+            print(f"[AscendRMSNorm] Device mismatch! x.device={x.device}, self.weight.device={self.weight.device}")
         x, residual = torch_npu.npu_rms_norm(x, self.weight,
                                              self.variance_epsilon)
         if self.bias is not None:
