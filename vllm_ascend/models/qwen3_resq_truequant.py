@@ -594,9 +594,9 @@ class Qwen3ResQTrueQuantForCausalLM(nn.Module):
         if 'resq.down_proj_blocksize' in weights_dict:
             self.resq_blocksize = int(weights_dict['resq.down_proj_blocksize'].item())
         
-        # Load embedding
+        # Load embedding (ensure on target device)
         if 'embed_tokens.weight' in weights_dict:
-            self.embed_tokens.weight.data.copy_(weights_dict['embed_tokens.weight'])
+            self.embed_tokens.weight.data.copy_(weights_dict['embed_tokens.weight'].to(target_device))
         
         # Load layers
         for i, layer in enumerate(self.layers):
@@ -625,26 +625,28 @@ class Qwen3ResQTrueQuantForCausalLM(nn.Module):
                 proj_prefix = f'{prefix}.mlp.{proj_name}'
                 self._load_resq_linear(proj, proj_prefix, weights_dict, target_device)
             
-            # Load layer norms
+            # Load layer norms (ensure on target device)
             for ln_name in ['input_layernorm', 'post_attention_layernorm']:
                 ln_key = f'{prefix}.{ln_name}.weight'
                 if ln_key in weights_dict:
-                    getattr(layer, ln_name).weight.data.copy_(weights_dict[ln_key])
+                    ln = getattr(layer, ln_name)
+                    ln.weight.data.copy_(weights_dict[ln_key].to(target_device))
             
             # Load QK norms (self_attn.q_norm, self_attn.k_norm)
             for qk_norm_name in ['q_norm', 'k_norm']:
                 qk_norm_key = f'{prefix}.self_attn.{qk_norm_name}.weight'
                 if qk_norm_key in weights_dict:
-                    getattr(layer.self_attn, qk_norm_name).weight.data.copy_(weights_dict[qk_norm_key])
+                    qk_norm = getattr(layer.self_attn, qk_norm_name)
+                    qk_norm.weight.data.copy_(weights_dict[qk_norm_key].to(target_device))
         
-        # Load final norm
+        # Load final norm (ensure on target device)
         if 'norm.weight' in weights_dict:
-            self.norm.weight.data.copy_(weights_dict['norm.weight'])
+            self.norm.weight.data.copy_(weights_dict['norm.weight'].to(target_device))
         
-        # Load LM head
+        # Load LM head (ensure on target device)
         if 'lm_head.weight' in weights_dict:
             if hasattr(self.lm_head, 'weight'):
-                self.lm_head.weight.data.copy_(weights_dict['lm_head.weight'])
+                self.lm_head.weight.data.copy_(weights_dict['lm_head.weight'].to(target_device))
         
         if RESQ_DEBUG:
             logger.warning(f"[ResQ TrueQuant] Loaded weights, Hd_K={self.resq_Hd_K}, blocksize={self.resq_blocksize}")
