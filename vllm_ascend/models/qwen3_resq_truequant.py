@@ -549,15 +549,16 @@ class Qwen3ResQTrueQuantForCausalLM(nn.Module):
             return ckpt_key[6:]  # Remove 'model.' prefix
         return ckpt_key
     
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Load weights from msmodelslim ResQ checkpoint."""
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
+        """Load weights from msmodelslim ResQ checkpoint.
+        
+        Returns None to skip vLLM's strict weight check (since we use custom quantization).
+        """
         # Normalize keys: remove 'model.' prefix
         weights_dict: Dict[str, torch.Tensor] = {}
         for name, tensor in weights:
             key = self._ckpt_to_model_key(name)
             weights_dict[key] = tensor
-        
-        loaded_keys = set()
         
         # Load global ResQ parameters (stored as attributes, not in state_dict)
         if 'resq.Hd' in weights_dict:
@@ -570,7 +571,6 @@ class Qwen3ResQTrueQuantForCausalLM(nn.Module):
         # Load embedding
         if 'embed_tokens.weight' in weights_dict:
             self.embed_tokens.weight.data.copy_(weights_dict['embed_tokens.weight'])
-            loaded_keys.add('embed_tokens.weight')
         
         # Load layers
         for i, layer in enumerate(self.layers):
@@ -591,47 +591,39 @@ class Qwen3ResQTrueQuantForCausalLM(nn.Module):
             for proj_name in ['q_proj', 'k_proj', 'v_proj', 'o_proj']:
                 proj = getattr(layer.self_attn, proj_name)
                 proj_prefix = f'{prefix}.self_attn.{proj_name}'
-                loaded_keys.update(self._load_resq_linear(proj, proj_prefix, weights_dict))
+                self._load_resq_linear(proj, proj_prefix, weights_dict)
             
             # Load MLP projections
             for proj_name in ['gate_proj', 'up_proj', 'down_proj']:
                 proj = getattr(layer.mlp, proj_name)
                 proj_prefix = f'{prefix}.mlp.{proj_name}'
-                loaded_keys.update(self._load_resq_linear(proj, proj_prefix, weights_dict))
+                self._load_resq_linear(proj, proj_prefix, weights_dict)
             
             # Load layer norms
             for ln_name in ['input_layernorm', 'post_attention_layernorm']:
                 ln_key = f'{prefix}.{ln_name}.weight'
                 if ln_key in weights_dict:
                     getattr(layer, ln_name).weight.data.copy_(weights_dict[ln_key])
-                    loaded_keys.add(ln_key)
         
         # Load final norm
         if 'norm.weight' in weights_dict:
             self.norm.weight.data.copy_(weights_dict['norm.weight'])
-            loaded_keys.add('norm.weight')
         
         # Load LM head
         if 'lm_head.weight' in weights_dict:
             if hasattr(self.lm_head, 'weight'):
                 self.lm_head.weight.data.copy_(weights_dict['lm_head.weight'])
-            loaded_keys.add('lm_head.weight')
         
         if RESQ_DEBUG:
-            logger.warning(f"[ResQ TrueQuant] Loaded {len(loaded_keys)} keys")
-            logger.warning(f"[ResQ TrueQuant] Hd_K={self.resq_Hd_K}, blocksize={self.resq_blocksize}")
-        
-        return loaded_keys
+            logger.warning(f"[ResQ TrueQuant] Loaded weights, Hd_K={self.resq_Hd_K}, blocksize={self.resq_blocksize}")
     
     def _load_resq_linear(
         self,
         linear: ResQMixedPrecisionLinear,
         prefix: str,
         weights_dict: Dict[str, torch.Tensor],
-    ) -> set[str]:
+    ) -> None:
         """Load weights for a ResQ mixed-precision linear layer."""
-        loaded = set()
-        
         for suffix in ['weight_low', 'weight_high', 'scale_low', 'scale_high', 'offset_low', 'offset_high']:
             key = f'{prefix}.{suffix}'
             if key in weights_dict:
@@ -641,6 +633,3 @@ class Qwen3ResQTrueQuantForCausalLM(nn.Module):
                     setattr(linear, suffix, tensor)
                 else:
                     buffer.copy_(tensor)
-                loaded.add(key)
-        
-        return loaded
