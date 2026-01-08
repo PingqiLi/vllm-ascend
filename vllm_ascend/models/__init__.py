@@ -52,3 +52,9 @@ def register_model():
         "Qwen3ResQW8A8ForCausalLM",
         "vllm_ascend.models.qwen3_resq_w8a8:Qwen3ResQW8A8ForCausalLM"
     )
+
+    # ResQ TrueQuant: Direct msmodelslim int4/int8 weights (TP=1 only)
+    ModelRegistry.register_model(
+        "Qwen3ResQTrueQuantForCausalLM",
+        "vllm_ascend.models.qwen3_resq_truequant:Qwen3ResQTrueQuantForCausalLM"
+    )
