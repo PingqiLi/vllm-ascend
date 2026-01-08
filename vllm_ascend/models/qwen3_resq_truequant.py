@@ -583,9 +583,12 @@ class Qwen3ResQTrueQuantForCausalLM(nn.Module):
             key = self._ckpt_to_model_key(name)
             weights_dict[key] = tensor
         
+        # Get target device from model parameters
+        target_device = self.embed_tokens.weight.device
+        
         # Load global ResQ parameters (stored as attributes, not in state_dict)
         if 'resq.Hd' in weights_dict:
-            self.resq_Hd = weights_dict['resq.Hd']
+            self.resq_Hd = weights_dict['resq.Hd'].to(target_device)
         if 'resq.Hd_K' in weights_dict:
             self.resq_Hd_K = int(weights_dict['resq.Hd_K'].item())
         if 'resq.down_proj_blocksize' in weights_dict:
@@ -599,14 +602,14 @@ class Qwen3ResQTrueQuantForCausalLM(nn.Module):
         for i, layer in enumerate(self.layers):
             prefix = f'layers.{i}'
             
-            # Load rotations (stored as attributes)
+            # Load rotations (stored as attributes, move to device)
             uc_key = f'resq.layer.{i}.Uc'
             if uc_key in weights_dict:
-                layer.self_attn.rotation_R3 = weights_dict[uc_key]
+                layer.self_attn.rotation_R3 = weights_dict[uc_key].to(target_device)
             
             pd_key = f'resq.layer.{i}.Pd'
             if pd_key in weights_dict:
-                layer.mlp.rotation_Pd = weights_dict[pd_key]
+                layer.mlp.rotation_Pd = weights_dict[pd_key].to(target_device)
             
             layer.mlp.set_shared_hadamard(self.resq_Hd, self.resq_Hd_K, self.resq_blocksize)
             
@@ -614,13 +617,13 @@ class Qwen3ResQTrueQuantForCausalLM(nn.Module):
             for proj_name in ['q_proj', 'k_proj', 'v_proj', 'o_proj']:
                 proj = getattr(layer.self_attn, proj_name)
                 proj_prefix = f'{prefix}.self_attn.{proj_name}'
-                self._load_resq_linear(proj, proj_prefix, weights_dict)
+                self._load_resq_linear(proj, proj_prefix, weights_dict, target_device)
             
             # Load MLP projections
             for proj_name in ['gate_proj', 'up_proj', 'down_proj']:
                 proj = getattr(layer.mlp, proj_name)
                 proj_prefix = f'{prefix}.mlp.{proj_name}'
-                self._load_resq_linear(proj, proj_prefix, weights_dict)
+                self._load_resq_linear(proj, proj_prefix, weights_dict, target_device)
             
             # Load layer norms
             for ln_name in ['input_layernorm', 'post_attention_layernorm']:
@@ -645,15 +648,15 @@ class Qwen3ResQTrueQuantForCausalLM(nn.Module):
         linear: ResQMixedPrecisionLinear,
         prefix: str,
         weights_dict: Dict[str, torch.Tensor],
+        target_device: torch.device,
     ) -> None:
         """Load weights for a ResQ mixed-precision linear layer."""
         for suffix in ['weight_low', 'weight_high', 'scale_low', 'scale_high', 'offset_low', 'offset_high']:
             key = f'{prefix}.{suffix}'
             if key in weights_dict:
-                tensor = weights_dict[key]
+                tensor = weights_dict[key].to(target_device)
                 buffer = getattr(linear, suffix)
-                if buffer.shape != tensor.shape:
-                    # Re-register buffer with correct shape to ensure .to(device) works
+                if buffer.numel() == 0 or buffer.shape != tensor.shape:
                     linear.register_buffer(suffix, tensor)
                 else:
                     buffer.copy_(tensor)
