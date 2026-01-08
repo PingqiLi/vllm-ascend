@@ -581,31 +581,26 @@ class Qwen3ResQTrueQuantForCausalLM(nn.Module):
         
         Returns None to skip vLLM's strict weight check (since we use custom quantization).
         """
-        # Build params_dict for standard weight loading (like other vLLM models)
-        params_dict = dict(self.named_parameters())
-        
-        # Normalize keys: remove 'model.' prefix and collect weights
-        weights_dict: Dict[str, torch.Tensor] = {}
-        for name, tensor in weights:
-            key = self._ckpt_to_model_key(name)
-            weights_dict[key] = tensor
-        
-        # Get target device - prefer NPU if available
-        try:
-            import torch_npu
-            target_device = torch.device(f'npu:{torch_npu.npu.current_device()}')
-        except (ImportError, RuntimeError):
-            if torch.cuda.is_available():
-                target_device = torch.device(f'cuda:{torch.cuda.current_device()}')
-            else:
-                target_device = torch.device('cpu')
+        # Step 1: Get target device and move model FIRST
+        # vllm-ascend requires torch_npu, no fallback needed
+        import torch_npu
+        target_device = torch.device(f'npu:{torch_npu.npu.current_device()}')
         
         if RESQ_DEBUG:
             logger.warning(f"[ResQ TrueQuant] target_device={target_device}")
         
-        # Ensure all model parameters/buffers are on the target device
-        # This handles standard layers like RMSNorm, Embedding, etc.
+        # Move entire model to target device before any weight loading
+        # This ensures all parameters (including RMSNorm weights) are on NPU
         self.to(target_device)
+        
+        # Step 2: Build params_dict (now model is on correct device)
+        params_dict = dict(self.named_parameters())
+        
+        # Step 3: Normalize keys and collect weights
+        weights_dict: Dict[str, torch.Tensor] = {}
+        for name, tensor in weights:
+            key = self._ckpt_to_model_key(name)
+            weights_dict[key] = tensor
         
         # Load global ResQ parameters (stored as attributes, not in state_dict)
         if 'resq.Hd' in weights_dict:
