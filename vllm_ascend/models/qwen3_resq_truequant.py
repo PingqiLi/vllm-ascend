@@ -603,6 +603,10 @@ class Qwen3ResQTrueQuantForCausalLM(nn.Module):
         if RESQ_DEBUG:
             logger.warning(f"[ResQ TrueQuant] target_device={target_device}")
         
+        # Ensure all model parameters/buffers are on the target device
+        # This handles standard layers like RMSNorm, Embedding, etc.
+        self.to(target_device)
+        
         # Load global ResQ parameters (stored as attributes, not in state_dict)
         if 'resq.Hd' in weights_dict:
             self.resq_Hd = weights_dict['resq.Hd'].to(target_device)
