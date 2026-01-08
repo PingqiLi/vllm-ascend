@@ -300,10 +300,17 @@ class Qwen3ResQTrueQuantAttention(nn.Module):
         self.v_proj = ResQMixedPrecisionLinear(hidden_size, self.kv_size)
         self.o_proj = ResQMixedPrecisionLinear(self.q_size, hidden_size)
         
-        # QK Norm
+        # QK Norm with custom weight_loader for proper device handling
         from vllm.model_executor.layers.layernorm import RMSNorm
         self.q_norm = RMSNorm(head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(head_dim, eps=rms_norm_eps)
+        
+        # Set weight_loader for norm weights (like resq_fake_v2 pattern)
+        # This lets vLLM's standard weight loading handle device placement
+        def norm_weight_loader(param, loaded_weight):
+            param.data.copy_(loaded_weight)
+        setattr(self.q_norm.weight, "weight_loader", norm_weight_loader)
+        setattr(self.k_norm.weight, "weight_loader", norm_weight_loader)
         
         # RoPE
         from vllm.model_executor.layers.rotary_embedding import get_rope
@@ -447,6 +454,12 @@ class Qwen3ResQTrueQuantDecoderLayer(nn.Module):
         from vllm.model_executor.layers.layernorm import RMSNorm
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        
+        # Set weight_loader for layer norm weights (like resq_fake_v2 pattern)
+        def norm_weight_loader(param, loaded_weight):
+            param.data.copy_(loaded_weight)
+        setattr(self.input_layernorm.weight, "weight_loader", norm_weight_loader)
+        setattr(self.post_attention_layernorm.weight, "weight_loader", norm_weight_loader)
     
     def forward(self, positions, hidden_states, residual):
         if residual is None:
@@ -521,6 +534,11 @@ class Qwen3ResQTrueQuantForCausalLM(nn.Module):
         # Final norm
         from vllm.model_executor.layers.layernorm import RMSNorm
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        
+        # Set weight_loader for final norm (like resq_fake_v2 pattern)
+        def norm_weight_loader(param, loaded_weight):
+            param.data.copy_(loaded_weight)
+        setattr(self.norm.weight, "weight_loader", norm_weight_loader)
         
         # LM head
         if get_pp_group().is_last_rank:
