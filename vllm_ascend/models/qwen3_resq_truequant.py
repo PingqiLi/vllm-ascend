@@ -611,6 +611,14 @@ class Qwen3ResQTrueQuantForCausalLM(nn.Module):
         # This ensures all parameters (including RMSNorm weights) are on NPU
         self.to(target_device)
         
+        # DEBUG: Check device after self.to()
+        if RESQ_DEBUG or True:  # Always log for debugging
+            # Check a specific norm weight
+            for name, param in self.named_parameters():
+                if 'q_norm' in name or 'input_layernorm' in name:
+                    logger.warning(f"[ResQ DEBUG] After self.to(): {name} device={param.device}")
+                    break
+        
         # Step 2: Build params_dict (now model is on correct device)
         params_dict = dict(self.named_parameters())
         
@@ -643,7 +651,12 @@ class Qwen3ResQTrueQuantForCausalLM(nn.Module):
             if param_name in params_dict:
                 param = params_dict[param_name]
                 weight_loader = getattr(param, 'weight_loader', default_weight_loader)
+                # DEBUG: Log norm weight loading
+                if 'q_norm' in param_name or 'input_layernorm' in param_name:
+                    logger.warning(f"[ResQ DEBUG] Loading {param_name}: param.device={param.device}, loaded_weight.device={loaded_weight.device}")
                 weight_loader(param, loaded_weight)
+                if 'q_norm' in param_name or 'input_layernorm' in param_name:
+                    logger.warning(f"[ResQ DEBUG] After load {param_name}: param.device={param.device}")
         
         # Load layers - ResQ specific parts
         for i, layer in enumerate(self.layers):
