@@ -130,7 +130,7 @@ def MIXPGMM(x: torch.Tensor, weight: torch.Tensor, perChannelScale: torch.Tensor
     groupList: (E,) 每个expert的token数
     """
     M, N = x.shape[0], weight.shape[2]
-    Output = torch.zeros(M, N).type(outDtype)
+    Output = torch.zeros(M, N, dtype=outDtype, device=x.device)
 
     start_idx = 0
     preV = 0
