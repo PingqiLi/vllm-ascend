@@ -583,9 +583,9 @@ class Qwen3ResQTrueQuantForCausalLM(nn.Module):
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
     
-    def compute_logits(self, hidden_states: torch.Tensor, sampling_metadata) -> torch.Tensor:
-        logits = self.lm_head(hidden_states)
-        return self.logits_processor(self.lm_head, hidden_states, sampling_metadata)
+    def compute_logits(self, hidden_states: torch.Tensor) -> Optional[torch.Tensor]:
+        logits = self.logits_processor(self.lm_head, hidden_states)
+        return logits
     
     def _ckpt_to_model_key(self, ckpt_key: str) -> str:
         """Convert checkpoint key to model state_dict key.
