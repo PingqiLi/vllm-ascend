@@ -340,6 +340,8 @@ class Qwen3ResQTrueQuantAttention(nn.Module):
     
     def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
         # One-time device fix: move norms to input device if needed (only runs once)
+        # DEBUG: Always log device info
+        logger.warning(f"[ResQ DEBUG] q_norm.device={self.q_norm.weight.device}, hidden_states.device={hidden_states.device}")
         if self.q_norm.weight.device != hidden_states.device:
             self.q_norm = self.q_norm.to(hidden_states.device)
             self.k_norm = self.k_norm.to(hidden_states.device)
