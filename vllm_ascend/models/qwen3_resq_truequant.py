@@ -685,6 +685,15 @@ class Qwen3ResQTrueQuantForCausalLM(nn.Module):
                 proj_prefix = f'{prefix}.mlp.{proj_name}'
                 self._load_resq_linear(proj, proj_prefix, weights_dict, target_device)
         
+
+        # Final device sync at end of load_weights
+        self.to(target_device)
+        
+        # Debug: verify device
+        for name, param in self.named_parameters():
+            if 'q_norm' in name:
+                logger.warning(f"[ResQ] FINAL load_weights: {name} device={param.device}")
+                break
         if RESQ_DEBUG:
             logger.warning(f"[ResQ TrueQuant] Loaded weights, Hd_K={self.resq_Hd_K}, blocksize={self.resq_blocksize}")
     
