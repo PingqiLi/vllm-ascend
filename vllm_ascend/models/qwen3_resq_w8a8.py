@@ -192,32 +192,27 @@ class Qwen3ResQW8A8Attention(Qwen3Attention):
 
 
 class Qwen3ResQW8A8MLP(Qwen3MLP):
-    """Qwen3 MLP with Ud rotation before down_proj."""
+    """Qwen3 MLP with Pd rotation before down_proj."""
     
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # Ud (Pd) rotation matrix [blocksize, blocksize]
-        self.register_buffer('rotation_Ud', torch.empty(0))
+        # Pd rotation matrix [blocksize, blocksize]
+        self.register_buffer('rotation_Pd', torch.empty(0))
         # Shared Hadamard (set after loading)
         self.shared_Hd: Optional[torch.Tensor] = None
         self.shared_Hd_K: int = 1
         self.blocksize: int = 256
-    
-    def set_shared_hadamard(self, Hd: Optional[torch.Tensor], Hd_K: int, blocksize: int):
-        self.shared_Hd = Hd
-        self.shared_Hd_K = Hd_K
-        self.blocksize = blocksize
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up, _ = self.gate_up_proj(x)
         gate, up = gate_up.chunk(2, dim=-1)
         intermediate = self.act_fn(gate) * up
         
-        # Apply Ud rotation before down_proj (ResQ key innovation)
-        if self.rotation_Ud.numel() > 0:
+        # Apply Pd rotation before down_proj (ResQ key innovation)
+        if self.rotation_Pd.numel() > 0:
             intermediate = apply_ud_rotation(
                 intermediate,
-                Ud=self.rotation_Ud,
+                Ud=self.rotation_Pd,
                 Hd=self.shared_Hd,
                 Hd_K=self.shared_Hd_K,
                 blocksize=self.blocksize,
@@ -269,70 +264,66 @@ class Qwen3ResQW8A8ForCausalLM(Qwen3ForCausalLM):
             if hasattr(layer, 'self_attn'):
                 layer.self_attn.register_buffer('rotation_Uc', torch.empty(0))
             
-            # Add Ud buffer and Hadamard refs to MLP
+            # Add Pd buffer and Hadamard refs to MLP
             if hasattr(layer, 'mlp'):
-                layer.mlp.register_buffer('rotation_Ud', torch.empty(0))
+                layer.mlp.register_buffer('rotation_Pd', torch.empty(0))
                 layer.mlp.shared_Hd = None
                 layer.mlp.shared_Hd_K = 1
                 layer.mlp.blocksize = 256
     
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Load weights including ResQ rotation matrices."""
+        """Load weights including ResQ rotation matrices.
+        
+        msmodelslim output keys:
+        - resq.Hd: Hadamard matrix
+        - resq.Hd_K: Hadamard size
+        - resq.down_proj_blocksize: block size for Pd rotation
+        - resq.intermediate_size: intermediate size (ignored)
+        - resq.layer.{i}.Uc: Q/K rotation after RoPE
+        - resq.layer.{i}.Pd: down_proj rotation
+        """
         # Collect weights
         weights_dict: Dict[str, torch.Tensor] = {}
         for name, tensor in weights:
             weights_dict[name] = tensor
         
-        # Load global ResQ parameters (handle both naming conventions)
+        # Load global ResQ parameters
         if 'resq.Hd' in weights_dict:
             self.resq_Hd = weights_dict.pop('resq.Hd')
         if 'resq.Hd_K' in weights_dict:
             self.resq_Hd_K = int(weights_dict.pop('resq.Hd_K').item())
-        
-        # blocksize might be named differently
-        for blocksize_key in ['resq.blocksize', 'resq.down_proj_blocksize']:
-            if blocksize_key in weights_dict:
-                self.resq_blocksize = int(weights_dict.pop(blocksize_key).item())
-                break
-        
-        # Remove other global ResQ metadata (not needed at runtime)
-        for key in list(weights_dict.keys()):
-            if key.startswith('resq.') and not key.startswith('resq.layer.'):
-                if RESQ_DEBUG:
-                    logger.warning(f"[ResQ] Ignoring global param: {key}")
-                weights_dict.pop(key)
+        if 'resq.down_proj_blocksize' in weights_dict:
+            self.resq_blocksize = int(weights_dict.pop('resq.down_proj_blocksize').item())
+        if 'resq.intermediate_size' in weights_dict:
+            weights_dict.pop('resq.intermediate_size')  # Not needed
         
         # Load per-layer rotation matrices
         for i, layer in enumerate(self.model.layers):
             # Load Uc for attention
             uc_key = f'resq.layer.{i}.Uc'
             if uc_key in weights_dict:
-                if hasattr(layer.self_attn, 'rotation_Uc'):
-                    layer.self_attn.rotation_Uc = weights_dict.pop(uc_key)
-                    if RESQ_DEBUG:
-                        logger.warning(f"[ResQ] Loaded Uc for layer {i}: {layer.self_attn.rotation_Uc.shape}")
+                layer.self_attn.rotation_Uc = weights_dict.pop(uc_key)
+                if RESQ_DEBUG:
+                    logger.warning(f"[ResQ] Loaded Uc for layer {i}: {layer.self_attn.rotation_Uc.shape}")
             
-            # Load Ud/Pd for MLP (msmodelslim uses 'Pd', we use 'Ud')
-            for ud_key in [f'resq.layer.{i}.Ud', f'resq.layer.{i}.Pd']:
-                if ud_key in weights_dict:
-                    if hasattr(layer.mlp, 'rotation_Ud'):
-                        layer.mlp.rotation_Ud = weights_dict.pop(ud_key)
-                        if RESQ_DEBUG:
-                            logger.warning(f"[ResQ] Loaded Ud from {ud_key} for layer {i}: {layer.mlp.rotation_Ud.shape}")
-                    break
+            # Load Pd for MLP
+            pd_key = f'resq.layer.{i}.Pd'
+            if pd_key in weights_dict:
+                layer.mlp.rotation_Pd = weights_dict.pop(pd_key)
+                if RESQ_DEBUG:
+                    logger.warning(f"[ResQ] Loaded Pd for layer {i}: {layer.mlp.rotation_Pd.shape}")
             
             # Set shared Hadamard references
-            if hasattr(layer.mlp, 'shared_Hd'):
-                layer.mlp.shared_Hd = self.resq_Hd if self.resq_Hd.numel() > 0 else None
-                layer.mlp.shared_Hd_K = self.resq_Hd_K
-                layer.mlp.blocksize = self.resq_blocksize
+            layer.mlp.shared_Hd = self.resq_Hd if self.resq_Hd.numel() > 0 else None
+            layer.mlp.shared_Hd_K = self.resq_Hd_K
+            layer.mlp.blocksize = self.resq_blocksize
         
-        # Remove any remaining resq.* keys that parent loader won't recognize
-        remaining_resq_keys = [k for k in weights_dict.keys() if k.startswith('resq.')]
-        for key in remaining_resq_keys:
-            if RESQ_DEBUG:
-                logger.warning(f"[ResQ] Removing unhandled key: {key}")
-            weights_dict.pop(key)
+        # Remove any remaining resq.* keys
+        for key in list(weights_dict.keys()):
+            if key.startswith('resq.'):
+                if RESQ_DEBUG:
+                    logger.warning(f"[ResQ] Removing unhandled key: {key}")
+                weights_dict.pop(key)
         
         # Load remaining weights using parent's loader
         remaining_weights = [(k, v) for k, v in weights_dict.items()]
