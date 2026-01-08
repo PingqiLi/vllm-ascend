@@ -150,16 +150,19 @@ def convert_checkpoint(
         if src.exists():
             shutil.copy(src, output_path / config_file)
     
-    # Update config.json with quantization info and architecture
+    # Update config.json with architecture only
+    # NOTE: Do NOT set quantization_config here! If present in config.json,
+    # vllm will use it directly instead of reading quant_model_description.json
     config_path = output_path / "config.json"
     if config_path.exists():
         with open(config_path, "r") as f:
             config = json.load(f)
         
-        config["quantization_config"] = {
-            "quant_method": "ascend",
-            "quant_type": "W8A8",
-        }
+        # Remove any existing quantization_config to ensure vllm reads
+        # quant_model_description.json for per-layer precision info
+        if "quantization_config" in config:
+            del config["quantization_config"]
+        
         # Update architecture to use our ResQ W8A8 model
         config["architectures"] = ["Qwen3ResQW8A8ForCausalLM"]
         
