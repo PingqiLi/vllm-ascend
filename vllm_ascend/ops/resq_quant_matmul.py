@@ -3,6 +3,10 @@ ResQ Mixed-Precision Quantized MatMul Operations
 
 Reference: msmodelslim reference_op_impl.py
 
+Note: On NPU, int32 matmul is not supported. We use:
+- CPU: torch.matmul(int32, int32) 
+- NPU: torch_npu.npu_quant_matmul (int8 + scale)
+
 Usage:
     from vllm_ascend.ops.resq_quant_matmul import resq_quant_matmul
     
@@ -21,6 +25,12 @@ Usage:
 import torch
 from typing import Optional
 
+try:
+    import torch_npu
+    HAS_NPU = True
+except ImportError:
+    HAS_NPU = False
+
 
 def pack_int4_to_int8_signed(x: torch.Tensor) -> torch.Tensor:
     """
@@ -38,6 +48,11 @@ def pack_int4_to_int8_signed(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def _is_npu_tensor(x: torch.Tensor) -> bool:
+    """Check if tensor is on NPU device."""
+    return HAS_NPU and x.device.type == 'npu'
+
+
 def MM(x: torch.Tensor, weight: torch.Tensor, perChannelScale: torch.Tensor, perTokenScale: torch.Tensor, 
        m: int, outDtype: torch.dtype, KNum_per_group: int, groupListType: int, dequantModle: int):
     """
@@ -47,21 +62,60 @@ def MM(x: torch.Tensor, weight: torch.Tensor, perChannelScale: torch.Tensor, per
     weight: (k, n) int8
     perChannelScale: (1, n) 或 (k//KNum_per_group, n)
     perTokenScale: (m,)
+    
+    Note: On NPU, uses npu_quant_matmul since int32 matmul is not supported.
     """
     K, N = x.shape[1], weight.shape[1]
+    
     if dequantModle == 0:
-        c_temp1 = torch.zeros(m, N).type(torch.float32)
+        # Per-group mode - not optimized for NPU yet, use CPU fallback logic
+        c_temp1 = torch.zeros(m, N, device=x.device).type(torch.float32)
         for k_idx in range(K // KNum_per_group):
-            c_temp1 = c_temp1 + perTokenScale.reshape(m, 1) * perChannelScale[k_idx].reshape(1, N) * \
-                torch.matmul(x[:, k_idx*KNum_per_group:(k_idx+1)*KNum_per_group].type(torch.int32), 
-                             weight[k_idx*KNum_per_group:(k_idx+1)*KNum_per_group, :].type(torch.int32)).type(torch.float32)
+            x_slice = x[:, k_idx*KNum_per_group:(k_idx+1)*KNum_per_group]
+            w_slice = weight[k_idx*KNum_per_group:(k_idx+1)*KNum_per_group, :]
+            
+            if _is_npu_tensor(x):
+                # NPU: use float16 matmul as fallback
+                mm_result = torch.matmul(x_slice.to(torch.float16), w_slice.to(torch.float16)).to(torch.float32)
+            else:
+                # CPU: use int32 matmul
+                mm_result = torch.matmul(x_slice.to(torch.int32), w_slice.to(torch.int32)).to(torch.float32)
+            
+            c_temp1 = c_temp1 + perTokenScale.reshape(m, 1) * perChannelScale[k_idx].reshape(1, N) * mm_result
         return c_temp1.type(outDtype)
+    
     elif dequantModle == 1:
-        c_temp1 = torch.matmul(x.type(torch.int32), weight.type(torch.int32))
-        c_temp1 = c_temp1.type(torch.float32)
-        c_temp2 = torch.mul(c_temp1, perChannelScale).type(torch.float16).type(torch.float32)
-        c_temp3 = torch.mul(c_temp2, perTokenScale.reshape(m, 1))
-        return c_temp3.type(outDtype)
+        # Per-channel mode
+        if _is_npu_tensor(x):
+            # NPU: use npu_quant_matmul
+            # npu_quant_matmul(x1, x2, scale, *, offset=None, pertoken_scale=None, bias=None)
+            # x1: (M, K) int8
+            # x2: (K, N) int8  
+            # scale: (N,) float32 - weight scale (per-channel)
+            # Returns: (M, N) float16
+            
+            # Flatten perChannelScale to (N,)
+            scale = perChannelScale.flatten().to(torch.float32)
+            
+            # Call npu_quant_matmul
+            result = torch_npu.npu_quant_matmul(x, weight, scale)
+            
+            # Result is tuple, get first element
+            if isinstance(result, tuple):
+                c_temp1 = result[0].to(torch.float32)
+            else:
+                c_temp1 = result.to(torch.float32)
+            
+            # Apply per-token scale
+            c_temp2 = torch.mul(c_temp1, perTokenScale.reshape(m, 1))
+            return c_temp2.type(outDtype)
+        else:
+            # CPU: use int32 matmul (original implementation)
+            c_temp1 = torch.matmul(x.type(torch.int32), weight.type(torch.int32))
+            c_temp1 = c_temp1.type(torch.float32)
+            c_temp2 = torch.mul(c_temp1, perChannelScale).type(torch.float16).type(torch.float32)
+            c_temp3 = torch.mul(c_temp2, perTokenScale.reshape(m, 1))
+            return c_temp3.type(outDtype)
 
 
 def MIXPGMM(x: torch.Tensor, weight: torch.Tensor, perChannelScale: torch.Tensor, perTokenScale: torch.Tensor, 
