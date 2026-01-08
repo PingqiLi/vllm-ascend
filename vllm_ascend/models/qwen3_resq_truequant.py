@@ -339,13 +339,12 @@ class Qwen3ResQTrueQuantAttention(nn.Module):
         self.register_buffer('rotation_R3', torch.empty(0))
     
     def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
-        # One-time device fix: move norms to input device if needed (only runs once)
-        # DEBUG: Always log device info
-        logger.warning(f"[ResQ DEBUG] q_norm.device={self.q_norm.weight.device}, hidden_states.device={hidden_states.device}")
-        if self.q_norm.weight.device != hidden_states.device:
-            self.q_norm = self.q_norm.to(hidden_states.device)
-            self.k_norm = self.k_norm.to(hidden_states.device)
-            logger.warning(f"[ResQ] Fixed q_norm/k_norm device to {hidden_states.device}")
+        # DEBUG: Log detailed info about q_norm
+        logger.warning(f"[ResQ DEBUG] q_norm type={type(self.q_norm).__name__}, "
+                      f"q_norm.weight.device={self.q_norm.weight.device}, "
+                      f"q_norm.weight.data_ptr={self.q_norm.weight.data_ptr()}, "
+                      f"hidden_states.device={hidden_states.device}, "
+                      f"forward_method={getattr(self.q_norm, '_forward_method', None)}")
         # Q/K/V projections
         q = self.q_proj(hidden_states)
         k = self.k_proj(hidden_states)
