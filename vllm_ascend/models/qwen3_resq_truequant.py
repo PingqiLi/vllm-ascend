@@ -86,14 +86,18 @@ def hadamard_transform(u: torch.Tensor) -> torch.Tensor:
 
 class ResQMixedPrecisionLinear(nn.Module):
     """
-    Linear layer with ResQ mixed-precision quantization.
+    Linear layer with ResQ mixed-precision quantization using NPU fused kernels.
     
-    Stores weights as int4/int8 and dequantizes during forward.
+    Uses torch_npu.npu_quant_matmul for efficient quantized matmul:
+    - Separate matmul for int4 (low) and int8 (high) parts
+    - Sum results to get final output
+    - No bf16 dequantization, avoids OOM
+    
     Layout: [out_features, in_features] where in_features = in_low + in_high
     
-    Forward computes:
-        y = x @ dequant(W)^T
-    where dequant reconstructs bf16 from int4/int8 parts.
+    Reference: 
+    - https://www.hiascend.com/document/detail/zh/Pytorch/710/apiref/torchnpuCustomsapi/context/torch_npu-npu_quant_matmul.md
+    - vllm_ascend/ops/resq_quant_matmul.py
     """
     
     def __init__(
@@ -112,58 +116,53 @@ class ResQMixedPrecisionLinear(nn.Module):
         self.in_low = in_features - self.in_high
         
         # Quantized weights - will be loaded from checkpoint
-        self.register_buffer('weight_low', torch.empty(0))   # [out, in_low], int8 storage
-        self.register_buffer('weight_high', torch.empty(0))  # [out, in_high], int8 storage
-        self.register_buffer('scale_low', torch.empty(0))    # [out, 1]
-        self.register_buffer('scale_high', torch.empty(0))   # [out, 1]
-        self.register_buffer('offset_low', torch.empty(0))   # [out, 1] or empty
-        self.register_buffer('offset_high', torch.empty(0))  # [out, 1] or empty
+        # weight_low: int4 stored as int8, [out, in_low]
+        # weight_high: int8, [out, in_high]
+        self.register_buffer('weight_low', torch.empty(0))
+        self.register_buffer('weight_high', torch.empty(0))
+        self.register_buffer('scale_low', torch.empty(0))    # [out] or [out, 1]
+        self.register_buffer('scale_high', torch.empty(0))   # [out] or [out, 1]
+        self.register_buffer('offset_low', torch.empty(0))   # optional
+        self.register_buffer('offset_high', torch.empty(0))  # optional
         
         if bias:
             self.bias = nn.Parameter(torch.zeros(out_features))
         else:
             self.register_parameter('bias', None)
     
-    def dequantize(self) -> torch.Tensor:
-        """Dequantize weights to bf16."""
-        # Low precision (int4 stored as int8)
-        w_low = self.weight_low.float()
-        s_low = self.scale_low.float()
-        if s_low.dim() == 1:
-            s_low = s_low.view(-1, 1)
-        
-        if self.offset_low.numel() > 0:
-            o_low = self.offset_low.float()
-            if o_low.dim() == 1:
-                o_low = o_low.view(-1, 1)
-            dequant_low = (w_low - o_low) * s_low
-        else:
-            dequant_low = w_low * s_low
-        
-        # High precision (int8)
-        w_high = self.weight_high.float()
-        s_high = self.scale_high.float()
-        if s_high.dim() == 1:
-            s_high = s_high.view(-1, 1)
-        
-        if self.offset_high.numel() > 0:
-            o_high = self.offset_high.float()
-            if o_high.dim() == 1:
-                o_high = o_high.view(-1, 1)
-            dequant_high = (w_high - o_high) * s_high
-        else:
-            dequant_high = w_high * s_high
-        
-        # Concat: low first, then high (matches msmodelslim layout)
-        return torch.cat([dequant_low, dequant_high], dim=1).to(torch.bfloat16)
-    
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward with on-the-fly dequantization."""
-        weight = self.dequantize()  # [out, in]
-        output = torch.matmul(x, weight.T)
+        """
+        Forward using NPU quantized matmul for both int4 and int8 parts.
+        
+        y = x_low @ W_low^T + x_high @ W_high^T
+        where x is split along last dim to match weight layout.
+        """
+        from vllm_ascend.ops.resq_quant_matmul import resq_mixed_precision_matmul
+        
+        original_shape = x.shape
+        original_dtype = x.dtype
+        
+        # Flatten batch dimensions
+        x_2d = x.view(-1, self.in_features)
+        
+        output = resq_mixed_precision_matmul(
+            x_2d,
+            weight_low=self.weight_low,
+            weight_high=self.weight_high,
+            scale_low=self.scale_low,
+            scale_high=self.scale_high,
+            split_k_pos=self.in_low,
+            offset_low=self.offset_low if self.offset_low.numel() > 0 else None,
+            offset_high=self.offset_high if self.offset_high.numel() > 0 else None,
+            output_dtype=original_dtype,
+        )
+        
         if self.bias is not None:
             output = output + self.bias
-        return output
+        
+        # Restore shape
+        output_shape = list(original_shape[:-1]) + [self.out_features]
+        return output.view(output_shape)
 
 
 # ============================================================================
