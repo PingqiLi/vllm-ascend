@@ -602,9 +602,29 @@ class Qwen3ResQTrueQuantForCausalLM(nn.Module):
                 proj = getattr(layer.mlp, proj_name)
                 proj_prefix = f'{prefix}.mlp.{proj_name}'
                 loaded_keys.update(self._load_resq_linear(proj, proj_prefix, weights_dict))
+            
+            # Load layer norms
+            input_ln_key = f'{prefix}.input_layernorm.weight'
+            if input_ln_key in weights_dict:
+                layer.input_layernorm.weight.data.copy_(weights_dict[input_ln_key])
+                loaded_keys.add(input_ln_key)
+            
+            post_ln_key = f'{prefix}.post_attention_layernorm.weight'
+            if post_ln_key in weights_dict:
+                layer.post_attention_layernorm.weight.data.copy_(weights_dict[post_ln_key])
+                loaded_keys.add(post_ln_key)
+        
+        # Load final norm
+        if 'model.norm.weight' in weights_dict:
+            self.norm.weight.data.copy_(weights_dict['model.norm.weight'])
+            loaded_keys.add('model.norm.weight')
         
         # Load LM head
-        if 'model.lm_head.weight' in weights_dict:
+        if 'lm_head.weight' in weights_dict:
+            if hasattr(self.lm_head, 'weight'):
+                self.lm_head.weight.data.copy_(weights_dict['lm_head.weight'])
+            loaded_keys.add('lm_head.weight')
+        elif 'model.lm_head.weight' in weights_dict:
             if hasattr(self.lm_head, 'weight'):
                 self.lm_head.weight.data.copy_(weights_dict['model.lm_head.weight'])
             loaded_keys.add('model.lm_head.weight')
