@@ -150,7 +150,7 @@ def convert_checkpoint(
         if src.exists():
             shutil.copy(src, output_path / config_file)
     
-    # Update config.json with quantization info
+    # Update config.json with quantization info and architecture
     config_path = output_path / "config.json"
     if config_path.exists():
         with open(config_path, "r") as f:
@@ -160,6 +160,8 @@ def convert_checkpoint(
             "quant_method": "ascend",
             "quant_type": "W8A8",
         }
+        # Update architecture to use our ResQ W8A8 model
+        config["architectures"] = ["Qwen3ResQW8A8ForCausalLM"]
         
         with open(config_path, "w") as f:
             json.dump(config, f, indent=2)
@@ -278,28 +280,49 @@ def convert_checkpoint(
     save_file(output_tensors, str(output_file))
     print(f"Saved to {output_file}")
     
-    # Create quant_description.json (required for --quantization ascend)
-    quant_desc = {
-        "quant_type": "W8A8",
-        "w_sym": True,  # symmetric weight quantization
-        "a_sym": True,  # symmetric activation quantization
-        "converted_from": "ResQ",
-        "has_rotation_matrices": len(rotation_matrices) > 0,
-    }
-    with open(output_path / "quant_description.json", "w") as f:
+    # Create quant_model_description.json (required for --quantization ascend)
+    # Format: {"model.layers.0.self_attn.q_proj.weight": "W8A8", ...}
+    quant_desc = {}
+    
+    # Mark all converted layers as W8A8
+    for layer_prefix in sorted(resq_layers):
+        quant_desc[f"{layer_prefix}.weight"] = "W8A8"
+    
+    # Mark non-quantized layers (embeddings, layernorms, lm_head) as FLOAT
+    for key in all_tensors:
+        # Skip ResQ-specific tensors
+        if any(suffix in key for suffix in [".weight_low", ".weight_high", 
+                                             ".scale_low", ".scale_high",
+                                             ".offset_low", ".offset_high"]):
+            continue
+        # Skip rotation matrices
+        if key.startswith("resq."):
+            continue
+        # Skip if it's part of a converted layer
+        if any(key.startswith(prefix) for prefix in resq_layers):
+            continue
+        # Mark as FLOAT (embeddings, layernorms, lm_head, biases, etc.)
+        if ".weight" in key or ".bias" in key:
+            quant_desc[key] = "FLOAT"
+    
+    with open(output_path / "quant_model_description.json", "w") as f:
         json.dump(quant_desc, f, indent=2)
+    
+    print(f"Created quant_model_description.json with {len(quant_desc)} entries")
     
     print("\n" + "=" * 60)
     print("Conversion complete!")
     print("=" * 60)
     print(f"\nOutput saved to: {output_path}")
+    print(f"\nOutput files:")
+    print(f"  - model.safetensors (W8A8 quantized weights)")
+    print(f"  - quant_model_description.json (layer precision info)")
+    print(f"  - config.json (updated with Qwen3ResQW8A8ForCausalLM)")
     print(f"\nTo run inference:")
     print(f"  vllm serve {output_path} --quantization ascend")
-    print(f"\nNote: ResQ rotation matrices (Uc, Ud) are preserved but NOT applied!")
-    print("Standard Qwen3 model will NOT apply online rotations.")
-    print("For correct ResQ inference, you need a custom model that applies:")
-    print("  - Uc: Q/K rotation after RoPE")
-    print("  - Ud: intermediate rotation before down_proj")
+    print(f"\nThe Qwen3ResQW8A8ForCausalLM model will automatically apply:")
+    print("  - Uc: Q/K rotation after RoPE (from resq.layer.{i}.Uc)")
+    print("  - Ud: intermediate rotation before down_proj (from resq.layer.{i}.Ud)")
 
 
 def main():
