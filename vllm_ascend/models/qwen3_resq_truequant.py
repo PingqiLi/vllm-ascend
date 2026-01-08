@@ -132,29 +132,52 @@ class ResQMixedPrecisionLinear(nn.Module):
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Forward using NPU quantized matmul for both int4 and int8 parts.
+        Forward using quantized matmul for both int4 and int8 parts.
         
-        y = x_low @ W_low^T + x_high @ W_high^T
-        where x is split along last dim to match weight layout.
+        y = x_low @ W_low^T * scale_low * lxScale + x_high @ W_high^T * scale_high * rxScale
         """
-        from vllm_ascend.ops.resq_quant_matmul import resq_mixed_precision_matmul
+        from vllm_ascend.ops.resq_quant_matmul import resq_quant_matmul
         
         original_shape = x.shape
         original_dtype = x.dtype
         
-        # Flatten batch dimensions
+        # Flatten batch dimensions: (..., in_features) -> (M, in_features)
         x_2d = x.view(-1, self.in_features)
+        M = x_2d.shape[0]
         
-        output = resq_mixed_precision_matmul(
-            x_2d,
-            weight_low=self.weight_low,
-            weight_high=self.weight_high,
-            scale_low=self.scale_low,
-            scale_high=self.scale_high,
-            split_k_pos=self.in_low,
-            offset_low=self.offset_low if self.offset_low.numel() > 0 else None,
-            offset_high=self.offset_high if self.offset_high.numel() > 0 else None,
-            output_dtype=original_dtype,
+        # Split input along K dimension
+        x_low = x_2d[:, :self.in_low]    # (M, in_low) for int4 weights
+        x_high = x_2d[:, self.in_low:]   # (M, in_high) for int8 weights
+        
+        # Per-token dynamic quantization
+        # int4 part: qmax=7
+        x_low_abs_max = x_low.abs().amax(dim=-1, keepdim=True)
+        lxScale = (x_low_abs_max / 7.0).clamp(min=1e-10).squeeze(-1).to(torch.float32)
+        x_low_int8 = torch.round(x_low / lxScale.unsqueeze(-1)).clamp(-8, 7).to(torch.int8)
+        
+        # int8 part: qmax=127
+        x_high_abs_max = x_high.abs().amax(dim=-1, keepdim=True)
+        rxScale = (x_high_abs_max / 127.0).clamp(min=1e-10).squeeze(-1).to(torch.float32)
+        x_high_int8 = torch.round(x_high / rxScale.unsqueeze(-1)).clamp(-128, 127).to(torch.int8)
+        
+        # Concatenate quantized input: (M, K)
+        x_quant = torch.cat([x_low_int8, x_high_int8], dim=-1)
+        
+        # Concatenate weights: (in_low, out) + (in_high, out) -> (K, N)
+        # Note: stored as (out, in_*), need to transpose
+        weight = torch.cat([self.weight_low.T, self.weight_high.T], dim=0)  # (K, N)
+        
+        # Call quantized matmul
+        output = resq_quant_matmul(
+            x_quant,
+            weight,
+            self.scale_low,
+            self.scale_high,
+            lxScale,
+            rxScale,
+            self.in_low,
+            groupList=None,  # E=1
+            outDtype=original_dtype,
         )
         
         if self.bias is not None:
