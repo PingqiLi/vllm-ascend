@@ -43,6 +43,7 @@ from vllm.config import VllmConfig, CacheConfig, QuantizationConfig
 from vllm.model_executor.models.qwen3 import (
     Qwen3DecoderLayer, Qwen3Model, Qwen3ForCausalLM
 )
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.utils import maybe_prefix, PPMissingLayer
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.distributed import get_tensor_model_parallel_world_size
@@ -575,9 +576,15 @@ class Qwen3ResQTrueQuantForCausalLM(nn.Module):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
         """Load weights from msmodelslim ResQ checkpoint.
         
+        Uses standard vLLM weight loading for regular parameters (norms, embed, lm_head)
+        and custom loading for ResQ quantized linear layers.
+        
         Returns None to skip vLLM's strict weight check (since we use custom quantization).
         """
-        # Normalize keys: remove 'model.' prefix
+        # Build params_dict for standard weight loading (like other vLLM models)
+        params_dict = dict(self.named_parameters())
+        
+        # Normalize keys: remove 'model.' prefix and collect weights
         weights_dict: Dict[str, torch.Tensor] = {}
         for name, tensor in weights:
             key = self._ckpt_to_model_key(name)
@@ -588,7 +595,6 @@ class Qwen3ResQTrueQuantForCausalLM(nn.Module):
             import torch_npu
             target_device = torch.device(f'npu:{torch_npu.npu.current_device()}')
         except (ImportError, RuntimeError):
-            # Fallback to CUDA or CPU
             if torch.cuda.is_available():
                 target_device = torch.device(f'cuda:{torch.cuda.current_device()}')
             else:
@@ -605,11 +611,24 @@ class Qwen3ResQTrueQuantForCausalLM(nn.Module):
         if 'resq.down_proj_blocksize' in weights_dict:
             self.resq_blocksize = int(weights_dict['resq.down_proj_blocksize'].item())
         
-        # Load embedding (ensure on target device)
-        if 'embed_tokens.weight' in weights_dict:
-            self.embed_tokens.weight.data.copy_(weights_dict['embed_tokens.weight'].to(target_device))
+        # Load standard parameters using default_weight_loader (handles device correctly)
+        # This includes: embed_tokens, all norms, lm_head
+        for ckpt_key, loaded_weight in weights_dict.items():
+            # Skip ResQ-specific keys
+            if ckpt_key.startswith('resq.'):
+                continue
+            # Skip quantized linear layer keys (weight_low, weight_high, scale_*, offset_*)
+            if any(suffix in ckpt_key for suffix in ['weight_low', 'weight_high', 'scale_low', 'scale_high', 'offset_low', 'offset_high']):
+                continue
+            
+            # Map to param name
+            param_name = ckpt_key
+            if param_name in params_dict:
+                param = params_dict[param_name]
+                weight_loader = getattr(param, 'weight_loader', default_weight_loader)
+                weight_loader(param, loaded_weight)
         
-        # Load layers
+        # Load layers - ResQ specific parts
         for i, layer in enumerate(self.layers):
             prefix = f'layers.{i}'
             
@@ -624,46 +643,20 @@ class Qwen3ResQTrueQuantForCausalLM(nn.Module):
             
             layer.mlp.set_shared_hadamard(self.resq_Hd, self.resq_Hd_K, self.resq_blocksize)
             
-            # Load attention projections
+            # Load attention projections (quantized)
             for proj_name in ['q_proj', 'k_proj', 'v_proj', 'o_proj']:
                 proj = getattr(layer.self_attn, proj_name)
                 proj_prefix = f'{prefix}.self_attn.{proj_name}'
                 self._load_resq_linear(proj, proj_prefix, weights_dict, target_device)
             
-            # Load MLP projections
+            # Load MLP projections (quantized)
             for proj_name in ['gate_proj', 'up_proj', 'down_proj']:
                 proj = getattr(layer.mlp, proj_name)
                 proj_prefix = f'{prefix}.mlp.{proj_name}'
                 self._load_resq_linear(proj, proj_prefix, weights_dict, target_device)
-            
-            # Load layer norms (ensure on target device)
-            for ln_name in ['input_layernorm', 'post_attention_layernorm']:
-                ln_key = f'{prefix}.{ln_name}.weight'
-                if ln_key in weights_dict:
-                    ln = getattr(layer, ln_name)
-                    ln.weight.data.copy_(weights_dict[ln_key].to(target_device))
-            
-            # Load QK norms (self_attn.q_norm, self_attn.k_norm)
-            for qk_norm_name in ['q_norm', 'k_norm']:
-                qk_norm_key = f'{prefix}.self_attn.{qk_norm_name}.weight'
-                if qk_norm_key in weights_dict:
-                    qk_norm = getattr(layer.self_attn, qk_norm_name)
-                    qk_norm.weight.data.copy_(weights_dict[qk_norm_key].to(target_device))
-        
-        # Load final norm (ensure on target device)
-        if 'norm.weight' in weights_dict:
-            self.norm.weight.data.copy_(weights_dict['norm.weight'].to(target_device))
-        
-        # Load LM head (ensure on target device)
-        if 'lm_head.weight' in weights_dict:
-            if hasattr(self.lm_head, 'weight'):
-                self.lm_head.weight.data.copy_(weights_dict['lm_head.weight'].to(target_device))
-        
-        # Move entire model to target device to ensure all parameters are on correct device
-        self.to(target_device)
         
         if RESQ_DEBUG:
-            logger.warning(f"[ResQ TrueQuant] Loaded weights to {target_device}, Hd_K={self.resq_Hd_K}, blocksize={self.resq_blocksize}")
+            logger.warning(f"[ResQ TrueQuant] Loaded weights, Hd_K={self.resq_Hd_K}, blocksize={self.resq_blocksize}")
     
     def _load_resq_linear(
         self,
