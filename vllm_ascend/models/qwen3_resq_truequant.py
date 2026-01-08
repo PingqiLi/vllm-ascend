@@ -583,8 +583,19 @@ class Qwen3ResQTrueQuantForCausalLM(nn.Module):
             key = self._ckpt_to_model_key(name)
             weights_dict[key] = tensor
         
-        # Get target device from model parameters
-        target_device = self.embed_tokens.weight.device
+        # Get target device - prefer NPU if available
+        try:
+            import torch_npu
+            target_device = torch.device(f'npu:{torch_npu.npu.current_device()}')
+        except (ImportError, RuntimeError):
+            # Fallback to CUDA or CPU
+            if torch.cuda.is_available():
+                target_device = torch.device(f'cuda:{torch.cuda.current_device()}')
+            else:
+                target_device = torch.device('cpu')
+        
+        if RESQ_DEBUG:
+            logger.warning(f"[ResQ TrueQuant] target_device={target_device}")
         
         # Load global ResQ parameters (stored as attributes, not in state_dict)
         if 'resq.Hd' in weights_dict:
@@ -648,8 +659,11 @@ class Qwen3ResQTrueQuantForCausalLM(nn.Module):
             if hasattr(self.lm_head, 'weight'):
                 self.lm_head.weight.data.copy_(weights_dict['lm_head.weight'].to(target_device))
         
+        # Move entire model to target device to ensure all parameters are on correct device
+        self.to(target_device)
+        
         if RESQ_DEBUG:
-            logger.warning(f"[ResQ TrueQuant] Loaded weights, Hd_K={self.resq_Hd_K}, blocksize={self.resq_blocksize}")
+            logger.warning(f"[ResQ TrueQuant] Loaded weights to {target_device}, Hd_K={self.resq_Hd_K}, blocksize={self.resq_blocksize}")
     
     def _load_resq_linear(
         self,
