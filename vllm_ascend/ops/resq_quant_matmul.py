@@ -211,16 +211,29 @@ def resq_quant_matmul(
     if weight.dim() == 2:
         weight = weight.unsqueeze(0)  # (K, N) -> (1, K, N)
     
-    # 处理scale shape: 确保是 (E, ..., N)
+    # 处理scale shape: 确保是 (E, 1, N)
+    # msmodelslim 保存的 scale shape 是 [N, 1] (per-row scale)，需要转换
     if lweightScale.dim() == 1:
-        lweightScale = lweightScale.unsqueeze(0).unsqueeze(0)  # (N,) -> (1, 1, N)
+        # (N,) -> (1, 1, N)
+        lweightScale = lweightScale.unsqueeze(0).unsqueeze(0)
     elif lweightScale.dim() == 2:
-        lweightScale = lweightScale.unsqueeze(0)  # (1, N) -> (1, 1, N)
+        # 可能是 (N, 1) 或 (1, N)，统一处理
+        if lweightScale.shape[0] > lweightScale.shape[1]:
+            # (N, 1) -> (1, 1, N)
+            lweightScale = lweightScale.T.unsqueeze(0)
+        else:
+            # (1, N) -> (1, 1, N)
+            lweightScale = lweightScale.unsqueeze(0)
     
     if hweightScale.dim() == 1:
         hweightScale = hweightScale.unsqueeze(0).unsqueeze(0)
     elif hweightScale.dim() == 2:
-        hweightScale = hweightScale.unsqueeze(0)
+        if hweightScale.shape[0] > hweightScale.shape[1]:
+            # (N, 1) -> (1, 1, N)
+            hweightScale = hweightScale.T.unsqueeze(0)
+        else:
+            # (1, N) -> (1, 1, N)
+            hweightScale = hweightScale.unsqueeze(0)
     
     # 处理groupList: None -> E=1
     if groupList is None:

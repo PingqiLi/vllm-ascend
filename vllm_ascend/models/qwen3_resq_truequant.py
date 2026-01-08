@@ -222,30 +222,57 @@ def apply_ud_rotation(
     blocksize: int,
 ) -> torch.Tensor:
     """
-    Apply U_d = block_diag(P_d.T) @ H rotation before down_proj.
+    Apply Ud rotation before down_proj for ResQ inference.
     
-    Normalization:
-    - msmodelslim's Hd is normalized (elements ±1/sqrt(K))
-    - matmul_hadU_cpu divides by sqrt(n)
-    - Combined: 1/(sqrt(n) * sqrt(K)) = 1/sqrt(n*K)
-    - Need to multiply by sqrt(K) to get correct 1/sqrt(n)
+    During quantization (rotate_mlp_output_hadamard), weights are fused with:
+        Wd_new = Ua.T @ Wd_old @ Ud
+        where Ud = block_diag(Pd).T @ H  (code order: Pd.T first, then H)
+    
+    At inference, activation x needs to match the weight's input space:
+        x_transformed = x @ Ud = x @ block_diag(Pd).T @ H
+    
+    The correct order is:
+        1. Apply block_diag(Pd).T to each block
+        2. Apply Hadamard H = Hd ⊗ H_butterfly
+    
+    Note: 
+        - K = Hd dimension (e.g., 100 for Qwen3-32B)
+        - blocksize = down_proj_blocksize (e.g., 256)
+        - intermediate_size = K * blocksize (e.g., 25600)
+        - num_blocks = K (since K = intermediate_size / blocksize)
+    
+    The Hadamard transform H = Hd ⊗ H_butterfly where:
+        - Hd: [K, K] block matrix
+        - H_butterfly: applied via fast butterfly algorithm on blocksize dimension
+    
+    This matches msmodelslim's matmul_hadU_cpu implementation.
     """
     original_shape = x.shape
-    n = x.shape[-1]
-    assert n == K * blocksize, f"n={n} != K*blocksize={K * blocksize}"
+    n = x.shape[-1]  # intermediate_size
+    
+    # Validate dimensions
+    if n != K * blocksize:
+        raise ValueError(
+            f"Dimension mismatch: intermediate_size={n} != K*blocksize={K}*{blocksize}={K*blocksize}. "
+            f"Check resq.Hd_K and resq.down_proj_blocksize configuration."
+        )
     
     original_dtype = x.dtype
     x = x.float()
     
-    # Step 1: Apply P_d.T block-wise
+    # Reshape: (..., n) -> (..., K, blocksize) where K = num_blocks
     x = x.reshape(*original_shape[:-1], K, blocksize)
+    
+    # Step 1: Apply block_diag(Pd).T block-wise (x @ Pd.T for each block)
     Pd_f32 = Pd.to(device=x.device, dtype=torch.float32)
     x = torch.matmul(x, Pd_f32.T)
     
-    # Step 2: Apply H = H_d ⊗ H_butterfly
+    # Step 2: Apply H = Hd ⊗ H_butterfly
+    # First apply butterfly Hadamard on the blocksize dimension (last dim)
     x = hadamard_transform(x.contiguous())
-    x = x / math.sqrt(n)  # Same as msmodelslim's matmul_hadU_cpu
     
+    # Then apply Hd on the K dimension (second-to-last dim)
+    # This matches matmul_hadU_cpu: hadK @ input_tensor where input has shape [batch, K, n//K]
     if Hd is not None and K > 1:
         batch_shape = x.shape[:-2]
         batch_size = 1
@@ -254,14 +281,22 @@ def apply_ud_rotation(
         x = x.reshape(batch_size, K, blocksize)
         
         Hd_f32 = Hd.to(device=x.device, dtype=torch.float32)
+        # Apply Hd: [K, K] @ [batch, K, blocksize] -> [batch, K, blocksize]
         x = torch.einsum('ij,bjk->bik', Hd_f32, x)
         
-        # Compensate for normalized Hd
-        hd_max = Hd.abs().max().item()
-        if hd_max < 0.5:  # Normalized (elements ~±1/sqrt(K))
-            x = x * math.sqrt(K)  # NOT * K !
-        
         x = x.reshape(*batch_shape, K, blocksize)
+    
+    # Normalize: divide by sqrt(n) to match msmodelslim's matmul_hadU_cpu
+    x = x / math.sqrt(n)
+    
+    # Compensate for Hd normalization if needed
+    # msmodelslim's Hd may be pre-normalized (elements ±1/sqrt(K))
+    # In that case, the effective scale is 1/(sqrt(n) * sqrt(K)) instead of 1/sqrt(n)
+    # We need to multiply by sqrt(K) to correct this
+    if Hd is not None and K > 1:
+        hd_max = Hd.abs().max().item()
+        if hd_max < 0.5:  # Normalized Hd (elements ~±1/sqrt(K) ≈ ±0.1 for K=100)
+            x = x * math.sqrt(K)
     
     return x.reshape(original_shape).to(original_dtype)
 
