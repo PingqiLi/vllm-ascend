@@ -630,6 +630,12 @@ class Qwen3ResQTrueQuantForCausalLM(nn.Module):
                 ln_key = f'{prefix}.{ln_name}.weight'
                 if ln_key in weights_dict:
                     getattr(layer, ln_name).weight.data.copy_(weights_dict[ln_key])
+            
+            # Load QK norms (self_attn.q_norm, self_attn.k_norm)
+            for qk_norm_name in ['q_norm', 'k_norm']:
+                qk_norm_key = f'{prefix}.self_attn.{qk_norm_name}.weight'
+                if qk_norm_key in weights_dict:
+                    getattr(layer.self_attn, qk_norm_name).weight.data.copy_(weights_dict[qk_norm_key])
         
         # Load final norm
         if 'norm.weight' in weights_dict:
