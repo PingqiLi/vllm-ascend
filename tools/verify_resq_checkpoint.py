@@ -438,12 +438,6 @@ class ResQVerifier:
         print(f"\n[Layer {layer_idx}] 正交性验证")
         all_passed = True
         
-        # 验证 Ua, Uc, Pd 的正交性
-        # 首次验证时启用 debug 输出
-        if layer_idx == 0:
-            print("  [DEBUG] 检查 P_a 和 R_a 的正交性:")
-            self.mgr.get_ua(layer_idx, debug=True)
-        
         for name, get_fn in [
             ("Ua", lambda: self.mgr.get_ua(layer_idx)),
             ("Uc", lambda: self.mgr.get_uc(layer_idx)),
@@ -516,15 +510,9 @@ class ResQVerifier:
             self.log(result)
             return result
         
-        # 直接比较（应该差异大）
-        direct = compute_diff(embed_A.float(), embed_O.float(), "embed_A vs embed_O (直接)")
-        print(f"  直接比较: rel={direct.rel_diff:.2%} (应该差异大)")
-        
-        # msmodelslim 的 fuse_layer_norms 对 embed 做了 mean subtraction:
-        #   W_new = W_ - W_.mean(dim=-1, keepdim=True)
+        # msmodelslim 的 fuse_layer_norms 对 embed 做了 mean subtraction
         embed_O_float = embed_O.float()
         embed_centered = embed_O_float - embed_O_float.mean(dim=-1, keepdim=True)
-        print(f"  [DEBUG] embed_O mean subtraction: mean={embed_O_float.mean(dim=-1).abs().mean():.4f}")
         
         # 正向验证: (embed_O - mean) @ Ua ≈ embed_A
         embed_forward = torch.matmul(embed_centered, Ua)
@@ -570,9 +558,7 @@ class ResQVerifier:
         for proj in ['q_proj', 'k_proj', 'v_proj']:
             # 使用 fuse_layernorm=True，因为 msmodelslim 在量化前会融合 LayerNorm
             W_O = self.mgr.get_original_weight(f'model.layers.{layer_idx}.self_attn.{proj}.weight', fuse_layernorm=True)
-            # 对 layer 0 的 q_proj 启用 debug
-            debug_dequant = (layer_idx == 0 and proj == 'q_proj')
-            W_A = self.mgr.get_quantized_weight(f'model.layers.{layer_idx}.self_attn.{proj}', debug=debug_dequant)
+            W_A = self.mgr.get_quantized_weight(f'model.layers.{layer_idx}.self_attn.{proj}')
             
             if W_O is None or W_A is None:
                 print(f"  ⚠ {proj} 权重未找到")
@@ -583,60 +569,6 @@ class ResQVerifier:
             in_dim = W_A.shape[1]  # = hidden_size
             
             if proj in ['q_proj', 'k_proj']:
-                # 诊断：直接比较 W_A 和 W_O
-                if layer_idx == 0 and proj == 'q_proj':
-                    print(f"  [DEBUG] {proj} 形状: W_A={W_A.shape}, W_O={W_O.shape}")
-                    print(f"  [DEBUG] {proj} 数值范围:")
-                    print(f"    W_A: min={W_A.min().item():.4f}, max={W_A.max().item():.4f}, mean={W_A.float().mean().item():.4f}")
-                    print(f"    W_O: min={W_O.min().item():.4f}, max={W_O.max().item():.4f}, mean={W_O.float().mean().item():.4f}")
-                    
-                    # 检查 LayerNorm gamma
-                    gamma = self.mgr._get_layernorm_gamma(f'model.layers.{layer_idx}.self_attn.{proj}.weight')
-                    if gamma is not None:
-                        print(f"    gamma: min={gamma.min().item():.4f}, max={gamma.max().item():.4f}, mean={gamma.mean().item():.4f}")
-                    
-                    # 检查 Ua 范围和正交性
-                    print(f"    Ua: min={Ua.min().item():.4f}, max={Ua.max().item():.4f}")
-                    Ua_orth_err = (torch.matmul(Ua, Ua.T) - torch.eye(Ua.shape[0])).abs().max().item()
-                    print(f"    Ua orthogonality error: {Ua_orth_err:.2e}")
-                    
-                    # 不融合 gamma 时的 W_O
-                    W_O_raw = self.mgr.get_original_weight(f'model.layers.{layer_idx}.self_attn.{proj}.weight', fuse_layernorm=False)
-                    print(f"    W_O_raw (no gamma): min={W_O_raw.min().item():.4f}, max={W_O_raw.max().item():.4f}")
-                    
-                    direct_diff = compute_diff(W_A.float(), W_O, f"{proj} 直接比较")
-                    print(f"  [DEBUG] {proj} 直接比较: rel={direct_diff.rel_diff:.2%}")
-                    
-                    # 正向验证: W_O @ Ua ≈ W_A
-                    W_forward = torch.matmul(W_O.float(), Ua)
-                    print(f"    W_O@Ua: min={W_forward.min().item():.4f}, max={W_forward.max().item():.4f}")
-                    forward_diff = compute_diff(W_forward, W_A.float(), f"{proj} 正向")
-                    print(f"  [DEBUG] {proj} 正向验证 (W_O @ Ua vs W_A): rel={forward_diff.rel_diff:.2%}")
-                    
-                    # 打印前几个元素对比
-                    print(f"  [DEBUG] 前5个元素对比 (row 0):")
-                    print(f"    W_O@Ua[0,:5]: {W_forward[0,:5].tolist()}")
-                    print(f"    W_A[0,:5]:    {W_A[0,:5].float().tolist()}")
-                    print(f"    diff[0,:5]:   {(W_forward[0,:5] - W_A[0,:5].float()).tolist()}")
-                    
-                    # 检查相关性（如果只是 scale 问题，相关性应该高）
-                    corr = torch.corrcoef(torch.stack([W_forward.flatten(), W_A.float().flatten()]))[0, 1]
-                    print(f"    相关系数: {corr.item():.4f} (1.0=完全相关, 0=无关)")
-                    
-                    # 检查非零元素的匹配程度（排除量化为0的影响）
-                    nonzero_mask = W_A.abs() > 1e-8
-                    if nonzero_mask.sum() > 0:
-                        W_forward_nz = W_forward[nonzero_mask]
-                        W_A_nz = W_A[nonzero_mask].float()
-                        nz_rel = ((W_forward_nz - W_A_nz).abs() / W_A_nz.abs()).mean().item()
-                        print(f"    非零元素相对误差: {nz_rel:.2%} (排除量化为0的影响)")
-                    
-                    # 不融合 gamma 的正向验证
-                    W_forward_raw = torch.matmul(W_O_raw.float(), Ua)
-                    print(f"    W_O_raw@Ua: min={W_forward_raw.min().item():.4f}, max={W_forward_raw.max().item():.4f}")
-                    forward_raw_diff = compute_diff(W_forward_raw, W_A.float(), f"{proj} 正向 (no gamma)")
-                    print(f"  [DEBUG] {proj} 正向验证 (W_O_raw @ Ua vs W_A): rel={forward_raw_diff.rel_diff:.2%}")
-                
                 # Q/K: W_A = W_O @ Ua
                 # 验证方式改为相关系数（int4量化导致rel_diff很大但相关性高）
                 W_forward = torch.matmul(W_O.float(), Ua)
@@ -644,7 +576,7 @@ class ResQVerifier:
                 
                 passed = corr >= THRESHOLDS.quantized_correlation
                 status = "✓ PASS" if passed else "✗ FAIL"
-                print(f"  {status} {proj}: corr={corr:.4f} (阈值>={THRESHOLDS.quantized_correlation})")
+                print(f"  {status} {proj}: corr={corr:.4f}")
                 
                 result = DiffResult(proj, 0, 0, 0, passed, f"corr={corr:.4f}")
                 results[proj] = result
@@ -655,7 +587,6 @@ class ResQVerifier:
                 continue
             else:
                 # V: W_A[h] = Ub[h].T @ W_O[h] @ Ua
-                # 验证方式改为相关系数
                 if Ub is None:
                     print("  ⚠ Ub 未找到，跳过 v_proj")
                     continue
@@ -664,7 +595,6 @@ class ResQVerifier:
                 
                 # 计算 W_forward = Ub[h].T @ W_O[h] @ Ua
                 W_O_reshaped = W_O.float().reshape(num_kv_heads, head_dim, in_dim)
-                # Ub[h].T @ W_O[h]: [head_dim, head_dim].T @ [head_dim, in_dim] = [head_dim, in_dim]
                 W_tmp = torch.einsum('nji,nje->nie', Ub.float(), W_O_reshaped)
                 W_tmp = W_tmp.reshape(out_dim, in_dim)
                 W_forward = torch.matmul(W_tmp, Ua)
@@ -673,7 +603,7 @@ class ResQVerifier:
                 
                 passed = corr >= THRESHOLDS.quantized_correlation
                 status = "✓ PASS" if passed else "✗ FAIL"
-                print(f"  {status} {proj}: corr={corr:.4f} (阈值>={THRESHOLDS.quantized_correlation})")
+                print(f"  {status} {proj}: corr={corr:.4f}")
                 
                 result = DiffResult(proj, 0, 0, 0, passed, f"corr={corr:.4f}")
                 results[proj] = result
