@@ -216,8 +216,13 @@ class CheckpointManager:
         self.Hd_K = int(ckpt_a.get('resq.Hd_K', torch.tensor(1)).item())
         self.blocksize = int(ckpt_a.get('resq.down_proj_blocksize', torch.tensor(256)).item())
     
-    def get_original_weight(self, name: str) -> Optional[torch.Tensor]:
-        """获取原始模型权重"""
+    def get_original_weight(self, name: str, fuse_layernorm: bool = False) -> Optional[torch.Tensor]:
+        """获取原始模型权重
+        
+        Args:
+            name: 权重名称
+            fuse_layernorm: 是否融合 LayerNorm (msmodelslim 量化前会融合)
+        """
         parts = name.split('.')
         obj = self.original_model
         for p in parts:
@@ -225,6 +230,51 @@ class CheckpointManager:
                 obj = getattr(obj, p)
             else:
                 return None
+        if hasattr(obj, 'data'):
+            weight = obj.data.float()
+        else:
+            weight = obj.float() if isinstance(obj, torch.Tensor) else None
+        
+        if weight is None:
+            return None
+        
+        # 融合 LayerNorm: W_new = W * gamma
+        if fuse_layernorm:
+            gamma = self._get_layernorm_gamma(name)
+            if gamma is not None:
+                weight = weight * gamma
+        
+        return weight
+    
+    def _get_layernorm_gamma(self, weight_name: str) -> Optional[torch.Tensor]:
+        """获取对应的 LayerNorm gamma
+        
+        msmodelslim fuse_layer_norms: W_new = W * gamma
+        """
+        # 解析层索引
+        import re
+        match = re.search(r'layers\.(\d+)', weight_name)
+        if not match:
+            return None
+        layer_idx = int(match.group(1))
+        
+        # Q/K/V -> input_layernorm
+        # gate/up -> post_attention_layernorm
+        if 'q_proj' in weight_name or 'k_proj' in weight_name or 'v_proj' in weight_name:
+            ln_path = f'model.layers.{layer_idx}.input_layernorm.weight'
+        elif 'gate_proj' in weight_name or 'up_proj' in weight_name:
+            ln_path = f'model.layers.{layer_idx}.post_attention_layernorm.weight'
+        else:
+            return None
+        
+        parts = ln_path.split('.')
+        obj = self.original_model
+        for p in parts:
+            if hasattr(obj, p):
+                obj = getattr(obj, p)
+            else:
+                return None
+        
         if hasattr(obj, 'data'):
             return obj.data.float()
         return obj.float() if isinstance(obj, torch.Tensor) else None
@@ -505,7 +555,8 @@ class ResQVerifier:
             return results
         
         for proj in ['q_proj', 'k_proj', 'v_proj']:
-            W_O = self.mgr.get_original_weight(f'model.layers.{layer_idx}.self_attn.{proj}.weight')
+            # 使用 fuse_layernorm=True，因为 msmodelslim 在量化前会融合 LayerNorm
+            W_O = self.mgr.get_original_weight(f'model.layers.{layer_idx}.self_attn.{proj}.weight', fuse_layernorm=True)
             # 对 layer 0 的 q_proj 启用 debug
             debug_dequant = (layer_idx == 0 and proj == 'q_proj')
             W_A = self.mgr.get_quantized_weight(f'model.layers.{layer_idx}.self_attn.{proj}', debug=debug_dequant)
@@ -652,10 +703,11 @@ class ResQVerifier:
             print("  ⚠ Ua 未找到")
             return results
         
-        # gate_proj 和 up_proj: W_A = W_O @ Ua
-        # 验证: W_O ≈ W_A @ Ua.T
+        # gate_proj 和 up_proj: W_A = (W_O * gamma) @ Ua
+        # 验证: (W_O * gamma) ≈ W_A @ Ua.T
         for proj in ['gate_proj', 'up_proj']:
-            W_O = self.mgr.get_original_weight(f'model.layers.{layer_idx}.mlp.{proj}.weight')
+            # 使用 fuse_layernorm=True，因为 msmodelslim 在量化前会融合 LayerNorm
+            W_O = self.mgr.get_original_weight(f'model.layers.{layer_idx}.mlp.{proj}.weight', fuse_layernorm=True)
             W_A = self.mgr.get_quantized_weight(f'model.layers.{layer_idx}.mlp.{proj}')
             
             if W_O is None or W_A is None:
