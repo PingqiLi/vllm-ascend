@@ -588,6 +588,20 @@ class ResQVerifier:
                     print(f"    W_A: min={W_A.min().item():.4f}, max={W_A.max().item():.4f}, mean={W_A.float().mean().item():.4f}")
                     print(f"    W_O: min={W_O.min().item():.4f}, max={W_O.max().item():.4f}, mean={W_O.float().mean().item():.4f}")
                     
+                    # 检查 LayerNorm gamma
+                    gamma = self.mgr._get_layernorm_gamma(f'model.layers.{layer_idx}.self_attn.{proj}.weight')
+                    if gamma is not None:
+                        print(f"    gamma: min={gamma.min().item():.4f}, max={gamma.max().item():.4f}, mean={gamma.mean().item():.4f}")
+                    
+                    # 检查 Ua 范围和正交性
+                    print(f"    Ua: min={Ua.min().item():.4f}, max={Ua.max().item():.4f}")
+                    Ua_orth_err = (torch.matmul(Ua, Ua.T) - torch.eye(Ua.shape[0])).abs().max().item()
+                    print(f"    Ua orthogonality error: {Ua_orth_err:.2e}")
+                    
+                    # 不融合 gamma 时的 W_O
+                    W_O_raw = self.mgr.get_original_weight(f'model.layers.{layer_idx}.self_attn.{proj}.weight', fuse_layernorm=False)
+                    print(f"    W_O_raw (no gamma): min={W_O_raw.min().item():.4f}, max={W_O_raw.max().item():.4f}")
+                    
                     direct_diff = compute_diff(W_A.float(), W_O, f"{proj} 直接比较")
                     print(f"  [DEBUG] {proj} 直接比较: rel={direct_diff.rel_diff:.2%}")
                     
@@ -596,6 +610,12 @@ class ResQVerifier:
                     print(f"    W_O@Ua: min={W_forward.min().item():.4f}, max={W_forward.max().item():.4f}")
                     forward_diff = compute_diff(W_forward, W_A.float(), f"{proj} 正向")
                     print(f"  [DEBUG] {proj} 正向验证 (W_O @ Ua vs W_A): rel={forward_diff.rel_diff:.2%}")
+                    
+                    # 不融合 gamma 的正向验证
+                    W_forward_raw = torch.matmul(W_O_raw.float(), Ua)
+                    print(f"    W_O_raw@Ua: min={W_forward_raw.min().item():.4f}, max={W_forward_raw.max().item():.4f}")
+                    forward_raw_diff = compute_diff(W_forward_raw, W_A.float(), f"{proj} 正向 (no gamma)")
+                    print(f"  [DEBUG] {proj} 正向验证 (W_O_raw @ Ua vs W_A): rel={forward_raw_diff.rel_diff:.2%}")
                 
                 # Q/K: W_A = W_O @ Ua
                 # 验证: W_O ≈ W_A @ Ua.T
