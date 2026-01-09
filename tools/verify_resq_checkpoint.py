@@ -98,11 +98,13 @@ except ImportError:
 @dataclass
 class Thresholds:
     """验证阈值"""
-    weight_rel_diff: float = 0.01      # 权重相对误差阈值
+    weight_rel_diff: float = 0.05      # 权重相对误差阈值（放宽到5%，考虑bf16精度损失）
     weight_max_diff: float = 0.1       # 权重最大绝对误差阈值
     activation_rel_diff: float = 0.05  # 激活值相对误差阈值
     logits_rel_diff: float = 0.1       # logits 相对误差阈值
     orthogonality: float = 1e-4        # 正交性误差阈值
+    # 量化层允许更大误差（int4量化有~10%误差是正常的）
+    quantized_weight_rel_diff: float = 0.15
 
 
 THRESHOLDS = Thresholds()
