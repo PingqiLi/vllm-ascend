@@ -489,9 +489,12 @@ class ResQVerifier:
         """
         验证 Embed 权重融合
         
-        msmodelslim 的 rotate_embeddings:
-          embed_A = embed_O @ Ua
-          验证: embed_O ≈ embed_A @ Ua.T
+        msmodelslim 的处理流程:
+          1. fuse_layer_norms: embed_centered = embed_O - mean(embed_O, dim=-1, keepdim=True)
+          2. rotate_embeddings: embed_A = embed_centered @ Ua
+          
+          综合: embed_A = (embed_O - mean(embed_O)) @ Ua
+          验证: (embed_O - mean) @ Ua ≈ embed_A
         """
         print("\n[Embed] 权重融合验证")
         
@@ -510,19 +513,25 @@ class ResQVerifier:
             return result
         
         # 直接比较（应该差异大）
-        direct = compute_diff(embed_A.float(), embed_O, "embed_A vs embed_O (直接)")
+        direct = compute_diff(embed_A.float(), embed_O.float(), "embed_A vs embed_O (直接)")
         print(f"  直接比较: rel={direct.rel_diff:.2%} (应该差异大)")
         
-        # 正向验证: embed_O @ Ua ≈ embed_A
-        # 如果融合正确，这个应该接近 0
-        embed_forward = torch.matmul(embed_O.float(), Ua)
-        forward_result = compute_diff(embed_forward, embed_A.float(), "embed_O @ Ua vs embed_A")
-        print(f"  正向验证: embed_O @ Ua vs embed_A: rel={forward_result.rel_diff:.2%}")
+        # msmodelslim 的 fuse_layer_norms 对 embed 做了 mean subtraction:
+        #   W_new = W_ - W_.mean(dim=-1, keepdim=True)
+        embed_O_float = embed_O.float()
+        embed_centered = embed_O_float - embed_O_float.mean(dim=-1, keepdim=True)
+        print(f"  [DEBUG] embed_O mean subtraction: mean={embed_O_float.mean(dim=-1).abs().mean():.4f}")
         
-        # 逆向验证: embed_A @ Ua.T ≈ embed_O
-        # 因为 embed_A = embed_O @ Ua，所以 embed_A @ Ua.T = embed_O @ Ua @ Ua.T = embed_O
+        # 正向验证: (embed_O - mean) @ Ua ≈ embed_A
+        embed_forward = torch.matmul(embed_centered, Ua)
+        forward_result = compute_diff(embed_forward, embed_A.float(), 
+                                     "(embed_O - mean) @ Ua vs embed_A")
+        print(f"  正向验证: (embed_O - mean) @ Ua vs embed_A: rel={forward_result.rel_diff:.2%}")
+        
+        # 逆向验证: embed_A @ Ua.T ≈ embed_O - mean
         embed_restored = torch.matmul(embed_A.float(), Ua.T)
-        result = compute_diff(embed_restored, embed_O, "embed_A @ Ua.T vs embed_O", 
+        result = compute_diff(embed_restored, embed_centered, 
+                             "embed_A @ Ua.T vs (embed_O - mean)", 
                              THRESHOLDS.weight_rel_diff)
         self.log(result)
         
@@ -729,9 +738,13 @@ class ResQVerifier:
         """
         验证激活值（考虑旋转）
         
-        embed_A = embed_O @ Ua，所以:
-        resq_hidden = embed_A[tokens] = embed_O[tokens] @ Ua = orig_hidden @ Ua
-        验证: orig_hidden ≈ resq_hidden @ Ua.T
+        msmodelslim 处理:
+          embed_centered = embed_O - mean(embed_O, dim=-1, keepdim=True)
+          embed_A = embed_centered @ Ua
+        
+        所以:
+          resq_hidden = embed_A[tokens] = embed_centered[tokens] @ Ua
+          验证: embed_centered[tokens] ≈ resq_hidden @ Ua.T
         """
         print("\n[Activation] 激活值验证")
         print(f"  使用 vllm-ascend 实现: {USING_VLLM_IMPL}")
@@ -740,9 +753,10 @@ class ResQVerifier:
         input_ids = inputs.input_ids
         print(f"  Prompt: '{prompt}' ({input_ids.shape[1]} tokens)")
         
-        # 原始模型 embed
-        orig_embed_weight = self.mgr.original_model.model.embed_tokens.weight.data
-        orig_hidden = torch.embedding(orig_embed_weight, input_ids).float()
+        # 原始模型 embed（需要做 mean subtraction）
+        orig_embed_weight = self.mgr.original_model.model.embed_tokens.weight.data.float()
+        orig_embed_centered = orig_embed_weight - orig_embed_weight.mean(dim=-1, keepdim=True)
+        orig_hidden = torch.embedding(orig_embed_centered, input_ids)
         
         # ResQ embed
         resq_embed_weight = self.mgr.ckpt_a.get('model.embed_tokens.weight')
@@ -760,10 +774,10 @@ class ResQVerifier:
             self.log(result)
             return result, orig_hidden, resq_hidden
         
-        # 验证: orig_hidden ≈ resq_hidden @ Ua.T
-        # 因为 resq_hidden = orig_hidden @ Ua
+        # 验证: orig_hidden (centered) ≈ resq_hidden @ Ua.T
+        # 因为 resq_hidden = orig_centered @ Ua
         resq_restored = torch.matmul(resq_hidden, Ua.T)
-        result = compute_diff(resq_restored, orig_hidden, "resq_embed @ Ua.T vs orig_embed",
+        result = compute_diff(resq_restored, orig_hidden, "resq_embed @ Ua.T vs orig_centered_embed",
                              THRESHOLDS.activation_rel_diff)
         self.log(result)
         
