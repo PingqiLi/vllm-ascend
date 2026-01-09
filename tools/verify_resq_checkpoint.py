@@ -372,6 +372,8 @@ class ResQVerifier:
     def __init__(self, mgr: CheckpointManager):
         self.mgr = mgr
         self.results = []
+        self.passed = []
+        self.failed = []
     
     def log(self, result: DiffResult):
         """记录结果"""
