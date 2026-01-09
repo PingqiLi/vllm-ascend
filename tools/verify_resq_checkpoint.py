@@ -440,22 +440,31 @@ class ResQVerifier:
                 print(f"  ⚠ {proj} 权重未找到")
                 continue
             
-            # W_A = Ua.T @ W_O @ Uc.T
-            # 验证: Ua @ W_A @ Uc ≈ W_O
-            # 注意: Uc 是 block diagonal，需要特殊处理
+            # 融合公式: W_A = Uc @ W_O @ Ua.T
+            # 验证: W_O ≈ Uc.T @ W_A @ Ua
+            # 
+            # 推导：
+            #   原始: Q = x @ W_O.T
+            #   变换: x_new = x @ Ua.T, Q_new = Q @ Uc.T (block-wise)
+            #   融合后: Q_new = x_new @ W_A.T
+            #   => (x @ Ua.T) @ W_A.T = (x @ W_O.T) @ Uc.T
+            #   => W_A = Uc @ W_O @ Ua.T
+            
             head_dim = Uc.shape[0]
-            out_dim = W_A.shape[0]
+            out_dim = W_A.shape[0]  # e.g., 8192 for Q
+            in_dim = W_A.shape[1]   # e.g., 5120 for hidden_size
             num_heads = out_dim // head_dim
             
-            # 先应用 Ua: Ua @ W_A
-            W_tmp = torch.matmul(Ua, W_A)
+            # Step 1: W_A @ Ua -> [out_dim, in_dim]
+            W_tmp = torch.matmul(W_A, Ua)  # [8192, 5120] @ [5120, 5120] = [8192, 5120]
             
-            # 再应用 Uc (block-wise): W_tmp @ Uc
-            # W_tmp: [out_dim, in_dim] = [num_heads * head_dim, hidden_size]
-            # 对输出维度按 head_dim 分块应用 Uc
-            W_tmp = W_tmp.reshape(num_heads, head_dim, -1)  # [num_heads, head_dim, hidden_size]
-            W_restored = torch.matmul(Uc.T, W_tmp)  # Uc.T @ each block
-            W_restored = W_restored.reshape(out_dim, -1)
+            # Step 2: 对 out_dim 按 head 分块应用 Uc.T
+            # W_tmp: [num_heads * head_dim, hidden_size]
+            # reshape to [num_heads, head_dim, hidden_size]
+            W_tmp = W_tmp.reshape(num_heads, head_dim, in_dim)
+            # Uc.T @ each block: [head_dim, head_dim] @ [head_dim, hidden_size] = [head_dim, hidden_size]
+            W_restored = torch.matmul(Uc.T, W_tmp)  # broadcast over num_heads
+            W_restored = W_restored.reshape(out_dim, in_dim)
             
             result = compute_diff(W_restored, W_O, proj, THRESHOLDS.weight_rel_diff)
             results[proj] = result
@@ -467,8 +476,13 @@ class ResQVerifier:
         """
         验证 O_proj 权重融合
         
-        O_proj 输入侧融合 Ub.T（每个 head 不同），输出侧融合 Ua.T
-        融合公式: W_o_A = Ua.T @ W_o_O @ block_diag(Ub)
+        O_proj:
+        - 输入侧融合 Ub（每个 head 不同）：attn_out 被变换
+        - 输出侧融合 Ua.T：output 被变换
+        
+        原始: output = attn_out @ W_o.T, W_o: [hidden_size, num_heads * head_dim]
+        融合公式: W_A = Ua.T @ W_O @ block_diag(Ub)
+        验证: W_O ≈ Ua @ W_A @ block_diag(Ub.T)
         """
         print(f"\n[Layer {layer_idx}] O_proj 权重融合验证")
         
@@ -482,33 +496,31 @@ class ResQVerifier:
             self.log(result)
             return result
         
+        # W_O: [hidden_size, num_heads * head_dim] = [5120, 8192]
+        # W_A: [hidden_size, num_heads * head_dim] = [5120, 8192]
+        hidden_size = W_A.shape[0]
+        in_dim = W_A.shape[1]
+        
         if Ua is None or Ub is None:
-            # 简化验证：只检查 Ua
-            if Ua is not None:
-                W_restored = torch.matmul(Ua, W_A)
-                result = compute_diff(W_restored, W_O, "o_proj (Ua only)", 
-                                      THRESHOLDS.weight_rel_diff * 10)  # 放宽阈值
-                self.log(result)
-                return result
-            
+            print("  ⚠ Ua 或 Ub 未找到，跳过 o_proj 验证")
             result = DiffResult("o_proj", 0, 0, 0, False, "Ua/Ub 未找到")
             self.log(result)
             return result
         
-        # 完整验证: Ua @ W_A @ block_diag(Ub.T) ≈ W_O
-        # W_A: [hidden_size, num_heads * head_dim]
-        # Ub: [num_heads, head_dim, head_dim]
-        
-        hidden_size = W_A.shape[0]
         num_heads, head_dim, _ = Ub.shape
         
-        # 先应用 Ua: Ua @ W_A
-        W_tmp = torch.matmul(Ua, W_A)  # [hidden_size, num_heads * head_dim]
+        # Step 1: 对输入侧应用 block_diag(Ub.T)
+        # W_A @ block_diag(Ub.T)
+        # 对 in_dim 按 head 分块：reshape to [hidden_size, num_heads, head_dim]
+        W_tmp = W_A.reshape(hidden_size, num_heads, head_dim)
+        # 对每个 head 应用 Ub.T: [head_dim, head_dim] @ [head_dim] -> [head_dim]
+        # einsum: W_tmp[h, n, d] @ Ub.T[n, d, d'] = W_tmp[h, n, d']
+        W_tmp = torch.einsum('hnd,nde->hne', W_tmp, Ub.transpose(-1, -2))
+        W_tmp = W_tmp.reshape(hidden_size, in_dim)
         
-        # 再应用 block_diag(Ub.T)
-        W_tmp = W_tmp.reshape(hidden_size, num_heads, head_dim)  # [hidden_size, num_heads, head_dim]
-        W_restored = torch.einsum('hnd,nhd->hnd', W_tmp, Ub)  # 对每个 head 应用 Ub
-        W_restored = W_restored.reshape(hidden_size, num_heads * head_dim)
+        # Step 2: 对输出侧应用 Ua
+        # Ua @ W_tmp: [hidden_size, hidden_size] @ [hidden_size, in_dim]
+        W_restored = torch.matmul(Ua, W_tmp)
         
         result = compute_diff(W_restored, W_O, "o_proj", THRESHOLDS.weight_rel_diff)
         self.log(result)
@@ -530,7 +542,10 @@ class ResQVerifier:
             print("  ⚠ Ua 未找到")
             return results
         
-        # gate_proj 和 up_proj: W_A = Ua.T @ W_O (输入侧融合 Ua.T)
+        # gate_proj 和 up_proj: 输入侧融合 Ua.T
+        # W_O: [intermediate_size, hidden_size] = [25600, 5120]
+        # 融合公式: W_A = W_O @ Ua.T
+        # 验证: W_O ≈ W_A @ Ua
         for proj in ['gate_proj', 'up_proj']:
             W_O = self.mgr.get_original_weight(f'model.layers.{layer_idx}.mlp.{proj}.weight')
             W_A = self.mgr.get_quantized_weight(f'model.layers.{layer_idx}.mlp.{proj}')
@@ -538,8 +553,8 @@ class ResQVerifier:
             if W_O is None or W_A is None:
                 continue
             
-            # 验证: Ua @ W_A ≈ W_O
-            W_restored = torch.matmul(Ua, W_A)
+            # W_A @ Ua: [intermediate, hidden] @ [hidden, hidden] = [intermediate, hidden]
+            W_restored = torch.matmul(W_A, Ua)
             result = compute_diff(W_restored, W_O, proj, THRESHOLDS.weight_rel_diff)
             results[proj] = result
             self.log(result)
