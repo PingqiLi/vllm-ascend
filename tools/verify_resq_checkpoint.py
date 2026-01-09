@@ -432,6 +432,12 @@ class ResQVerifier:
             print("  ⚠ Ua 或 Uc 未找到")
             return results
         
+        # Q/K: 输出侧融合 Uc (用于 RoPE 后的旋转)
+        # V:   输出侧融合 Ub (per-head，V 没有 RoPE)
+        # 输入侧都融合 Ua.T
+        
+        Ub = self.mgr.get_ub(layer_idx)  # [num_heads, head_dim, head_dim] for V
+        
         for proj in ['q_proj', 'k_proj', 'v_proj']:
             W_O = self.mgr.get_original_weight(f'model.layers.{layer_idx}.self_attn.{proj}.weight')
             W_A = self.mgr.get_quantized_weight(f'model.layers.{layer_idx}.self_attn.{proj}')
@@ -440,31 +446,38 @@ class ResQVerifier:
                 print(f"  ⚠ {proj} 权重未找到")
                 continue
             
-            # 融合公式: W_A = Uc @ W_O @ Ua.T
-            # 验证: W_O ≈ Uc.T @ W_A @ Ua
-            # 
-            # 推导：
-            #   原始: Q = x @ W_O.T
-            #   变换: x_new = x @ Ua.T, Q_new = Q @ Uc.T (block-wise)
-            #   融合后: Q_new = x_new @ W_A.T
-            #   => (x @ Ua.T) @ W_A.T = (x @ W_O.T) @ Uc.T
-            #   => W_A = Uc @ W_O @ Ua.T
+            out_dim = W_A.shape[0]
+            in_dim = W_A.shape[1]
             
-            head_dim = Uc.shape[0]
-            out_dim = W_A.shape[0]  # e.g., 8192 for Q
-            in_dim = W_A.shape[1]   # e.g., 5120 for hidden_size
-            num_heads = out_dim // head_dim
-            
-            # Step 1: W_A @ Ua -> [out_dim, in_dim]
-            W_tmp = torch.matmul(W_A, Ua)  # [8192, 5120] @ [5120, 5120] = [8192, 5120]
-            
-            # Step 2: 对 out_dim 按 head 分块应用 Uc.T
-            # W_tmp: [num_heads * head_dim, hidden_size]
-            # reshape to [num_heads, head_dim, hidden_size]
-            W_tmp = W_tmp.reshape(num_heads, head_dim, in_dim)
-            # Uc.T @ each block: [head_dim, head_dim] @ [head_dim, hidden_size] = [head_dim, hidden_size]
-            W_restored = torch.matmul(Uc.T, W_tmp)  # broadcast over num_heads
-            W_restored = W_restored.reshape(out_dim, in_dim)
+            if proj in ['q_proj', 'k_proj']:
+                # Q/K: W_A = Uc @ W_O @ Ua.T, 验证: W_O ≈ Uc.T @ W_A @ Ua
+                head_dim = Uc.shape[0]
+                num_heads = out_dim // head_dim
+                
+                # Step 1: W_A @ Ua
+                W_tmp = torch.matmul(W_A, Ua)
+                
+                # Step 2: 对 out_dim 按 head 分块应用 Uc.T
+                W_tmp = W_tmp.reshape(num_heads, head_dim, in_dim)
+                W_restored = torch.matmul(Uc.T, W_tmp)
+                W_restored = W_restored.reshape(out_dim, in_dim)
+            else:
+                # V: W_A = Ub @ W_O @ Ua.T, 验证: W_O ≈ Ub.T @ W_A @ Ua
+                # Ub: [num_heads, head_dim, head_dim] (per-head)
+                if Ub is None:
+                    print("  ⚠ Ub 未找到，跳过 v_proj")
+                    continue
+                
+                num_heads, head_dim, _ = Ub.shape
+                
+                # Step 1: W_A @ Ua
+                W_tmp = torch.matmul(W_A, Ua)
+                
+                # Step 2: 对 out_dim 按 head 分块应用 Ub.T (per-head)
+                W_tmp = W_tmp.reshape(num_heads, head_dim, in_dim)
+                # Ub.T[n]: [head_dim, head_dim], W_tmp[n]: [head_dim, in_dim]
+                W_restored = torch.einsum('nhd,nde->nhe', Ub.transpose(-1, -2), W_tmp)
+                W_restored = W_restored.reshape(out_dim, in_dim)
             
             result = compute_diff(W_restored, W_O, proj, THRESHOLDS.weight_rel_diff)
             results[proj] = result
