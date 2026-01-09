@@ -52,6 +52,12 @@ logger = logging.getLogger(__name__)
 
 RESQ_DEBUG = os.environ.get("RESQ_DEBUG", "0") == "1"
 
+# Fix for msmodelslim rearrange/quantize mismatch in o_proj:
+# - rearrange_columns uses: model_dim * high_fraction (e.g., 5120 * 0.125 = 640 -> 10 cols/head)
+# - calibrator uses: weight.shape[1] * high_fraction (e.g., 8192 * 0.125 = 1024 -> 16 cols/head)
+# When enabled, use the rearrange logic (10 cols/head) to match the actual column order
+RESQ_O_PROJ_REARRANGE_FIX = os.environ.get("RESQ_O_PROJ_REARRANGE_FIX", "0") == "1"
+
 
 # ============================================================================
 # Hadamard Transform Utilities
@@ -718,19 +724,52 @@ class Qwen3ResQTrueQuantForCausalLM(nn.Module):
             layer.mlp.set_shared_hadamard(self.resq_Hd, self.resq_Hd_K, self.resq_blocksize)
             
             # Initialize o_proj column reordering for mixed-precision layout
-            # msmodelslim's rearrange_o_proj reorders columns to [low | high]
-            # low = int4 (87.5%), high = int8 (12.5%)
+            # msmodelslim's rearrange_o_proj reorders columns to [mid | high]
+            # 
+            # BUG in msmodelslim: rearrange and quantize use different high_bits_length:
+            # - rearrange_columns: high_bits_length = model_dim * high_fraction = 5120 * 0.125 = 640
+            #   -> high_length_per_head = 640 / 64 = 10
+            # - calibrator: high_bits_length = in_dim * high_fraction = 8192 * 0.125 = 1024
+            #   -> high_length_per_head = 1024 / 64 = 16
+            #
+            # The actual column order in ckpt A follows rearrange logic (10 cols/head),
+            # but weight_low/weight_high split follows quantize logic (16 cols/head).
+            #
+            # RESQ_O_PROJ_REARRANGE_FIX=1: Use rearrange logic to match actual column order
+            # RESQ_O_PROJ_REARRANGE_FIX=0: Use quantize logic (original, incorrect)
+            
             head_dim = self.config.head_dim if hasattr(self.config, 'head_dim') else self.config.hidden_size // self.config.num_attention_heads
             num_attention_heads = self.config.num_attention_heads
+            hidden_size = self.config.hidden_size
+            in_dim = num_attention_heads * head_dim  # o_proj input dim
             high_fraction = 0.125
-            high_length_per_head = int(head_dim * high_fraction)  # 16 for head_dim=128
-            low_length_per_head = head_dim - high_length_per_head  # 112 for head_dim=128
             
-            # Build column reorder: original -> [low | high]
-            # Original: [head0_all, head1_all, ...] where head_all = [low, high]
-            # Target: [all_low, all_high]
+            if RESQ_O_PROJ_REARRANGE_FIX:
+                # Use rearrange logic: high_bits_length based on model_dim (hidden_size)
+                high_bits_length = int(hidden_size * high_fraction)  # 640 for hidden_size=5120
+                high_length_per_head = high_bits_length // num_attention_heads  # 10
+                if RESQ_DEBUG:
+                    logger.warning(f"[ResQ] o_proj REARRANGE_FIX enabled: "
+                                   f"high_bits_length={high_bits_length} (from model_dim={hidden_size}), "
+                                   f"high_length_per_head={high_length_per_head}")
+            else:
+                # Original logic: high_bits_length based on in_dim (incorrect for rearranged weights)
+                high_bits_length = int(in_dim * high_fraction)  # 1024 for in_dim=8192
+                high_length_per_head = high_bits_length // num_attention_heads  # 16
+                if RESQ_DEBUG:
+                    logger.warning(f"[ResQ] o_proj using quantize logic: "
+                                   f"high_bits_length={high_bits_length} (from in_dim={in_dim}), "
+                                   f"high_length_per_head={high_length_per_head}")
+            
+            low_length_per_head = head_dim - high_length_per_head
+            
+            # Build column reorder: original -> [mid | high]
+            # Original layout: [head0_all, head1_all, ...] where head_all has head_dim columns
+            # Target layout: [all_mid, all_high] where:
+            #   - mid = first (head_dim - high_length_per_head) columns of each head
+            #   - high = last high_length_per_head columns of each head
             column_order = []
-            # First: all low parts (first low_length_per_head of each head)
+            # First: all mid parts (first low_length_per_head of each head)
             for h in range(num_attention_heads):
                 base = h * head_dim
                 for j in range(low_length_per_head):
@@ -783,3 +822,13 @@ class Qwen3ResQTrueQuantForCausalLM(nn.Module):
                     linear.register_buffer(suffix, tensor)
                 else:
                     buffer.copy_(tensor)
+
+        # Update in_low/in_high from actual loaded weight shapes
+        # This handles the rearrange/quantize mismatch in msmodelslim
+        if linear.weight_low.numel() > 0:
+            linear.in_low = linear.weight_low.shape[1]
+        if linear.weight_high.numel() > 0:
+            linear.in_high = linear.weight_high.shape[1]
+        
+        if RESQ_DEBUG:
+            logger.warning(f"[ResQ] {prefix}: in_low={linear.in_low}, in_high={linear.in_high}")
