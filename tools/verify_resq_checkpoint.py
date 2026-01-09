@@ -680,30 +680,30 @@ class ResQVerifier:
         print(f"  Ub_expanded shape: {Ub_expanded.shape}")
         
         # 重要：msmodelslim 的 rearrange_o_proj 会重排 o_proj 的列！
-        # 新顺序是 [mid | high]，需要还原回原始顺序
+        # 新顺序是 [low | high]，low=int4 (87.5%), high=int8 (12.5%)
         # high_length_per_head = head_dim * 0.125 = 16
         high_fraction = 0.125
         high_length_per_head = int(head_dim * high_fraction)
-        mid_length_per_head = head_dim - high_length_per_head
+        low_length_per_head = head_dim - high_length_per_head
         
         # 计算 rearrange 后的列顺序，然后构建逆映射
-        # rearrange_o_proj: [mid | high]
-        # 原始: 每个 head 的 [0:mid, mid:head_dim]
-        # 重排后: 所有 head 的 mid 部分在前，所有 head 的 high 部分在后
-        mid_total = mid_length_per_head * num_attention_heads
+        # rearrange_o_proj: [low | high]
+        # 原始: 每个 head 的 [0:low, low:head_dim]
+        # 重排后: 所有 head 的 low 部分在前，所有 head 的 high 部分在后
+        low_total = low_length_per_head * num_attention_heads
         high_total = high_length_per_head * num_attention_heads
         
         # 构建还原索引
-        # 重排后: [head0_mid, head1_mid, ..., head63_mid, head0_high, head1_high, ..., head63_high]
-        # 原始:   [head0_mid, head0_high, head1_mid, head1_high, ...]
+        # 重排后: [head0_low, head1_low, ..., head63_low, head0_high, head1_high, ..., head63_high]
+        # 原始:   [head0_low, head0_high, head1_low, head1_high, ...]
         restore_indices = []
         for h in range(num_attention_heads):
-            # mid 部分在 [h * mid_length_per_head : (h+1) * mid_length_per_head]
-            mid_start = h * mid_length_per_head
-            # high 部分在 [mid_total + h * high_length_per_head : mid_total + (h+1) * high_length_per_head]
-            high_start = mid_total + h * high_length_per_head
-            for i in range(mid_length_per_head):
-                restore_indices.append(mid_start + i)
+            # low 部分在 [h * low_length_per_head : (h+1) * low_length_per_head]
+            low_start = h * low_length_per_head
+            # high 部分在 [low_total + h * high_length_per_head : low_total + (h+1) * high_length_per_head]
+            high_start = low_total + h * high_length_per_head
+            for i in range(low_length_per_head):
+                restore_indices.append(low_start + i)
             for i in range(high_length_per_head):
                 restore_indices.append(high_start + i)
         restore_indices = torch.tensor(restore_indices)

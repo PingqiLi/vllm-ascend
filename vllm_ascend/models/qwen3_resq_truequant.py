@@ -718,25 +718,26 @@ class Qwen3ResQTrueQuantForCausalLM(nn.Module):
             layer.mlp.set_shared_hadamard(self.resq_Hd, self.resq_Hd_K, self.resq_blocksize)
             
             # Initialize o_proj column reordering for mixed-precision layout
-            # msmodelslim's rearrange_o_proj reorders columns to [mid | high]
-            # high_fraction = 0.125 (12.5% high precision)
-            head_dim = self.head_dim
-            num_attention_heads = self.num_heads
-            in_dim = num_attention_heads * head_dim  # o_proj input dim
+            # msmodelslim's rearrange_o_proj reorders columns to [low | high]
+            # low = int4 (87.5%), high = int8 (12.5%)
+            head_dim = self.config.head_dim if hasattr(self.config, 'head_dim') else self.config.hidden_size // self.config.num_attention_heads
+            num_attention_heads = self.config.num_attention_heads
             high_fraction = 0.125
-            high_length_per_head = int(head_dim * high_fraction)
-            mid_length_per_head = head_dim - high_length_per_head
+            high_length_per_head = int(head_dim * high_fraction)  # 16 for head_dim=128
+            low_length_per_head = head_dim - high_length_per_head  # 112 for head_dim=128
             
-            # Build column reorder: original -> [mid | high]
-            # Original: [head0_all, head1_all, ...] where head_all = [mid, high]
-            # Target: [all_mid, all_high]
+            # Build column reorder: original -> [low | high]
+            # Original: [head0_all, head1_all, ...] where head_all = [low, high]
+            # Target: [all_low, all_high]
             column_order = []
+            # First: all low parts (first low_length_per_head of each head)
             for h in range(num_attention_heads):
                 base = h * head_dim
-                for j in range(mid_length_per_head):
+                for j in range(low_length_per_head):
                     column_order.append(base + j)
+            # Then: all high parts (last high_length_per_head of each head)
             for h in range(num_attention_heads):
-                base = h * head_dim + mid_length_per_head
+                base = h * head_dim + low_length_per_head
                 for j in range(high_length_per_head):
                     column_order.append(base + j)
             layer.self_attn.o_proj_column_order = torch.tensor(column_order, dtype=torch.long, device=target_device)
