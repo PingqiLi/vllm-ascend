@@ -623,6 +623,14 @@ class ResQVerifier:
                     corr = torch.corrcoef(torch.stack([W_forward.flatten(), W_A.float().flatten()]))[0, 1]
                     print(f"    相关系数: {corr.item():.4f} (1.0=完全相关, 0=无关)")
                     
+                    # 检查非零元素的匹配程度（排除量化为0的影响）
+                    nonzero_mask = W_A.abs() > 1e-8
+                    if nonzero_mask.sum() > 0:
+                        W_forward_nz = W_forward[nonzero_mask]
+                        W_A_nz = W_A[nonzero_mask].float()
+                        nz_rel = ((W_forward_nz - W_A_nz).abs() / W_A_nz.abs()).mean().item()
+                        print(f"    非零元素相对误差: {nz_rel:.2%} (排除量化为0的影响)")
+                    
                     # 不融合 gamma 的正向验证
                     W_forward_raw = torch.matmul(W_O_raw.float(), Ua)
                     print(f"    W_O_raw@Ua: min={W_forward_raw.min().item():.4f}, max={W_forward_raw.max().item():.4f}")
