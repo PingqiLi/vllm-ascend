@@ -383,8 +383,9 @@ class ResQVerifier:
         """
         验证 Embed 权重融合
         
-        融合公式: embed_A = embed_O @ Ua.T
-        验证: embed_A @ Ua ≈ embed_O
+        msmodelslim 的 rotate_embeddings:
+          embed_A = embed_O @ Ua
+          验证: embed_O ≈ embed_A @ Ua.T
         """
         print("\n[Embed] 权重融合验证")
         
@@ -406,10 +407,10 @@ class ResQVerifier:
         direct = compute_diff(embed_A.float(), embed_O, "embed_A vs embed_O (直接)")
         print(f"  直接比较: rel={direct.rel_diff:.2%} (应该差异大)")
         
-        # 还原后比较: embed_A @ Ua ≈ embed_O
-        # 因为 embed_A = embed_O @ Ua.T，所以 embed_A @ Ua = embed_O @ Ua.T @ Ua = embed_O
-        embed_restored = torch.matmul(embed_A.float(), Ua)
-        result = compute_diff(embed_restored, embed_O, "embed_A @ Ua vs embed_O", 
+        # 还原后比较: embed_O ≈ embed_A @ Ua.T
+        # 因为 embed_A = embed_O @ Ua，所以 embed_A @ Ua.T = embed_O @ Ua @ Ua.T = embed_O
+        embed_restored = torch.matmul(embed_A.float(), Ua.T)
+        result = compute_diff(embed_restored, embed_O, "embed_A @ Ua.T vs embed_O", 
                              THRESHOLDS.weight_rel_diff)
         self.log(result)
         
@@ -419,24 +420,27 @@ class ResQVerifier:
         """
         验证 Q/K/V 权重融合
         
-        融合公式: W_q_A = Ua.T @ W_q_O @ Uc.T
-        验证: Ua @ W_q_A @ Uc ≈ W_q_O
+        msmodelslim 的 rotate_attention_inputs 和 rotate_ov_proj:
+        
+        Q/K_proj:
+          - rotate_attention_inputs: W_A = W_O @ Ua
+          - 验证: W_O ≈ W_A @ Ua.T
+        
+        V_proj:
+          - rotate_attention_inputs: W_temp = W_O @ Ua
+          - rotate_ov_proj (output=True): W_A[h] = Ub[h].T @ W_temp[h]
+          - 综合: W_A[h] = Ub[h].T @ W_O[h] @ Ua
+          - 验证: W_O[h] ≈ Ub[h] @ W_A[h] @ Ua.T
         """
         print(f"\n[Layer {layer_idx}] Q/K/V 权重融合验证")
         
         results = {}
         Ua = self.mgr.get_ua(layer_idx)
-        Uc = self.mgr.get_uc(layer_idx)
+        Ub = self.mgr.get_ub(layer_idx)  # [num_kv_heads, head_dim, head_dim]
         
-        if Ua is None or Uc is None:
-            print("  ⚠ Ua 或 Uc 未找到")
+        if Ua is None:
+            print("  ⚠ Ua 未找到")
             return results
-        
-        # Q/K: 输出侧融合 Uc (用于 RoPE 后的旋转)
-        # V:   输出侧融合 Ub (per-head，V 没有 RoPE)
-        # 输入侧都融合 Ua.T
-        
-        Ub = self.mgr.get_ub(layer_idx)  # [num_heads, head_dim, head_dim] for V
         
         for proj in ['q_proj', 'k_proj', 'v_proj']:
             W_O = self.mgr.get_original_weight(f'model.layers.{layer_idx}.self_attn.{proj}.weight')
@@ -446,37 +450,30 @@ class ResQVerifier:
                 print(f"  ⚠ {proj} 权重未找到")
                 continue
             
+            # W shape: [out_features, in_features]
             out_dim = W_A.shape[0]
-            in_dim = W_A.shape[1]
+            in_dim = W_A.shape[1]  # = hidden_size
             
             if proj in ['q_proj', 'k_proj']:
-                # Q/K: W_A = Uc @ W_O @ Ua.T, 验证: W_O ≈ Uc.T @ W_A @ Ua
-                head_dim = Uc.shape[0]
-                num_heads = out_dim // head_dim
-                
-                # Step 1: W_A @ Ua
-                W_tmp = torch.matmul(W_A, Ua)
-                
-                # Step 2: 对 out_dim 按 head 分块应用 Uc.T
-                W_tmp = W_tmp.reshape(num_heads, head_dim, in_dim)
-                W_restored = torch.matmul(Uc.T, W_tmp)
-                W_restored = W_restored.reshape(out_dim, in_dim)
+                # Q/K: W_A = W_O @ Ua
+                # 验证: W_O ≈ W_A @ Ua.T
+                W_restored = torch.matmul(W_A.float(), Ua.T)
             else:
-                # V: W_A = Ub @ W_O @ Ua.T, 验证: W_O ≈ Ub.T @ W_A @ Ua
-                # Ub: [num_heads, head_dim, head_dim] (per-head)
+                # V: W_A[h] = Ub[h].T @ W_O[h] @ Ua
+                # 验证: W_O[h] ≈ Ub[h] @ W_A[h] @ Ua.T
                 if Ub is None:
                     print("  ⚠ Ub 未找到，跳过 v_proj")
                     continue
                 
-                num_heads, head_dim, _ = Ub.shape
+                num_kv_heads, head_dim, _ = Ub.shape
                 
-                # Step 1: W_A @ Ua
-                W_tmp = torch.matmul(W_A, Ua)
+                # Step 1: W_A @ Ua.T
+                W_tmp = torch.matmul(W_A.float(), Ua.T)  # [out_dim, hidden_size]
                 
-                # Step 2: 对 out_dim 按 head 分块应用 Ub.T (per-head)
-                W_tmp = W_tmp.reshape(num_heads, head_dim, in_dim)
-                # Ub.T[n]: [head_dim, head_dim], W_tmp[n]: [head_dim, in_dim]
-                W_restored = torch.einsum('nhd,nde->nhe', Ub.transpose(-1, -2), W_tmp)
+                # Step 2: 按 head 分块，应用 Ub[h]
+                W_tmp = W_tmp.reshape(num_kv_heads, head_dim, in_dim)
+                # Ub[h] @ W_tmp[h]: [head_dim, head_dim] @ [head_dim, in_dim] = [head_dim, in_dim]
+                W_restored = torch.einsum('nij,nje->nie', Ub.float(), W_tmp)
                 W_restored = W_restored.reshape(out_dim, in_dim)
             
             result = compute_diff(W_restored, W_O, proj, THRESHOLDS.weight_rel_diff)
@@ -489,30 +486,33 @@ class ResQVerifier:
         """
         验证 O_proj 权重融合
         
-        O_proj:
-        - 输入侧融合 Ub（每个 head 不同）：attn_out 被变换
-        - 输出侧融合 Ua.T：output 被变换
+        msmodelslim 的 rotate_ov_proj (output=False) 和 rotate_attention_output:
         
-        原始: output = attn_out @ W_o.T, W_o: [hidden_size, num_heads * head_dim]
-        融合公式: W_A = Ua.T @ W_O @ block_diag(Ub)
-        验证: W_O ≈ Ua @ W_A @ block_diag(Ub.T)
+        O_proj:
+          - rotate_ov_proj: W_temp[:,h,:] = W_O[:,h,:] @ Ub_expanded[h] (GQA 扩展)
+          - rotate_attention_output: W_A = Ua.T @ W_temp
+          - 综合: W_A = Ua.T @ (W_O @ block_diag(Ub_expanded))
+          - 验证: W_O ≈ Ua @ W_A @ block_diag(Ub_expanded.T)
+        
+        GQA: num_attention_heads = 64, num_kv_heads = 8
+        Ub shape: [num_kv_heads, head_dim, head_dim] = [8, 128, 128]
+        需要扩展成 [num_attention_heads, head_dim, head_dim] = [64, 128, 128]
         """
         print(f"\n[Layer {layer_idx}] O_proj 权重融合验证")
         
         W_O = self.mgr.get_original_weight(f'model.layers.{layer_idx}.self_attn.o_proj.weight')
         W_A = self.mgr.get_quantized_weight(f'model.layers.{layer_idx}.self_attn.o_proj')
         Ua = self.mgr.get_ua(layer_idx)
-        Ub = self.mgr.get_ub(layer_idx)  # [num_heads, head_dim, head_dim]
+        Ub = self.mgr.get_ub(layer_idx)  # [num_kv_heads, head_dim, head_dim]
         
         if W_O is None or W_A is None:
             result = DiffResult("o_proj", 0, 0, 0, False, "权重未找到")
             self.log(result)
             return result
         
-        # W_O: [hidden_size, num_heads * head_dim] = [5120, 8192]
-        # W_A: [hidden_size, num_heads * head_dim] = [5120, 8192]
-        hidden_size = W_A.shape[0]
-        in_dim = W_A.shape[1]
+        # W shape: [hidden_size, num_attention_heads * head_dim]
+        hidden_size = W_A.shape[0]  # 5120
+        in_dim = W_A.shape[1]       # 8192 = num_attention_heads * head_dim
         
         if Ua is None or Ub is None:
             print("  ⚠ Ua 或 Ub 未找到，跳过 o_proj 验证")
@@ -520,20 +520,31 @@ class ResQVerifier:
             self.log(result)
             return result
         
-        num_heads, head_dim, _ = Ub.shape
+        num_kv_heads, head_dim, _ = Ub.shape  # 8, 128, 128
+        num_attention_heads = in_dim // head_dim  # 64
         
-        # Step 1: 对输入侧应用 block_diag(Ub.T)
-        # W_A @ block_diag(Ub.T)
-        # 对 in_dim 按 head 分块：reshape to [hidden_size, num_heads, head_dim]
-        W_tmp = W_A.reshape(hidden_size, num_heads, head_dim)
-        # 对每个 head 应用 Ub.T: [head_dim, head_dim] @ [head_dim] -> [head_dim]
-        # einsum: W_tmp[h, n, d] @ Ub.T[n, d, d'] = W_tmp[h, n, d']
-        W_tmp = torch.einsum('hnd,nde->hne', W_tmp, Ub.transpose(-1, -2))
+        # GQA: 扩展 Ub 到 num_attention_heads
+        # 每个 KV head 对应 num_attention_heads // num_kv_heads 个 Q heads
+        num_q_per_kv = num_attention_heads // num_kv_heads  # 8
+        Ub_expanded = Ub.repeat_interleave(num_q_per_kv, dim=0)  # [64, 128, 128]
+        
+        print(f"  GQA: num_attention_heads={num_attention_heads}, num_kv_heads={num_kv_heads}")
+        print(f"  Ub_expanded shape: {Ub_expanded.shape}")
+        
+        # 验证: W_O ≈ Ua @ W_A @ block_diag(Ub_expanded.T)
+        # Step 1: W_A @ block_diag(Ub_expanded.T)
+        # W_A shape: [hidden_size, num_attention_heads * head_dim]
+        # reshape to [hidden_size, num_attention_heads, head_dim]
+        W_tmp = W_A.reshape(hidden_size, num_attention_heads, head_dim).float()
+        
+        # 对每个 head: W_tmp[:, h, :] @ Ub_expanded[h].T
+        # einsum: W_tmp[hid, n, d] @ Ub.T[n, d, d'] -> W_tmp[hid, n, d']
+        Ub_expanded_T = Ub_expanded.transpose(-1, -2).float()  # [64, 128, 128]
+        W_tmp = torch.einsum('hnd,nde->hne', W_tmp, Ub_expanded_T)
         W_tmp = W_tmp.reshape(hidden_size, in_dim)
         
-        # Step 2: 对输出侧应用 Ua
-        # Ua @ W_tmp: [hidden_size, hidden_size] @ [hidden_size, in_dim]
-        W_restored = torch.matmul(Ua, W_tmp)
+        # Step 2: Ua @ W_tmp
+        W_restored = torch.matmul(Ua.float(), W_tmp)
         
         result = compute_diff(W_restored, W_O, "o_proj", THRESHOLDS.weight_rel_diff)
         self.log(result)
@@ -543,8 +554,14 @@ class ResQVerifier:
         """
         验证 MLP 权重融合
         
-        gate_proj/up_proj: 输入侧融合 Ua.T
-        down_proj: 输入侧融合 Ud，输出侧融合 Ua.T
+        msmodelslim 的 rotate_mlp_input:
+        
+        gate_proj/up_proj:
+          - rotate_mlp_input: W_A = W_O @ Ua
+          - 验证: W_O ≈ W_A @ Ua.T
+        
+        down_proj (输出侧 Ua.T，输入侧 Ud):
+          - 变换复杂，暂时跳过
         """
         print(f"\n[Layer {layer_idx}] MLP 权重融合验证")
         
@@ -555,19 +572,18 @@ class ResQVerifier:
             print("  ⚠ Ua 未找到")
             return results
         
-        # gate_proj 和 up_proj: 输入侧融合 Ua.T
-        # W_O: [intermediate_size, hidden_size] = [25600, 5120]
-        # 融合公式: W_A = W_O @ Ua.T
-        # 验证: W_O ≈ W_A @ Ua
+        # gate_proj 和 up_proj: W_A = W_O @ Ua
+        # 验证: W_O ≈ W_A @ Ua.T
         for proj in ['gate_proj', 'up_proj']:
             W_O = self.mgr.get_original_weight(f'model.layers.{layer_idx}.mlp.{proj}.weight')
             W_A = self.mgr.get_quantized_weight(f'model.layers.{layer_idx}.mlp.{proj}')
             
             if W_O is None or W_A is None:
+                print(f"  ⚠ {proj} 权重未找到")
                 continue
             
-            # W_A @ Ua: [intermediate, hidden] @ [hidden, hidden] = [intermediate, hidden]
-            W_restored = torch.matmul(W_A, Ua)
+            # W_A @ Ua.T: [intermediate, hidden] @ [hidden, hidden] = [intermediate, hidden]
+            W_restored = torch.matmul(W_A.float(), Ua.T)
             result = compute_diff(W_restored, W_O, proj, THRESHOLDS.weight_rel_diff)
             results[proj] = result
             self.log(result)
@@ -581,10 +597,9 @@ class ResQVerifier:
         """
         验证激活值（考虑旋转）
         
-        ResQ embed 输出 = 原始 embed 输出 @ Ua.T
-        验证: resq_embed @ Ua ≈ orig_embed
-        
-        使用 vllm-ascend 的 apply_block_rotation 函数来验证实现正确性
+        embed_A = embed_O @ Ua，所以:
+        resq_hidden = embed_A[tokens] = embed_O[tokens] @ Ua = orig_hidden @ Ua
+        验证: orig_hidden ≈ resq_hidden @ Ua.T
         """
         print("\n[Activation] 激活值验证")
         print(f"  使用 vllm-ascend 实现: {USING_VLLM_IMPL}")
@@ -613,10 +628,10 @@ class ResQVerifier:
             self.log(result)
             return result, orig_hidden, resq_hidden
         
-        # 还原: resq_hidden @ Ua ≈ orig_hidden
-        # 使用 apply_block_rotation 来验证（这里 Ua 是全局旋转，不是分块）
-        resq_restored = torch.matmul(resq_hidden, Ua)
-        result = compute_diff(resq_restored, orig_hidden, "resq_embed @ Ua vs orig_embed",
+        # 验证: orig_hidden ≈ resq_hidden @ Ua.T
+        # 因为 resq_hidden = orig_hidden @ Ua
+        resq_restored = torch.matmul(resq_hidden, Ua.T)
+        result = compute_diff(resq_restored, orig_hidden, "resq_embed @ Ua.T vs orig_embed",
                              THRESHOLDS.activation_rel_diff)
         self.log(result)
         
