@@ -664,6 +664,112 @@ class ResQVerifier:
             print(f"  ✗ apply_block_rotation 失败: {e}")
             return DiffResult("Uc rotation", 0, 0, 0, False, str(e))
     
+    def verify_resq_quant_matmul(self) -> Optional[DiffResult]:
+        """
+        验证 resq_quant_matmul 接口精度
+        
+        对比 vllm-ascend 的实现与 CPU 参考实现（int32 matmul）
+        这是 E=1 情况下 reference_op_impl.py run_test 的封装
+        """
+        print("\n[resq_quant_matmul] 量化 MatMul 精度验证")
+        
+        try:
+            from vllm_ascend.ops.resq_quant_matmul import resq_quant_matmul
+        except ImportError:
+            print("  ⚠ 无法导入 resq_quant_matmul，跳过验证")
+            return None
+        
+        # 测试参数（模拟 Qwen3-32B 的一个线性层）
+        M = 32     # batch * seq
+        K = 5120   # hidden_size
+        N = 8192   # intermediate_size 或 num_heads * head_dim
+        splitKPos = (K // 8) * 7  # int4 占 7/8
+        
+        print(f"  测试参数: M={M}, K={K}, N={N}, splitKPos={splitKPos}")
+        
+        # 生成随机量化输入
+        torch.manual_seed(42)
+        
+        # 激活：int8，前 splitKPos 是 int4 范围 [-8, 7]
+        x = torch.zeros(M, K, dtype=torch.int8)
+        x[:, :splitKPos] = torch.randint(-8, 8, (M, splitKPos), dtype=torch.int8)
+        x[:, splitKPos:] = torch.randint(-128, 128, (M, K - splitKPos), dtype=torch.int8)
+        
+        # 权重：int8，同样的切分
+        weight = torch.zeros(1, K, N, dtype=torch.int8)
+        weight[:, :splitKPos, :] = torch.randint(-8, 8, (1, splitKPos, N), dtype=torch.int8)
+        weight[:, splitKPos:, :] = torch.randint(-128, 128, (1, K - splitKPos, N), dtype=torch.int8)
+        
+        # Scales
+        lweightScale = torch.rand(1, 1, N, dtype=torch.float32) * 0.1
+        hweightScale = torch.rand(1, 1, N, dtype=torch.float32) * 0.01
+        lxScale = torch.rand(M, dtype=torch.float32) * 0.1
+        rxScale = torch.rand(M, dtype=torch.float32) * 0.01
+        
+        # 运行 resq_quant_matmul
+        try:
+            output = resq_quant_matmul(
+                x=x,
+                weight=weight,
+                lweightScale=lweightScale,
+                hweightScale=hweightScale,
+                lxScale=lxScale,
+                rxScale=rxScale,
+                splitKPos=splitKPos,
+                groupList=None,
+                outDtype=torch.float16,
+            )
+            print(f"  ✓ resq_quant_matmul 执行成功: output shape={tuple(output.shape)}")
+        except Exception as e:
+            print(f"  ✗ resq_quant_matmul 执行失败: {e}")
+            return DiffResult("resq_quant_matmul", 0, 0, 0, False, str(e))
+        
+        # 参考实现：直接用 int32 matmul
+        # y_low = (x[:, :splitKPos].int32 @ weight[0, :splitKPos, :].int32) * lweightScale * lxScale
+        # y_high = (x[:, splitKPos:].int32 @ weight[0, splitKPos:, :].int32) * hweightScale * rxScale
+        x_low = x[:, :splitKPos].to(torch.int32)
+        x_high = x[:, splitKPos:].to(torch.int32)
+        w_low = weight[0, :splitKPos, :].to(torch.int32)
+        w_high = weight[0, splitKPos:, :].to(torch.int32)
+        
+        y_low_ref = torch.matmul(x_low, w_low).float()
+        y_low_ref = y_low_ref * lweightScale.flatten().unsqueeze(0)  # (1, N)
+        y_low_ref = y_low_ref * lxScale.unsqueeze(1)  # (M, 1)
+        
+        y_high_ref = torch.matmul(x_high, w_high).float()
+        y_high_ref = y_high_ref * hweightScale.flatten().unsqueeze(0)
+        y_high_ref = y_high_ref * rxScale.unsqueeze(1)
+        
+        golden = (y_low_ref + y_high_ref).to(torch.float16)
+        
+        # 比较
+        output_f32 = output.float()
+        golden_f32 = golden.float()
+        diff = (output_f32 - golden_f32).abs()
+        
+        max_diff = diff.max().item()
+        mean_diff = diff.mean().item()
+        rel_diff = (diff / (golden_f32.abs() + 1e-10)).mean().item()
+        
+        print("  对比结果:")
+        print(f"    max_diff: {max_diff:.2e}")
+        print(f"    mean_diff: {mean_diff:.2e}")
+        print(f"    rel_diff: {rel_diff:.2%}")
+        
+        # 判断是否通过（允许 1% 相对误差，因为 float16 精度有限）
+        passed = rel_diff < 0.01
+        
+        result = DiffResult(
+            name="resq_quant_matmul",
+            max_diff=max_diff,
+            mean_diff=mean_diff,
+            rel_diff=rel_diff,
+            passed=passed,
+            message="CPU 参考实现对比" if passed else "精度超出阈值"
+        )
+        self.log(result)
+        return result
+    
     def verify_final_logits(self, tokenizer, prompt: str) -> DiffResult:
         """
         验证最终 logits
@@ -745,6 +851,12 @@ class ResQVerifier:
         for layer_idx in range(min(num_layers, 64)):
             self.verify_uc_rotation(layer_idx)
             self.verify_ud_rotation(layer_idx)
+        
+        # 3.5 resq_quant_matmul 精度验证
+        print("\n" + "=" * 70)
+        print("阶段 3.5: resq_quant_matmul 精度验证")
+        print("=" * 70)
+        self.verify_resq_quant_matmul()
         
         # 4. 激活值验证
         print("\n" + "=" * 70)
