@@ -372,6 +372,11 @@ class Qwen3ResQTrueQuantAttention(nn.Module):
         
         # U_c (R3) rotation for Q/K after RoPE
         self.register_buffer('rotation_R3', torch.empty(0))
+        
+        # O_proj input column reordering
+        # msmodelslim's rearrange_o_proj reorders columns to [mid | high]
+        # We need to reorder attn_output to match this layout
+        self.register_buffer('o_proj_column_order', torch.empty(0, dtype=torch.long))
     
     def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
         # Q/K/V projections
@@ -393,6 +398,10 @@ class Qwen3ResQTrueQuantAttention(nn.Module):
         
         # Attention
         attn_output = self.attn(q, k, v)
+        
+        # Reorder attn_output columns to match o_proj weight layout [mid | high]
+        if self.o_proj_column_order.numel() > 0:
+            attn_output = attn_output[..., self.o_proj_column_order]
         
         # O projection
         return self.o_proj(attn_output)
@@ -707,6 +716,30 @@ class Qwen3ResQTrueQuantForCausalLM(nn.Module):
                 layer.mlp.rotation_Pd = weights_dict[pd_key].to(target_device)
             
             layer.mlp.set_shared_hadamard(self.resq_Hd, self.resq_Hd_K, self.resq_blocksize)
+            
+            # Initialize o_proj column reordering for mixed-precision layout
+            # msmodelslim's rearrange_o_proj reorders columns to [mid | high]
+            # high_fraction = 0.125 (12.5% high precision)
+            head_dim = self.head_dim
+            num_attention_heads = self.num_heads
+            in_dim = num_attention_heads * head_dim  # o_proj input dim
+            high_fraction = 0.125
+            high_length_per_head = int(head_dim * high_fraction)
+            mid_length_per_head = head_dim - high_length_per_head
+            
+            # Build column reorder: original -> [mid | high]
+            # Original: [head0_all, head1_all, ...] where head_all = [mid, high]
+            # Target: [all_mid, all_high]
+            column_order = []
+            for h in range(num_attention_heads):
+                base = h * head_dim
+                for j in range(mid_length_per_head):
+                    column_order.append(base + j)
+            for h in range(num_attention_heads):
+                base = h * head_dim + mid_length_per_head
+                for j in range(high_length_per_head):
+                    column_order.append(base + j)
+            layer.self_attn.o_proj_column_order = torch.tensor(column_order, dtype=torch.long, device=target_device)
             
             # Load attention projections (quantized)
             for proj_name in ['q_proj', 'k_proj', 'v_proj', 'o_proj']:
