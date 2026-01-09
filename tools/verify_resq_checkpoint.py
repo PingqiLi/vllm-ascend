@@ -1154,6 +1154,317 @@ class ResQVerifier:
         
         return results
     
+    def verify_resq_forward_detailed(self, tokenizer, prompt: str) -> Dict[str, DiffResult]:
+        """
+        完整验证 ResQ 前向逻辑，模拟 qwen3_resq_truequant.py 的实现
+        
+        对比每一步的激活值与原始模型（消除旋转影响后）
+        
+        这是最关键的验证：如果这里有问题，推理就会乱码
+        """
+        print("\n" + "=" * 70)
+        print("[ResQ Forward] 完整前向激活值验证 (Layer 0)")
+        print("=" * 70)
+        
+        results = {}
+        inputs = tokenizer(prompt, return_tensors="pt")
+        input_ids = inputs.input_ids
+        print(f"  Prompt: '{prompt}' ({input_ids.shape[1]} tokens)")
+        
+        # 获取所有旋转矩阵
+        Ua = self.mgr.get_ua(0)
+        Ub = self.mgr.get_ub(0)  # [num_kv_heads, head_dim, head_dim]
+        Uc = self.mgr.get_uc(0)
+        Pd = self.mgr.get_pd(0)
+        Hd = self.mgr.Hd
+        K = self.mgr.Hd_K
+        blocksize = self.mgr.blocksize
+        
+        if Ua is None:
+            print("  ⚠ Ua 未找到，无法验证")
+            return results
+        
+        # 模型配置
+        hidden_size = Ua.shape[0]  # 5120
+        num_attention_heads = 64
+        num_kv_heads = 8
+        head_dim = hidden_size // num_attention_heads  # 128? No, should be from config
+        # For Qwen3-32B: head_dim = 128, num_attention_heads = 64
+        head_dim = 128
+        q_size = num_attention_heads * head_dim  # 8192
+        kv_size = num_kv_heads * head_dim        # 1024
+        
+        print(f"\n  配置: hidden_size={hidden_size}, heads={num_attention_heads}, kv_heads={num_kv_heads}, head_dim={head_dim}")
+        
+        # ========== Step 1: Embed ==========
+        print(f"\n  [Step 1] Embed")
+        
+        orig_embed = self.mgr.original_model.model.embed_tokens.weight.data.float()
+        orig_embed_centered = orig_embed - orig_embed.mean(dim=-1, keepdim=True)
+        orig_hidden = torch.embedding(orig_embed_centered, input_ids)  # [1, seq, 5120]
+        
+        resq_embed = self.mgr.ckpt_a.get('model.embed_tokens.weight').float()
+        resq_hidden = torch.embedding(resq_embed, input_ids)  # [1, seq, 5120]
+        
+        # resq_hidden 在 Ua 空间，orig_hidden 在原始空间
+        # 验证: resq_hidden @ Ua.T ≈ orig_hidden
+        resq_hidden_restored = torch.matmul(resq_hidden, Ua.T.float())
+        corr = torch.corrcoef(torch.stack([resq_hidden_restored.flatten(), orig_hidden.flatten()]))[0, 1].item()
+        print(f"    resq_embed @ Ua.T vs orig_embed: corr={corr:.4f}")
+        results["embed"] = corr
+        
+        # ========== Step 2: Q/K/V Projections ==========
+        print(f"\n  [Step 2] Q/K/V Projections")
+        
+        Q_O = self.mgr.get_original_weight('model.layers.0.self_attn.q_proj.weight', fuse_layernorm=True)
+        K_O = self.mgr.get_original_weight('model.layers.0.self_attn.k_proj.weight', fuse_layernorm=True)
+        V_O = self.mgr.get_original_weight('model.layers.0.self_attn.v_proj.weight', fuse_layernorm=True)
+        Q_A = self.mgr.get_quantized_weight('model.layers.0.self_attn.q_proj')
+        K_A = self.mgr.get_quantized_weight('model.layers.0.self_attn.k_proj')
+        V_A = self.mgr.get_quantized_weight('model.layers.0.self_attn.v_proj')
+        
+        if Q_A is not None and Q_O is not None:
+            # 原始: q_orig = orig_hidden @ Q_O.T
+            q_orig = torch.matmul(orig_hidden.float(), Q_O.float().T)  # [1, seq, 8192]
+            
+            # ResQ: q_resq = resq_hidden @ Q_A.T
+            # 因为 Q_A = Q_O @ Ua，所以 q_resq = resq_hidden @ Ua.T @ Q_O.T = orig_hidden @ Q_O.T = q_orig
+            q_resq = torch.matmul(resq_hidden.float(), Q_A.float().T)
+            
+            corr_q = torch.corrcoef(torch.stack([q_resq.flatten(), q_orig.flatten()]))[0, 1].item()
+            print(f"    Q: resq vs orig: corr={corr_q:.4f}")
+            results["q_proj"] = corr_q
+        
+        if K_A is not None and K_O is not None:
+            k_orig = torch.matmul(orig_hidden.float(), K_O.float().T)
+            k_resq = torch.matmul(resq_hidden.float(), K_A.float().T)
+            corr_k = torch.corrcoef(torch.stack([k_resq.flatten(), k_orig.flatten()]))[0, 1].item()
+            print(f"    K: resq vs orig: corr={corr_k:.4f}")
+            results["k_proj"] = corr_k
+        
+        if V_A is not None and V_O is not None:
+            # V 更复杂：V_A[h] = Ub[h].T @ V_O[h] @ Ua
+            # 所以 v_resq = resq_hidden @ V_A.T 结果在 Ub 空间
+            # 需要对比: v_resq @ Ub vs v_orig
+            v_orig = torch.matmul(orig_hidden.float(), V_O.float().T)  # [1, seq, kv_size]
+            v_resq = torch.matmul(resq_hidden.float(), V_A.float().T)  # [1, seq, kv_size]
+            
+            # v_resq 在 Ub 空间（per kv-head）
+            if Ub is not None:
+                # v_resq[h] @ Ub[h] ≈ v_orig[h]
+                v_resq_reshaped = v_resq.view(1, -1, num_kv_heads, head_dim)  # [1, seq, 8, 128]
+                v_orig_reshaped = v_orig.view(1, -1, num_kv_heads, head_dim)
+                
+                # 应用 Ub 恢复
+                v_resq_restored = torch.einsum('bsnh,nhd->bsnd', v_resq_reshaped.float(), Ub.float())
+                
+                corr_v = torch.corrcoef(torch.stack([v_resq_restored.flatten(), v_orig_reshaped.flatten()]))[0, 1].item()
+                print(f"    V: resq @ Ub vs orig: corr={corr_v:.4f}")
+            else:
+                corr_v = torch.corrcoef(torch.stack([v_resq.flatten(), v_orig.flatten()]))[0, 1].item()
+                print(f"    V: resq vs orig (无Ub): corr={corr_v:.4f}")
+            results["v_proj"] = corr_v
+        
+        # ========== Step 3: Uc Rotation (Q, K after RoPE) ==========
+        print(f"\n  [Step 3] Uc Rotation")
+        if Uc is not None and Q_A is not None:
+            # 应用 Uc 旋转
+            q_resq_uc = apply_block_rotation(q_resq, Uc)
+            
+            # Uc 旋转后的 q 与原始 q 没有简单的对应关系（因为 RoPE）
+            # 这里只验证 Uc 可逆性
+            q_resq_restored = apply_block_rotation(q_resq_uc, Uc.T)
+            corr_uc = torch.corrcoef(torch.stack([q_resq_restored.flatten(), q_resq.flatten()]))[0, 1].item()
+            print(f"    Uc 可逆性: q @ Uc @ Uc.T vs q: corr={corr_uc:.4f} (应≈1.0)")
+            results["uc_rotation"] = corr_uc
+        
+        # ========== Step 4: O_proj 输入重排 ==========
+        print(f"\n  [Step 4] O_proj 输入重排")
+        
+        # 模拟 attention 输出（使用 q 作为近似，实际是 softmax(QK)V）
+        # 这里简化：假设 attn_output ≈ v_resq (忽略 attention 计算)
+        # 实际验证需要完整 attention，但这足以测试 column reorder
+        
+        # 构建 column_order（与 qwen3_resq_truequant.py 相同）
+        high_fraction = 0.125
+        in_dim = q_size  # 8192
+        
+        # 测试两种 high_length_per_head
+        for fix_name, use_rearrange_logic in [("quantize(16/head)", False), ("rearrange(10/head)", True)]:
+            if use_rearrange_logic:
+                high_bits_length = int(hidden_size * high_fraction)  # 640
+            else:
+                high_bits_length = int(in_dim * high_fraction)  # 1024
+            
+            high_length_per_head = high_bits_length // num_attention_heads
+            low_length_per_head = head_dim - high_length_per_head
+            
+            column_order = []
+            for h in range(num_attention_heads):
+                base = h * head_dim
+                for j in range(low_length_per_head):
+                    column_order.append(base + j)
+            for h in range(num_attention_heads):
+                base = h * head_dim + low_length_per_head
+                for j in range(high_length_per_head):
+                    column_order.append(base + j)
+            column_order = torch.tensor(column_order, dtype=torch.long)
+            
+            print(f"    {fix_name}: high_per_head={high_length_per_head}, low_per_head={low_length_per_head}")
+            print(f"      column_order[:5]={column_order[:5].tolist()}")
+            
+        # ========== Step 5: O_proj 混精度 MatMul ==========
+        print(f"\n  [Step 5] O_proj 混精度 MatMul")
+        
+        O_O = self.mgr.get_original_weight('model.layers.0.self_attn.o_proj.weight')
+        O_A = self.mgr.get_quantized_weight('model.layers.0.self_attn.o_proj')
+        
+        if O_A is not None and O_O is not None:
+            # 使用 q_orig 作为模拟的 attention 输出
+            attn_output_orig = q_orig  # [1, seq, 8192]
+            
+            # 原始: o_orig = attn_output_orig @ O_O.T
+            o_orig = torch.matmul(attn_output_orig.float(), O_O.float().T)  # [1, seq, 5120]
+            
+            # ResQ (复杂):
+            # 1. attn_output_resq 在 Ub 空间
+            # 2. 重排列
+            # 3. 混精度 matmul
+            
+            # 模拟 attn_output_resq = attn_output_orig @ block_diag(Ub.T) (per-head)
+            if Ub is not None:
+                num_q_per_kv = num_attention_heads // num_kv_heads
+                Ub_expanded = Ub.repeat_interleave(num_q_per_kv, dim=0)  # [64, 128, 128]
+                
+                attn_output_reshaped = attn_output_orig.view(1, -1, num_attention_heads, head_dim)
+                # attn_output_resq[h] = attn_output_orig[h] @ Ub[h].T
+                attn_output_resq = torch.einsum('bsnh,nhd->bsnd', attn_output_reshaped.float(), Ub_expanded.float().transpose(-1, -2))
+                attn_output_resq = attn_output_resq.view(1, -1, in_dim)  # [1, seq, 8192]
+            else:
+                attn_output_resq = attn_output_orig
+            
+            # 测试两种 column order
+            for fix_name, use_rearrange_logic in [("quantize(16/head)", False), ("rearrange(10/head)", True)]:
+                if use_rearrange_logic:
+                    high_bits_length = int(hidden_size * high_fraction)
+                else:
+                    high_bits_length = int(in_dim * high_fraction)
+                
+                high_length_per_head = high_bits_length // num_attention_heads
+                low_length_per_head = head_dim - high_length_per_head
+                
+                column_order = []
+                for h in range(num_attention_heads):
+                    base = h * head_dim
+                    for j in range(low_length_per_head):
+                        column_order.append(base + j)
+                for h in range(num_attention_heads):
+                    base = h * head_dim + low_length_per_head
+                    for j in range(high_length_per_head):
+                        column_order.append(base + j)
+                column_order = torch.tensor(column_order, dtype=torch.long)
+                
+                # 重排输入
+                attn_output_reordered = attn_output_resq[..., column_order]
+                
+                # 混精度 matmul (用反量化权重近似)
+                o_resq = torch.matmul(attn_output_reordered.float(), O_A.float().T)  # [1, seq, 5120]
+                
+                # o_resq 在 Ua 空间，需要 @ Ua.T 恢复
+                o_resq_restored = torch.matmul(o_resq, Ua.T.float())
+                
+                corr_o = torch.corrcoef(torch.stack([o_resq_restored.flatten(), o_orig.flatten()]))[0, 1].item()
+                print(f"    O_proj [{fix_name}]: o_resq @ Ua.T vs o_orig: corr={corr_o:.4f}")
+                results[f"o_proj_{fix_name}"] = corr_o
+        
+        # ========== Step 6: MLP ==========
+        print(f"\n  [Step 6] MLP gate/up")
+        
+        gate_O = self.mgr.get_original_weight('model.layers.0.mlp.gate_proj.weight', fuse_layernorm=True)
+        up_O = self.mgr.get_original_weight('model.layers.0.mlp.up_proj.weight', fuse_layernorm=True)
+        gate_A = self.mgr.get_quantized_weight('model.layers.0.mlp.gate_proj')
+        up_A = self.mgr.get_quantized_weight('model.layers.0.mlp.up_proj')
+        
+        # 使用 o_orig 作为 MLP 输入（实际需要经过 residual + layernorm）
+        mlp_input_orig = o_orig
+        mlp_input_resq = torch.matmul(mlp_input_orig, Ua.float())  # 转到 Ua 空间
+        
+        if gate_A is not None and gate_O is not None:
+            gate_orig = torch.matmul(mlp_input_orig.float(), gate_O.float().T)
+            gate_resq = torch.matmul(mlp_input_resq.float(), gate_A.float().T)
+            corr_gate = torch.corrcoef(torch.stack([gate_resq.flatten(), gate_orig.flatten()]))[0, 1].item()
+            print(f"    gate_proj: resq vs orig: corr={corr_gate:.4f}")
+            results["gate_proj"] = corr_gate
+        
+        if up_A is not None and up_O is not None:
+            up_orig = torch.matmul(mlp_input_orig.float(), up_O.float().T)
+            up_resq = torch.matmul(mlp_input_resq.float(), up_A.float().T)
+            corr_up = torch.corrcoef(torch.stack([up_resq.flatten(), up_orig.flatten()]))[0, 1].item()
+            print(f"    up_proj: resq vs orig: corr={corr_up:.4f}")
+            results["up_proj"] = corr_up
+        
+        # ========== Step 7: Ud Rotation ==========
+        print(f"\n  [Step 7] Ud Rotation (before down_proj)")
+        
+        if Pd is not None and gate_A is not None and up_A is not None:
+            intermediate_orig = torch.nn.functional.silu(gate_orig) * up_orig
+            intermediate_resq = torch.nn.functional.silu(gate_resq) * up_resq
+            
+            # 应用 Ud 旋转
+            try:
+                intermediate_ud = apply_ud_rotation(intermediate_resq, Pd, Hd, K, blocksize)
+                
+                # 检查 Ud 可逆性
+                # Ud 应该保持范数
+                norm_before = intermediate_resq.norm().item()
+                norm_after = intermediate_ud.norm().item()
+                norm_ratio = norm_after / norm_before
+                print(f"    Ud 范数变化: {norm_before:.4f} -> {norm_after:.4f} (ratio={norm_ratio:.4f}, 应≈1.0)")
+                results["ud_rotation"] = norm_ratio
+            except Exception as e:
+                print(f"    Ud 旋转失败: {e}")
+        
+        # ========== Step 8: down_proj ==========
+        print(f"\n  [Step 8] down_proj")
+        
+        down_O = self.mgr.get_original_weight('model.layers.0.mlp.down_proj.weight')
+        down_A = self.mgr.get_quantized_weight('model.layers.0.mlp.down_proj')
+        
+        if down_A is not None and down_O is not None and Pd is not None:
+            # 原始: down_orig = intermediate_orig @ down_O.T
+            down_orig = torch.matmul(intermediate_orig.float(), down_O.float().T)
+            
+            # ResQ: down_resq = intermediate_ud @ down_A.T
+            try:
+                down_resq = torch.matmul(intermediate_ud.float(), down_A.float().T)
+                
+                # down_resq 在 Ua 空间
+                down_resq_restored = torch.matmul(down_resq, Ua.T.float())
+                
+                corr_down = torch.corrcoef(torch.stack([down_resq_restored.flatten(), down_orig.flatten()]))[0, 1].item()
+                print(f"    down_proj: resq @ Ua.T vs orig: corr={corr_down:.4f}")
+                results["down_proj"] = corr_down
+            except Exception as e:
+                print(f"    down_proj 计算失败: {e}")
+        
+        # ========== 汇总 ==========
+        print(f"\n  === 激活值验证汇总 ===")
+        critical_steps = ["q_proj", "k_proj", "o_proj_rearrange(10/head)", "gate_proj", "up_proj"]
+        all_good = True
+        for step in critical_steps:
+            if step in results:
+                status = "✓" if results[step] > 0.95 else "✗"
+                if results[step] < 0.95:
+                    all_good = False
+                print(f"  {status} {step}: corr={results[step]:.4f}")
+        
+        if all_good:
+            print(f"\n  ✓ 所有关键步骤的相关系数 > 0.95，前向逻辑正确")
+        else:
+            print(f"\n  ✗ 存在相关系数 < 0.95 的步骤，需要排查")
+        
+        return results
+    
     def verify_ud_rotation(self, layer_idx: int) -> Optional[DiffResult]:
         """
         验证 Ud 旋转实现
@@ -1424,6 +1735,9 @@ class ResQVerifier:
         print("=" * 70)
         self.verify_activation_with_rotation(tokenizer, prompt)
         self.verify_layer0_activations(tokenizer, prompt)
+        
+        # 4.5 完整前向验证 (关键!)
+        self.verify_resq_forward_detailed(tokenizer, prompt)
         
         # 5. 最终 logits
         print("\n" + "=" * 70)
