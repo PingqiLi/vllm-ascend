@@ -160,22 +160,43 @@ def compute_diff(a: torch.Tensor, b: torch.Tensor, name: str,
     )
 
 
-def dequantize_mixed_precision(weight_low, weight_high, scale_low, scale_high):
+def dequantize_mixed_precision(weight_low, weight_high, scale_low, scale_high, debug=False):
     """反量化混精度权重"""
+    if debug:
+        print(f"    [DEQUANT] weight_low: shape={weight_low.shape}, dtype={weight_low.dtype}, "
+              f"range=[{weight_low.float().min():.2f}, {weight_low.float().max():.2f}]")
+        print(f"    [DEQUANT] scale_low: shape={scale_low.shape}, dtype={scale_low.dtype}, "
+              f"range=[{scale_low.float().min():.6f}, {scale_low.float().max():.6f}]")
+        if weight_high is not None:
+            print(f"    [DEQUANT] weight_high: shape={weight_high.shape}, dtype={weight_high.dtype}, "
+                  f"range=[{weight_high.float().min():.2f}, {weight_high.float().max():.2f}]")
+            print(f"    [DEQUANT] scale_high: shape={scale_high.shape}, dtype={scale_high.dtype}, "
+                  f"range=[{scale_high.float().min():.6f}, {scale_high.float().max():.6f}]")
+    
     # 处理 scale 形状
     if scale_low.dim() == 1:
         scale_low = scale_low.unsqueeze(1)
     elif scale_low.dim() == 2 and scale_low.shape[1] == 1:
         pass  # 已经是 [N, 1]
     
-    if scale_high.dim() == 1:
-        scale_high = scale_high.unsqueeze(1)
-    elif scale_high.dim() == 2 and scale_high.shape[1] == 1:
-        pass
+    if scale_high is not None:
+        if scale_high.dim() == 1:
+            scale_high = scale_high.unsqueeze(1)
+        elif scale_high.dim() == 2 and scale_high.shape[1] == 1:
+            pass
     
     w_low = weight_low.float() * scale_low.float()
-    w_high = weight_high.float() * scale_high.float()
-    return torch.cat([w_low, w_high], dim=1)
+    
+    if debug:
+        print(f"    [DEQUANT] w_low (after scale): range=[{w_low.min():.6f}, {w_low.max():.6f}]")
+    
+    if weight_high is not None and scale_high is not None:
+        w_high = weight_high.float() * scale_high.float()
+        if debug:
+            print(f"    [DEQUANT] w_high (after scale): range=[{w_high.min():.6f}, {w_high.max():.6f}]")
+        return torch.cat([w_low, w_high], dim=1)
+    
+    return w_low
 
 
 # ============================================================================
@@ -208,7 +229,7 @@ class CheckpointManager:
             return obj.data.float()
         return obj.float() if isinstance(obj, torch.Tensor) else None
     
-    def get_quantized_weight(self, prefix: str) -> Optional[torch.Tensor]:
+    def get_quantized_weight(self, prefix: str, debug: bool = False) -> Optional[torch.Tensor]:
         """获取并反量化 A 中的权重"""
         weight_low = self.ckpt_a.get(f'{prefix}.weight_low')
         if weight_low is None:
@@ -218,7 +239,7 @@ class CheckpointManager:
         scale_low = self.ckpt_a.get(f'{prefix}.scale_low')
         scale_high = self.ckpt_a.get(f'{prefix}.scale_high')
         
-        return dequantize_mixed_precision(weight_low, weight_high, scale_low, scale_high)
+        return dequantize_mixed_precision(weight_low, weight_high, scale_low, scale_high, debug=debug)
     
     def get_ua(self, layer_idx: int, debug: bool = False) -> Optional[torch.Tensor]:
         """获取 Ua = Pa @ Ra"""
@@ -485,7 +506,9 @@ class ResQVerifier:
         
         for proj in ['q_proj', 'k_proj', 'v_proj']:
             W_O = self.mgr.get_original_weight(f'model.layers.{layer_idx}.self_attn.{proj}.weight')
-            W_A = self.mgr.get_quantized_weight(f'model.layers.{layer_idx}.self_attn.{proj}')
+            # 对 layer 0 的 q_proj 启用 debug
+            debug_dequant = (layer_idx == 0 and proj == 'q_proj')
+            W_A = self.mgr.get_quantized_weight(f'model.layers.{layer_idx}.self_attn.{proj}', debug=debug_dequant)
             
             if W_O is None or W_A is None:
                 print(f"  ⚠ {proj} 权重未找到")
