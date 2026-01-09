@@ -611,6 +611,16 @@ class ResQVerifier:
                     forward_diff = compute_diff(W_forward, W_A.float(), f"{proj} 正向")
                     print(f"  [DEBUG] {proj} 正向验证 (W_O @ Ua vs W_A): rel={forward_diff.rel_diff:.2%}")
                     
+                    # 打印前几个元素对比
+                    print(f"  [DEBUG] 前5个元素对比 (row 0):")
+                    print(f"    W_O@Ua[0,:5]: {W_forward[0,:5].tolist()}")
+                    print(f"    W_A[0,:5]:    {W_A[0,:5].float().tolist()}")
+                    print(f"    diff[0,:5]:   {(W_forward[0,:5] - W_A[0,:5].float()).tolist()}")
+                    
+                    # 检查相关性（如果只是 scale 问题，相关性应该高）
+                    corr = torch.corrcoef(torch.stack([W_forward.flatten(), W_A.float().flatten()]))[0, 1]
+                    print(f"    相关系数: {corr.item():.4f} (1.0=完全相关, 0=无关)")
+                    
                     # 不融合 gamma 的正向验证
                     W_forward_raw = torch.matmul(W_O_raw.float(), Ua)
                     print(f"    W_O_raw@Ua: min={W_forward_raw.min().item():.4f}, max={W_forward_raw.max().item():.4f}")
