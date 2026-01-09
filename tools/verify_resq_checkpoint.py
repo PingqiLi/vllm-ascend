@@ -345,12 +345,28 @@ class CheckpointManager:
             return None
         return torch.matmul(Pc.float(), Rc.float())
     
-    def get_ub(self, layer_idx: int) -> Optional[torch.Tensor]:
+    def get_ub(self, layer_idx: int, debug: bool = False) -> Optional[torch.Tensor]:
         """获取 Ub = Pb @ Rb (per-head)"""
         Pb = self.ckpt_b.get(f'resq.layer.{layer_idx}.P_b')  # [num_heads, head_dim, head_dim]
         Rb = self.ckpt_b.get(f'resq.layer.{layer_idx}.R_b')  # [head_dim, head_dim]
         if Pb is None or Rb is None:
+            if debug:
+                print(f"  [DEBUG] P_b or R_b not found for layer {layer_idx}")
+                print(f"    P_b: {Pb is not None}, R_b: {Rb is not None}")
             return None
+        
+        if debug:
+            print(f"  [DEBUG] P_b shape: {Pb.shape}, R_b shape: {Rb.shape}")
+            # 检查 P_b 正交性 (per-head)
+            Pb_f = Pb.float()
+            for i in range(min(2, Pb.shape[0])):  # 只检查前2个head
+                Pb_i_orth_err = (Pb_f[i] @ Pb_f[i].T - torch.eye(Pb.shape[1])).abs().max().item()
+                print(f"  [DEBUG] P_b[{i}] 正交性误差: {Pb_i_orth_err:.2e}")
+            # 检查 R_b 正交性
+            Rb_f = Rb.float()
+            Rb_orth_err = (Rb_f @ Rb_f.T - torch.eye(Rb.shape[0])).abs().max().item()
+            print(f"  [DEBUG] R_b 正交性误差: {Rb_orth_err:.2e}")
+        
         # Ub[i] = Pb[i] @ Rb
         return torch.matmul(Pb.float(), Rb.float())
     
@@ -635,7 +651,7 @@ class ResQVerifier:
         W_O = self.mgr.get_original_weight(f'model.layers.{layer_idx}.self_attn.o_proj.weight')
         W_A = self.mgr.get_quantized_weight(f'model.layers.{layer_idx}.self_attn.o_proj')
         Ua = self.mgr.get_ua(layer_idx)
-        Ub = self.mgr.get_ub(layer_idx)  # [num_kv_heads, head_dim, head_dim]
+        Ub = self.mgr.get_ub(layer_idx, debug=True)  # [num_kv_heads, head_dim, head_dim]
         
         if W_O is None or W_A is None:
             result = DiffResult("o_proj", 0, 0, 0, False, "权重未找到")
@@ -678,8 +694,13 @@ class ResQVerifier:
         # Step 2: Ua @ W_tmp
         W_restored = torch.matmul(Ua.float(), W_tmp)
         
+        # Debug: 检查数值范围
+        print(f"  W_A: range=[{W_A.min():.4f}, {W_A.max():.4f}]")
+        print(f"  W_O: range=[{W_O.min():.4f}, {W_O.max():.4f}]")
+        print(f"  W_restored: range=[{W_restored.min():.4f}, {W_restored.max():.4f}]")
+        
         # 使用相关系数验证（int4量化导致rel_diff很大）
-        corr = torch.corrcoef(torch.stack([W_restored.flatten(), W_O.flatten()]))[0, 1].item()
+        corr = torch.corrcoef(torch.stack([W_restored.flatten(), W_O.float().flatten()]))[0, 1].item()
         passed = corr >= THRESHOLDS.quantized_correlation
         status = "✓ PASS" if passed else "✗ FAIL"
         print(f"  {status} o_proj: corr={corr:.4f}")
