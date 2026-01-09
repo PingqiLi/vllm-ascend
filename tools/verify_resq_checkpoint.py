@@ -680,33 +680,25 @@ class ResQVerifier:
         print(f"  Ub_expanded shape: {Ub_expanded.shape}")
         
         # 重要：msmodelslim 的 rearrange_o_proj 会重排 o_proj 的列！
-        # 新顺序是 [low | high]，low=int4 (87.5%), high=int8 (12.5%)
+        # 重建 rearrange_o_proj 的 new_column_order，然后用 argsort 得到逆映射
         # high_length_per_head = head_dim * 0.125 = 16
         high_fraction = 0.125
         high_length_per_head = int(head_dim * high_fraction)
-        low_length_per_head = head_dim - high_length_per_head
         
-        # 计算 rearrange 后的列顺序，然后构建逆映射
-        # rearrange_o_proj: [low | high]
-        # 原始: 每个 head 的 [0:low, low:head_dim]
-        # 重排后: 所有 head 的 low 部分在前，所有 head 的 high 部分在后
-        low_total = low_length_per_head * num_attention_heads
-        high_total = high_length_per_head * num_attention_heads
+        # 复现 rearrange_o_proj 逻辑
+        chunk_starts = torch.arange(0, in_dim, head_dim)
+        high_precision_columns = torch.arange(head_dim - high_length_per_head, head_dim)
+        columns_to_end = (chunk_starts.unsqueeze(1) + high_precision_columns).flatten()
         
-        # 构建还原索引
-        # 重排后: [head0_low, head1_low, ..., head63_low, head0_high, head1_high, ..., head63_high]
-        # 原始:   [head0_low, head0_high, head1_low, head1_high, ...]
-        restore_indices = []
-        for h in range(num_attention_heads):
-            # low 部分在 [h * low_length_per_head : (h+1) * low_length_per_head]
-            low_start = h * low_length_per_head
-            # high 部分在 [low_total + h * high_length_per_head : low_total + (h+1) * high_length_per_head]
-            high_start = low_total + h * high_length_per_head
-            for i in range(low_length_per_head):
-                restore_indices.append(low_start + i)
-            for i in range(high_length_per_head):
-                restore_indices.append(high_start + i)
-        restore_indices = torch.tensor(restore_indices)
+        all_columns = torch.arange(in_dim)
+        mask = torch.ones(in_dim, dtype=torch.bool)
+        mask[columns_to_end] = False
+        remaining_columns = all_columns[mask]
+        
+        new_column_order = torch.cat([remaining_columns, columns_to_end])
+        
+        # argsort 得到逆映射: 对于每个原始列 j，它在重排后 W_A 中的位置
+        restore_indices = torch.argsort(new_column_order)
         
         # 还原 W_A 的列顺序
         W_A_restored_order = W_A[:, restore_indices]
