@@ -98,13 +98,19 @@ def MM(x: torch.Tensor, weight: torch.Tensor, perChannelScale: torch.Tensor, per
             scale = perChannelScale.flatten().to(torch.float32)
             
             # Call npu_quant_matmul
+            # npu_quant_matmul 输出 = x @ weight * scale (已含 perChannelScale)
             result = torch_npu.npu_quant_matmul(x, weight, scale)
             
             # Result is tuple, get first element
             if isinstance(result, tuple):
-                c_temp1 = result[0].to(torch.float32)
+                c_temp1 = result[0]
             else:
-                c_temp1 = result.to(torch.float32)
+                c_temp1 = result
+            
+            # 关键：和 reference 保持一致，先转 fp16 再转 fp32
+            # Reference 注释：一定要先转换为fp16，再转换为fp32，否则对精度的时候会出现问题
+            # npu_quant_matmul 已经输出 fp16，所以这里直接转 fp32
+            c_temp1 = c_temp1.to(torch.float16).to(torch.float32)
             
             # Apply per-token scale
             c_temp2 = torch.mul(c_temp1, perTokenScale.reshape(m, 1))
