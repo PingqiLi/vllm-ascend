@@ -775,6 +775,113 @@ class ResQVerifier:
         
         return result, orig_hidden, resq_hidden
     
+    def verify_layer0_activations(self, tokenizer, prompt: str) -> Dict[str, DiffResult]:
+        """
+        详细比较 Layer 0 的内部激活值
+        
+        关键点：消除正交融合矩阵的影响才能有可比性
+        
+        激活值对应关系：
+        - embed: resq_hidden = orig_centered @ Ua
+        - Q/K/V proj: 输入在 Ua 空间，权重融合了 Ua，结果抵消
+        - Uc rotation: Q/K 在 RoPE 后应用 Uc
+        - O_proj: 输入在 Ub 空间，输出在 Ua 空间
+        - MLP gate/up: 输入在 Ua 空间
+        - MLP down: 输入需要先应用 Ud，输出在 Ua 空间
+        """
+        print("\n[Layer 0] 内部激活值详细比较")
+        results = {}
+        
+        inputs = tokenizer(prompt, return_tensors="pt")
+        input_ids = inputs.input_ids
+        print(f"  Prompt: '{prompt}' ({input_ids.shape[1]} tokens)")
+        
+        # 获取旋转矩阵
+        Ua = self.mgr.get_ua(0)
+        Uc = self.mgr.get_uc(0)
+        
+        if Ua is None:
+            print("  ⚠ Ua 未找到，无法比较")
+            return results
+        
+        # ========== 1. Embed 输出 ==========
+        # 原始: orig_hidden = embed_O_centered[tokens]
+        # ResQ: resq_hidden = orig_hidden @ Ua
+        orig_embed = self.mgr.original_model.model.embed_tokens.weight.data.float()
+        orig_embed_centered = orig_embed - orig_embed.mean(dim=-1, keepdim=True)
+        orig_hidden = torch.embedding(orig_embed_centered, input_ids)
+        
+        resq_embed = self.mgr.ckpt_a.get('model.embed_tokens.weight')
+        resq_hidden = torch.embedding(resq_embed, input_ids).float()
+        
+        # 消除 Ua 影响: resq_hidden @ Ua.T ≈ orig_hidden
+        resq_restored = torch.matmul(resq_hidden, Ua.T)
+        result = compute_diff(resq_restored, orig_hidden, "embed_output @ Ua.T vs orig", 
+                             THRESHOLDS.activation_rel_diff)
+        results["embed_output"] = result
+        print(f"  embed_output: corr={torch.corrcoef(torch.stack([resq_restored.flatten(), orig_hidden.flatten()]))[0,1].item():.4f}, rel={result.rel_diff:.2%}")
+        
+        # ========== 2. Q 投影后 ==========
+        # Q 融合: Q_A = Q_O * gamma @ Ua
+        # 原始: q_orig = orig_hidden @ Q_O.T (但需要先融合 gamma)
+        # ResQ: q_resq = resq_hidden @ Q_A.T = (orig_hidden @ Ua) @ (Q_O * gamma @ Ua).T
+        #             = orig_hidden @ Ua @ Ua.T @ (Q_O * gamma).T = orig_hidden @ (Q_O * gamma).T
+        # 所以 q_resq ≈ q_orig_with_gamma (Ua 在投影时被抵消)
+        
+        Q_O = self.mgr.get_original_weight('model.layers.0.self_attn.q_proj.weight', fuse_layernorm=True)
+        Q_A = self.mgr.get_quantized_weight('model.layers.0.self_attn.q_proj')
+        
+        if Q_O is not None and Q_A is not None:
+            # 原始模型 Q 投影 (with gamma fusion)
+            q_orig = torch.matmul(orig_hidden, Q_O.T)
+            
+            # ResQ 模型 Q 投影
+            q_resq = torch.matmul(resq_hidden, Q_A.T)
+            
+            # q_resq 应该 ≈ q_orig (Ua 被抵消)
+            corr = torch.corrcoef(torch.stack([q_resq.flatten(), q_orig.flatten()]))[0, 1].item()
+            result_q = compute_diff(q_resq, q_orig, "q_proj_output", THRESHOLDS.activation_rel_diff)
+            results["q_proj_output"] = result_q
+            print(f"  q_proj_output: corr={corr:.4f}, rel={result_q.rel_diff:.2%}")
+        
+        # ========== 3. Uc 旋转后 ==========
+        # 原始: q_orig 不需要 Uc
+        # ResQ: q_resq 需要应用 Uc (在 RoPE 后)
+        # 消除 Uc: q_resq_uc @ Uc.T ≈ q_orig (假设 RoPE 前)
+        if Uc is not None and Q_O is not None and Q_A is not None:
+            # 应用 Uc
+            q_resq_uc = apply_block_rotation(q_resq, Uc)
+            # 消除 Uc
+            q_resq_restored = apply_block_rotation(q_resq_uc, Uc.T)
+            
+            # 验证 Uc 可逆性
+            corr = torch.corrcoef(torch.stack([q_resq_restored.flatten(), q_resq.flatten()]))[0, 1].item()
+            print(f"  Uc 可逆性检查: corr={corr:.4f} (应为1.0)")
+        
+        # ========== 4. MLP gate/up 输出 ==========
+        # 类似 Q，Ua 在投影时被抵消
+        gate_O = self.mgr.get_original_weight('model.layers.0.mlp.gate_proj.weight', fuse_layernorm=True)
+        gate_A = self.mgr.get_quantized_weight('model.layers.0.mlp.gate_proj')
+        
+        if gate_O is not None and gate_A is not None:
+            # 需要先过 attention 和 layernorm... 这里简化，只验证权重级别
+            # 实际激活值比较需要完整前向传播
+            print(f"  gate_proj: 需要完整前向传播才能比较激活值")
+        
+        # ========== 5. MLP down 输入/输出 ==========
+        # down_proj 输入需要 Ud 变换
+        # 原始: out = intermediate @ down_O.T
+        # ResQ: intermediate_ud = apply_ud_rotation(intermediate)
+        #       out_resq = intermediate_ud @ down_A.T
+        # 因为 down_A = Ua.T @ down_O @ Ud, 所以:
+        # out_resq = intermediate_ud @ (Ua.T @ down_O @ Ud).T 
+        #          = intermediate_ud @ Ud.T @ down_O.T @ Ua
+        # 消除 Ua: out_resq @ Ua.T ≈ intermediate_ud @ Ud.T @ down_O.T
+        #        = intermediate @ down_O.T (因为 intermediate_ud @ Ud.T = intermediate)
+        print(f"  down_proj: Ud 变换验证见 'Ud 旋转验证' 用例")
+        
+        return results
+    
     def verify_ud_rotation(self, layer_idx: int) -> Optional[DiffResult]:
         """
         验证 Ud 旋转实现
@@ -1044,6 +1151,7 @@ class ResQVerifier:
         print("阶段 4: 激活值验证")
         print("=" * 70)
         self.verify_activation_with_rotation(tokenizer, prompt)
+        self.verify_layer0_activations(tokenizer, prompt)
         
         # 5. 最终 logits
         print("\n" + "=" * 70)
