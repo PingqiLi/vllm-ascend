@@ -679,11 +679,44 @@ class ResQVerifier:
         print(f"  GQA: num_attention_heads={num_attention_heads}, num_kv_heads={num_kv_heads}")
         print(f"  Ub_expanded shape: {Ub_expanded.shape}")
         
+        # 重要：msmodelslim 的 rearrange_o_proj 会重排 o_proj 的列！
+        # 新顺序是 [mid | high]，需要还原回原始顺序
+        # high_length_per_head = head_dim * 0.125 = 16
+        high_fraction = 0.125
+        high_length_per_head = int(head_dim * high_fraction)
+        mid_length_per_head = head_dim - high_length_per_head
+        
+        # 计算 rearrange 后的列顺序，然后构建逆映射
+        # rearrange_o_proj: [mid | high]
+        # 原始: 每个 head 的 [0:mid, mid:head_dim]
+        # 重排后: 所有 head 的 mid 部分在前，所有 head 的 high 部分在后
+        mid_total = mid_length_per_head * num_attention_heads
+        high_total = high_length_per_head * num_attention_heads
+        
+        # 构建还原索引
+        # 重排后: [head0_mid, head1_mid, ..., head63_mid, head0_high, head1_high, ..., head63_high]
+        # 原始:   [head0_mid, head0_high, head1_mid, head1_high, ...]
+        restore_indices = []
+        for h in range(num_attention_heads):
+            # mid 部分在 [h * mid_length_per_head : (h+1) * mid_length_per_head]
+            mid_start = h * mid_length_per_head
+            # high 部分在 [mid_total + h * high_length_per_head : mid_total + (h+1) * high_length_per_head]
+            high_start = mid_total + h * high_length_per_head
+            for i in range(mid_length_per_head):
+                restore_indices.append(mid_start + i)
+            for i in range(high_length_per_head):
+                restore_indices.append(high_start + i)
+        restore_indices = torch.tensor(restore_indices)
+        
+        # 还原 W_A 的列顺序
+        W_A_restored_order = W_A[:, restore_indices]
+        print(f"  列重排还原: W_A shape {W_A.shape} -> 还原后相同")
+        
         # 验证: W_O ≈ Ua @ W_A @ block_diag(Ub_expanded.T)
         # Step 1: W_A @ block_diag(Ub_expanded.T)
         # W_A shape: [hidden_size, num_attention_heads * head_dim]
         # reshape to [hidden_size, num_attention_heads, head_dim]
-        W_tmp = W_A.reshape(hidden_size, num_attention_heads, head_dim).float()
+        W_tmp = W_A_restored_order.reshape(hidden_size, num_attention_heads, head_dim).float()
         
         # 对每个 head: W_tmp[:, h, :] @ Ub_expanded[h].T
         # einsum: W_tmp[hid, n, d] @ Ub.T[n, d, d'] -> W_tmp[hid, n, d']
