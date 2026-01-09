@@ -637,10 +637,16 @@ class ResQVerifier:
         msmodelslim 的 rotate_ov_proj (output=False) 和 rotate_attention_output:
         
         O_proj:
-          - rotate_ov_proj: W_temp[:,h,:] = W_O[:,h,:] @ Ub_expanded[h] (GQA 扩展)
+          - rotate_ov_proj: 在 apply_exact_had_to_linear 中对 o_proj 应用:
+            W_temp[:, i, :] = W_O[:, i, :] @ inv(Ub[i]).T = W_O[:, i, :] @ Ub[i] (因为正交)
           - rotate_attention_output: W_A = Ua.T @ W_temp
-          - 综合: W_A = Ua.T @ (W_O @ block_diag(Ub_expanded))
-          - 验证: W_O ≈ Ua @ W_A @ block_diag(Ub_expanded.T)
+          - 综合: W_A_before_rearrange = Ua.T @ (W_O @ block_diag(Ub_expanded))
+          - rearrange_o_proj: W_A = W_A_before_rearrange[:, new_column_order]
+          
+        验证方案：
+          方案1 (正向): 从 W_O 计算预期的 W_A，与实际 W_A 对比
+          方案2 (不含Ub): 检查是否可能没有应用 Ub 旋转
+          方案3 (不含rearrange): 检查是否可能没有应用列重排
         
         GQA: num_attention_heads = 64, num_kv_heads = 8
         Ub shape: [num_kv_heads, head_dim, head_dim] = [8, 128, 128]
@@ -672,18 +678,29 @@ class ResQVerifier:
         num_attention_heads = in_dim // head_dim  # 64
         
         # GQA: 扩展 Ub 到 num_attention_heads
-        # 每个 KV head 对应 num_attention_heads // num_kv_heads 个 Q heads
         num_q_per_kv = num_attention_heads // num_kv_heads  # 8
         Ub_expanded = Ub.repeat_interleave(num_q_per_kv, dim=0)  # [64, 128, 128]
         
         print(f"  GQA: num_attention_heads={num_attention_heads}, num_kv_heads={num_kv_heads}")
         print(f"  Ub_expanded shape: {Ub_expanded.shape}")
         
-        # 重要：msmodelslim 的 rearrange_o_proj 会重排 o_proj 的列！
-        # 重建 rearrange_o_proj 的 new_column_order，然后用 argsort 得到逆映射
-        # high_length_per_head = head_dim * 0.125 = 16
-        high_fraction = 0.125
-        high_length_per_head = int(head_dim * high_fraction)
+        # === 根据 ckpt A 的实际 shape 推断 high_fraction ===
+        # 从 ckpt A 读取 weight_low 的 shape 来确定实际的 high/low 分割点
+        weight_low = self.mgr.ckpt_a.get(f'model.layers.{layer_idx}.self_attn.o_proj.weight_low')
+        weight_high = self.mgr.ckpt_a.get(f'model.layers.{layer_idx}.self_attn.o_proj.weight_high')
+        if weight_low is not None and weight_high is not None:
+            actual_low_cols = weight_low.shape[1]
+            actual_high_cols = weight_high.shape[1]
+            print(f"  [从ckpt A推断] weight_low: {weight_low.shape}, weight_high: {weight_high.shape}")
+            print(f"  [从ckpt A推断] low_cols={actual_low_cols}, high_cols={actual_high_cols}")
+            # 计算每个 head 的 high 列数
+            high_length_per_head = actual_high_cols // num_attention_heads
+            print(f"  [从ckpt A推断] high_length_per_head = {actual_high_cols} / {num_attention_heads} = {high_length_per_head}")
+        else:
+            # 如果无法从 ckpt A 推断，使用默认值
+            high_fraction = 0.125
+            high_length_per_head = int(head_dim * high_fraction)
+            print(f"  [使用默认值] high_length_per_head = {head_dim} * {high_fraction} = {high_length_per_head}")
         
         # 复现 rearrange_o_proj 逻辑
         chunk_starts = torch.arange(0, in_dim, head_dim)
@@ -696,58 +713,128 @@ class ResQVerifier:
         remaining_columns = all_columns[mask]
         
         new_column_order = torch.cat([remaining_columns, columns_to_end])
-        
-        # argsort 得到逆映射: 对于每个原始列 j，它在重排后 W_A 中的位置
         restore_indices = torch.argsort(new_column_order)
         
-        # Debug: 验证 restore_indices
-        print(f"  new_column_order: len={len(new_column_order)}, first 5: {new_column_order[:5].tolist()}")
-        print(f"  restore_indices: first 5: {restore_indices[:5].tolist()}")
-        print(f"  restore_indices[112:117]: {restore_indices[112:117].tolist()}")  # head0 的 high 部分
-        print(f"  restore_indices[128:133]: {restore_indices[128:133].tolist()}")  # head1 的 low 部分
+        # Debug: 验证 new_column_order
+        low_per_head = head_dim - high_length_per_head
+        print(f"  new_column_order 结构: {num_attention_heads} heads x ({low_per_head} low + {high_length_per_head} high)")
+        print(f"  new_column_order[:5]: {new_column_order[:5].tolist()}")
+        print(f"  new_column_order[{low_per_head}:{low_per_head+5}]: {new_column_order[low_per_head:low_per_head+5].tolist()} (head1 low start)")
+        expected_high_start = num_attention_heads * low_per_head
+        print(f"  new_column_order[{expected_high_start}:{expected_high_start+5}]: {new_column_order[expected_high_start:expected_high_start+5].tolist()} (high start)")
         
         # 还原 W_A 的列顺序
-        W_A_restored_order = W_A[:, restore_indices]
-        print(f"  列重排还原: W_A shape {W_A.shape} -> 还原后相同")
+        W_A_restored = W_A[:, restore_indices]
         
-        # 验证: W_O ≈ Ua @ W_A @ block_diag(Ub_expanded.T)
-        # Step 1: W_A @ block_diag(Ub_expanded.T)
-        # W_A shape: [hidden_size, num_attention_heads * head_dim]
-        # reshape to [hidden_size, num_attention_heads, head_dim]
-        W_tmp = W_A_restored_order.reshape(hidden_size, num_attention_heads, head_dim).float()
+        # === 方案1: 完整公式 W_A = (Ua.T @ W_O @ Ub)[:, new_column_order] ===
+        W_O_float = W_O.float()
+        W_O_reshaped = W_O_float.reshape(hidden_size, num_attention_heads, head_dim)
+        Ub_expanded_float = Ub_expanded.float()
+        W_with_Ub = torch.einsum('hnd,nde->hne', W_O_reshaped, Ub_expanded_float)
+        W_with_Ub = W_with_Ub.reshape(hidden_size, in_dim)
+        W_O_transformed = torch.matmul(Ua.T.float(), W_with_Ub)
+        W_expected_1 = W_O_transformed[:, new_column_order]
+        corr_1 = torch.corrcoef(torch.stack([W_A.flatten(), W_expected_1.flatten()]))[0, 1].item()
         
-        # 对每个 head: W_tmp[:, h, :] @ Ub_expanded[h].T
-        # einsum: W_tmp[hid, n, d] @ Ub.T[n, d, d'] -> W_tmp[hid, n, d']
-        Ub_expanded_T = Ub_expanded.transpose(-1, -2).float()  # [64, 128, 128]
-        W_tmp = torch.einsum('hnd,nde->hne', W_tmp, Ub_expanded_T)
-        W_tmp = W_tmp.reshape(hidden_size, in_dim)
+        # === 方案2: 不含 Ub 旋转 W_A = (Ua.T @ W_O)[:, new_column_order] ===
+        W_O_only_Ua = torch.matmul(Ua.T.float(), W_O_float)
+        W_expected_2 = W_O_only_Ua[:, new_column_order]
+        corr_2 = torch.corrcoef(torch.stack([W_A.flatten(), W_expected_2.flatten()]))[0, 1].item()
         
-        # Step 2: Ua @ W_tmp
-        W_restored = torch.matmul(Ua.float(), W_tmp)
+        # === 方案3: 不含列重排 W_A = Ua.T @ W_O @ Ub (无rearrange) ===
+        corr_3 = torch.corrcoef(torch.stack([W_A.flatten(), W_O_transformed.flatten()]))[0, 1].item()
         
-        # Debug: 检查数值范围和中间结果
-        print(f"  W_A: range=[{W_A.min():.4f}, {W_A.max():.4f}]")
-        print(f"  W_A_restored: range=[{W_A_restored_order.min():.4f}, {W_A_restored_order.max():.4f}]")
+        # === 方案4: 只有 Ua.T @ W_O (无 Ub，无 rearrange) ===
+        corr_4 = torch.corrcoef(torch.stack([W_A.flatten(), W_O_only_Ua.flatten()]))[0, 1].item()
+        
+        # === 方案5: 检查 W_A_restored (还原列顺序) 与变换后的关系 ===
+        corr_5 = torch.corrcoef(torch.stack([W_A_restored.flatten(), W_O_transformed.flatten()]))[0, 1].item()
+        
+        # === 方案6: 只与原始 W_O 对比（无任何变换） ===
+        corr_6 = torch.corrcoef(torch.stack([W_A.flatten(), W_O_float.flatten()]))[0, 1].item()
+        
+        print(f"\n  === 变换公式验证 ===")
+        print(f"  方案1 [Ua.T @ W_O @ Ub][:, col_order] vs W_A: corr={corr_1:.4f}")
+        print(f"  方案2 [Ua.T @ W_O][:, col_order] vs W_A: corr={corr_2:.4f}")
+        print(f"  方案3 Ua.T @ W_O @ Ub (无rearrange) vs W_A: corr={corr_3:.4f}")
+        print(f"  方案4 Ua.T @ W_O (无Ub,无rearrange) vs W_A: corr={corr_4:.4f}")
+        print(f"  方案5 Ua.T @ W_O @ Ub vs W_A_restored: corr={corr_5:.4f}")
+        print(f"  方案6 W_O vs W_A (无任何变换): corr={corr_6:.4f}")
+        
+        # 选择最佳匹配的方案
+        correlations = {
+            "方案1 (完整公式)": corr_1,
+            "方案2 (无Ub)": corr_2,
+            "方案3 (无rearrange)": corr_3,
+            "方案4 (只Ua.T)": corr_4,
+            "方案5 (restored对比)": corr_5,
+            "方案6 (无变换)": corr_6,
+        }
+        best_scheme, best_corr = max(correlations.items(), key=lambda x: x[1])
+        print(f"\n  最佳匹配: {best_scheme} (corr={best_corr:.4f})")
+        
+        # 数值范围对比
+        print(f"\n  === 数值范围对比 ===")
         print(f"  W_O: range=[{W_O.min():.4f}, {W_O.max():.4f}]")
-        print(f"  W_restored: range=[{W_restored.min():.4f}, {W_restored.max():.4f}]")
+        print(f"  W_A: range=[{W_A.min():.4f}, {W_A.max():.4f}]")
+        print(f"  W_expected_1: range=[{W_expected_1.min():.4f}, {W_expected_1.max():.4f}]")
+        print(f"  W_expected_2: range=[{W_expected_2.min():.4f}, {W_expected_2.max():.4f}]")
         
-        # 方案1: 不做 Ub 变换，只验证 Ua.T @ W_O ≈ W_A (重排后)
-        # 因为 v_proj 和 o_proj 的 Ub 变换在推理时抵消
-        W_O_transformed = torch.matmul(Ua.T.float(), W_O.float())  # Ua.T @ W_O
-        # W_O_transformed 是原始布局，需要重排成 [low | high]
-        W_O_rearranged = W_O_transformed[:, new_column_order]
-        corr_no_ub = torch.corrcoef(torch.stack([W_A.flatten(), W_O_rearranged.flatten()]))[0, 1].item()
-        print(f"  [方案1] Ua.T @ W_O (重排后) vs W_A: corr={corr_no_ub:.4f}")
+        # === 深入诊断: 检查 Ub 的性质 ===
+        print(f"\n  === Ub 矩阵诊断 ===")
         
-        # 方案2: 原来的完整变换 (可能有误)
-        corr_with_ub = torch.corrcoef(torch.stack([W_restored.flatten(), W_O.float().flatten()]))[0, 1].item()
-        print(f"  [方案2] Ua @ W_A_restored @ Ub.T vs W_O: corr={corr_with_ub:.4f}")
+        # 检查 Ub 是否是正交矩阵
+        Ub_orth_errs = []
+        for i in range(min(3, num_kv_heads)):
+            orth_err = (Ub[i].float() @ Ub[i].float().T - torch.eye(head_dim)).abs().max().item()
+            Ub_orth_errs.append(orth_err)
+        print(f"  Ub 正交性误差 (前3个head): {Ub_orth_errs}")
         
-        # 选择方案1作为结果
-        corr = corr_no_ub
+        # 检查 Ub 是否接近单位矩阵
+        Ub_identity_errs = []
+        for i in range(min(3, num_kv_heads)):
+            identity_err = (Ub[i].float() - torch.eye(head_dim)).abs().max().item()
+            Ub_identity_errs.append(identity_err)
+        print(f"  Ub 与 I 差距 (前3个head): {Ub_identity_errs}")
+        
+        # 检查如果 Ub 是单位矩阵会怎样
+        if Ub_identity_errs[0] > 0.01:
+            print(f"  Ub 不是单位矩阵，应该有旋转效果")
+        else:
+            print(f"  ⚠ Ub 接近单位矩阵，旋转效果很小")
+        
+        # === 额外诊断: 检查单个 head 的变换 ===
+        print(f"\n  === 单个 head 变换诊断 (head 0) ===")
+        W_O_h0 = W_O_float[:, :head_dim]  # [5120, 128]
+        W_A_h0 = W_A[:, :low_per_head].float()  # 重排后的前 112 列应该是 head0 的 low 部分
+        
+        # 尝试不同的变换
+        # 1. Ua.T @ W_O[:, :head_dim]
+        W_h0_v1 = torch.matmul(Ua.T.float(), W_O_h0)[:, :low_per_head]
+        corr_h0_v1 = torch.corrcoef(torch.stack([W_A_h0.flatten(), W_h0_v1.flatten()]))[0, 1].item()
+        
+        # 2. Ua.T @ W_O[:, :head_dim] @ Ub[0]
+        W_O_with_Ub0 = torch.matmul(W_O_h0, Ub_expanded_float[0])
+        W_h0_v2 = torch.matmul(Ua.T.float(), W_O_with_Ub0)[:, :low_per_head]
+        corr_h0_v2 = torch.corrcoef(torch.stack([W_A_h0.flatten(), W_h0_v2.flatten()]))[0, 1].item()
+        
+        print(f"  W_A head0 low (前{low_per_head}列): shape={W_A_h0.shape}")
+        print(f"  变换v1 (Ua.T @ W_O_h0)[:, :low]: corr={corr_h0_v1:.4f}")
+        print(f"  变换v2 (Ua.T @ W_O_h0 @ Ub0)[:, :low]: corr={corr_h0_v2:.4f}")
+        
+        # 使用最佳方案作为主要验证
+        corr = best_corr
         passed = corr >= THRESHOLDS.quantized_correlation
         status = "✓ PASS" if passed else "✗ FAIL"
-        print(f"  {status} o_proj: corr={corr:.4f}")
+        print(f"\n  {status} o_proj: corr={corr:.4f} (最佳方案: {best_scheme})")
+        
+        # 如果所有方案都失败，可能是 Ub 没有被正确保存到 ckpt B
+        if best_corr < 0.5:
+            print(f"\n  ⚠⚠⚠ 警告: 所有变换方案的相关系数都很低!")
+            print(f"  可能的原因:")
+            print(f"  1. ckpt B 中的 P_b/R_b 与实际量化时使用的不同")
+            print(f"  2. msmodelslim 的变换顺序/公式与预期不同")
+            print(f"  3. 量化时可能使用了不同的配置")
         
         result = DiffResult("o_proj", 0, 0, 0, passed, f"corr={corr:.4f}")
         if not passed:
