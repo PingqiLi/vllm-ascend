@@ -684,23 +684,41 @@ class ResQVerifier:
         print(f"  GQA: num_attention_heads={num_attention_heads}, num_kv_heads={num_kv_heads}")
         print(f"  Ub_expanded shape: {Ub_expanded.shape}")
         
-        # === 根据 ckpt A 的实际 shape 推断 high_fraction ===
+        # === 检测 modelslim 的 bug: rearrange 和 quantize 使用不同的 high_bits_length ===
         # 从 ckpt A 读取 weight_low 的 shape 来确定实际的 high/low 分割点
         weight_low = self.mgr.ckpt_a.get(f'model.layers.{layer_idx}.self_attn.o_proj.weight_low')
         weight_high = self.mgr.ckpt_a.get(f'model.layers.{layer_idx}.self_attn.o_proj.weight_high')
+        
+        # modelslim 的 bug:
+        # - rearrange_columns 使用: high_bits_length = high_fraction * model_dim = 0.125 * 5120 = 640
+        # - calibrator 使用: high_bits_length = high_fraction * weight.shape[1] = 0.125 * 8192 = 1024
+        high_fraction = 0.125
+        hidden_size_based_high = int(high_fraction * hidden_size)  # 640 (rearrange 使用)
+        in_dim_based_high = int(high_fraction * in_dim)            # 1024 (量化存储使用)
+        
+        high_per_head_rearrange = hidden_size_based_high // num_attention_heads  # 10
+        high_per_head_quant = in_dim_based_high // num_attention_heads            # 16
+        
+        print(f"  === modelslim bug 检测 ===")
+        print(f"  rearrange 使用: high_bits_length = {high_fraction} * {hidden_size} = {hidden_size_based_high}")
+        print(f"    -> high_length_per_head = {hidden_size_based_high} / {num_attention_heads} = {high_per_head_rearrange}")
+        print(f"  quantize 使用: high_bits_length = {high_fraction} * {in_dim} = {in_dim_based_high}")
+        print(f"    -> high_length_per_head = {in_dim_based_high} / {num_attention_heads} = {high_per_head_quant}")
+        
         if weight_low is not None and weight_high is not None:
-            actual_low_cols = weight_low.shape[1]
             actual_high_cols = weight_high.shape[1]
-            print(f"  [从ckpt A推断] weight_low: {weight_low.shape}, weight_high: {weight_high.shape}")
-            print(f"  [从ckpt A推断] low_cols={actual_low_cols}, high_cols={actual_high_cols}")
-            # 计算每个 head 的 high 列数
-            high_length_per_head = actual_high_cols // num_attention_heads
-            print(f"  [从ckpt A推断] high_length_per_head = {actual_high_cols} / {num_attention_heads} = {high_length_per_head}")
-        else:
-            # 如果无法从 ckpt A 推断，使用默认值
-            high_fraction = 0.125
-            high_length_per_head = int(head_dim * high_fraction)
-            print(f"  [使用默认值] high_length_per_head = {head_dim} * {high_fraction} = {high_length_per_head}")
+            actual_high_per_head = actual_high_cols // num_attention_heads
+            print(f"  ckpt A 实际: weight_high has {actual_high_cols} cols = {actual_high_per_head} per head")
+            
+            if actual_high_per_head == high_per_head_quant:
+                print(f"  ✓ ckpt A 与 quantize 逻辑一致 (使用 in_dim)")
+            elif actual_high_per_head == high_per_head_rearrange:
+                print(f"  ✓ ckpt A 与 rearrange 逻辑一致 (使用 model_dim)")
+            else:
+                print(f"  ⚠ ckpt A 与两种计算方式都不一致!")
+        
+        # 使用量化存储的实际 high 列数
+        high_length_per_head = high_per_head_quant
         
         # 复现 rearrange_o_proj 逻辑
         chunk_starts = torch.arange(0, in_dim, head_dim)
@@ -726,19 +744,44 @@ class ResQVerifier:
         # 还原 W_A 的列顺序
         W_A_restored = W_A[:, restore_indices]
         
-        # === 方案1: 完整公式 W_A = (Ua.T @ W_O @ Ub)[:, new_column_order] ===
+        # === 计算两种不同的 column order ===
+        # 方式A: 使用量化的 high_length_per_head (16, 基于 in_dim)
+        def build_column_order(hlph):
+            """Build column rearrangement order given high_length_per_head"""
+            chunk_starts = torch.arange(0, in_dim, head_dim)
+            high_prec_cols = torch.arange(head_dim - hlph, head_dim)
+            cols_to_end = (chunk_starts.unsqueeze(1) + high_prec_cols).flatten()
+            all_cols = torch.arange(in_dim)
+            mask = torch.ones(in_dim, dtype=torch.bool)
+            mask[cols_to_end] = False
+            remaining = all_cols[mask]
+            return torch.cat([remaining, cols_to_end])
+        
+        col_order_quant = build_column_order(high_per_head_quant)      # 16 per head
+        col_order_rearrange = build_column_order(high_per_head_rearrange)  # 10 per head
+        
+        # 使用量化的 column order 作为主要验证
+        new_column_order = col_order_quant
+        
+        # === 基础变换: Ua.T @ W_O @ block_diag(Ub) ===
         W_O_float = W_O.float()
         W_O_reshaped = W_O_float.reshape(hidden_size, num_attention_heads, head_dim)
         Ub_expanded_float = Ub_expanded.float()
         W_with_Ub = torch.einsum('hnd,nde->hne', W_O_reshaped, Ub_expanded_float)
         W_with_Ub = W_with_Ub.reshape(hidden_size, in_dim)
         W_O_transformed = torch.matmul(Ua.T.float(), W_with_Ub)
-        W_expected_1 = W_O_transformed[:, new_column_order]
-        corr_1 = torch.corrcoef(torch.stack([W_A.flatten(), W_expected_1.flatten()]))[0, 1].item()
-        
-        # === 方案2: 不含 Ub 旋转 W_A = (Ua.T @ W_O)[:, new_column_order] ===
         W_O_only_Ua = torch.matmul(Ua.T.float(), W_O_float)
-        W_expected_2 = W_O_only_Ua[:, new_column_order]
+        
+        # === 方案1: 使用量化的 column order (16 per head) ===
+        W_expected_quant = W_O_transformed[:, col_order_quant]
+        corr_1 = torch.corrcoef(torch.stack([W_A.flatten(), W_expected_quant.flatten()]))[0, 1].item()
+        
+        # === 方案1b: 使用 rearrange 的 column order (10 per head) ===
+        W_expected_rearrange = W_O_transformed[:, col_order_rearrange]
+        corr_1b = torch.corrcoef(torch.stack([W_A.flatten(), W_expected_rearrange.flatten()]))[0, 1].item()
+        
+        # === 方案2: 不含 Ub 旋转，使用量化 column order ===
+        W_expected_2 = W_O_only_Ua[:, col_order_quant]
         corr_2 = torch.corrcoef(torch.stack([W_A.flatten(), W_expected_2.flatten()]))[0, 1].item()
         
         # === 方案3: 不含列重排 W_A = Ua.T @ W_O @ Ub (无rearrange) ===
@@ -747,27 +790,31 @@ class ResQVerifier:
         # === 方案4: 只有 Ua.T @ W_O (无 Ub，无 rearrange) ===
         corr_4 = torch.corrcoef(torch.stack([W_A.flatten(), W_O_only_Ua.flatten()]))[0, 1].item()
         
-        # === 方案5: 检查 W_A_restored (还原列顺序) 与变换后的关系 ===
-        corr_5 = torch.corrcoef(torch.stack([W_A_restored.flatten(), W_O_transformed.flatten()]))[0, 1].item()
+        # === 方案5: 使用 rearrange order 还原后对比 ===
+        restore_indices_rearrange = torch.argsort(col_order_rearrange)
+        W_A_restored_rearrange = W_A[:, restore_indices_rearrange]
+        corr_5 = torch.corrcoef(torch.stack([W_A_restored_rearrange.flatten(), W_O_transformed.flatten()]))[0, 1].item()
         
         # === 方案6: 只与原始 W_O 对比（无任何变换） ===
         corr_6 = torch.corrcoef(torch.stack([W_A.flatten(), W_O_float.flatten()]))[0, 1].item()
         
         print(f"\n  === 变换公式验证 ===")
-        print(f"  方案1 [Ua.T @ W_O @ Ub][:, col_order] vs W_A: corr={corr_1:.4f}")
-        print(f"  方案2 [Ua.T @ W_O][:, col_order] vs W_A: corr={corr_2:.4f}")
-        print(f"  方案3 Ua.T @ W_O @ Ub (无rearrange) vs W_A: corr={corr_3:.4f}")
-        print(f"  方案4 Ua.T @ W_O (无Ub,无rearrange) vs W_A: corr={corr_4:.4f}")
-        print(f"  方案5 Ua.T @ W_O @ Ub vs W_A_restored: corr={corr_5:.4f}")
-        print(f"  方案6 W_O vs W_A (无任何变换): corr={corr_6:.4f}")
+        print(f"  方案1  [Ua.T @ W_O @ Ub][:, col_quant(16/head)] vs W_A: corr={corr_1:.4f}")
+        print(f"  方案1b [Ua.T @ W_O @ Ub][:, col_rearr(10/head)] vs W_A: corr={corr_1b:.4f}")
+        print(f"  方案2  [Ua.T @ W_O][:, col_quant] vs W_A: corr={corr_2:.4f}")
+        print(f"  方案3  Ua.T @ W_O @ Ub (无rearrange) vs W_A: corr={corr_3:.4f}")
+        print(f"  方案4  Ua.T @ W_O (无Ub,无rearrange) vs W_A: corr={corr_4:.4f}")
+        print(f"  方案5  Ua.T @ W_O @ Ub vs W_A_restored(rearr_order): corr={corr_5:.4f}")
+        print(f"  方案6  W_O vs W_A (无任何变换): corr={corr_6:.4f}")
         
         # 选择最佳匹配的方案
         correlations = {
-            "方案1 (完整公式)": corr_1,
-            "方案2 (无Ub)": corr_2,
+            "方案1 (quant order, 16/head)": corr_1,
+            "方案1b (rearrange order, 10/head)": corr_1b,
+            "方案2 (无Ub, quant order)": corr_2,
             "方案3 (无rearrange)": corr_3,
             "方案4 (只Ua.T)": corr_4,
-            "方案5 (restored对比)": corr_5,
+            "方案5 (restore用rearr order)": corr_5,
             "方案6 (无变换)": corr_6,
         }
         best_scheme, best_corr = max(correlations.items(), key=lambda x: x[1])
@@ -777,8 +824,8 @@ class ResQVerifier:
         print(f"\n  === 数值范围对比 ===")
         print(f"  W_O: range=[{W_O.min():.4f}, {W_O.max():.4f}]")
         print(f"  W_A: range=[{W_A.min():.4f}, {W_A.max():.4f}]")
-        print(f"  W_expected_1: range=[{W_expected_1.min():.4f}, {W_expected_1.max():.4f}]")
-        print(f"  W_expected_2: range=[{W_expected_2.min():.4f}, {W_expected_2.max():.4f}]")
+        print(f"  W_expected(quant order): range=[{W_expected_quant.min():.4f}, {W_expected_quant.max():.4f}]")
+        print(f"  W_expected(rearr order): range=[{W_expected_rearrange.min():.4f}, {W_expected_rearrange.max():.4f}]")
         
         # === 深入诊断: 检查 Ub 的性质 ===
         print(f"\n  === Ub 矩阵诊断 ===")
@@ -822,6 +869,58 @@ class ResQVerifier:
         print(f"  变换v1 (Ua.T @ W_O_h0)[:, :low]: corr={corr_h0_v1:.4f}")
         print(f"  变换v2 (Ua.T @ W_O_h0 @ Ub0)[:, :low]: corr={corr_h0_v2:.4f}")
         
+        # === 方案7: 测试 modelslim bug 假设 ===
+        # 假设: rearrange 用 10/head 重排，但量化存储按 16/head 分割 high/low
+        # 这意味着列被错误地打乱了
+        print(f"\n  === modelslim bug 假设测试 (方案7) ===")
+        
+        # 步骤1: 计算旋转后的权重 (Ua.T @ W_O @ Ub)
+        W_rotated = W_O_transformed  # shape [5120, 8192]
+        
+        # 步骤2: 模拟 rearrange 用 10/head 重排
+        W_after_rearrange_10 = W_rotated[:, col_order_rearrange]
+        
+        # 步骤3: 模拟量化器读取时按 16/head 理解 high/low 分割
+        # 量化器认为最后 1024 列是 high，前 7168 列是 low
+        # 但实际上 rearrange 只移动了 640 列到末尾
+        # 这导致量化器错误地认为一些 mid 列是 high 列
+        
+        # 分析 W_A 的实际结构
+        if weight_low is not None and weight_high is not None:
+            actual_low_cols = weight_low.shape[1]
+            actual_high_cols = weight_high.shape[1]
+            print(f"  实际存储: weight_low={actual_low_cols} cols, weight_high={actual_high_cols} cols")
+            
+            # 方案7a: 如果 rearrange 用 10/head，量化用 16/head
+            # 那么 W_A 的前 7168 列对应 W_after_rearrange_10 的前 7168 列
+            # W_A 的后 1024 列对应 W_after_rearrange_10 的后 1024 列
+            # 但 W_after_rearrange_10 的结构是 [7552 mid | 640 high]
+            
+            W_expected_bug = W_after_rearrange_10  # 直接比较
+            corr_7a = torch.corrcoef(torch.stack([W_A.flatten(), W_expected_bug.flatten()]))[0, 1].item()
+            print(f"  方案7a [Ua.T @ W_O @ Ub][:, rearr_10] 直接对比 W_A: corr={corr_7a:.4f}")
+            
+            # 方案7b: 反向推导——假设量化器在 rearrange 结果上按 16/head 理解
+            # 我们需要"修正"这个错误来还原原始变换
+            # 这很复杂，因为涉及到两套不同的列索引
+            
+            # 先检查 weight_low 和 weight_high 的数值范围
+            print(f"\n  量化权重数值诊断:")
+            print(f"  weight_low: range=[{weight_low.min():.4f}, {weight_low.max():.4f}], dtype={weight_low.dtype}")
+            print(f"  weight_high: range=[{weight_high.min():.4f}, {weight_high.max():.4f}], dtype={weight_high.dtype}")
+            
+            # 检查 W_A 的 low/high 部分与 W_expected 的对应关系
+            W_A_low = W_A[:, :actual_low_cols].float()
+            W_A_high = W_A[:, actual_low_cols:].float()
+            W_exp_quant_low = W_expected_quant[:, :actual_low_cols].float()
+            W_exp_quant_high = W_expected_quant[:, actual_low_cols:].float()
+            
+            corr_low = torch.corrcoef(torch.stack([W_A_low.flatten(), W_exp_quant_low.flatten()]))[0, 1].item()
+            corr_high = torch.corrcoef(torch.stack([W_A_high.flatten(), W_exp_quant_high.flatten()]))[0, 1].item()
+            print(f"\n  分区域对比 (quant order 16/head):")
+            print(f"  W_A_low vs W_expected_low: corr={corr_low:.4f}")
+            print(f"  W_A_high vs W_expected_high: corr={corr_high:.4f}")
+        
         # 使用最佳方案作为主要验证
         corr = best_corr
         passed = corr >= THRESHOLDS.quantized_correlation
@@ -833,7 +932,9 @@ class ResQVerifier:
             print(f"\n  ⚠⚠⚠ 警告: 所有变换方案的相关系数都很低!")
             print(f"  可能的原因:")
             print(f"  1. ckpt B 中的 P_b/R_b 与实际量化时使用的不同")
-            print(f"  2. msmodelslim 的变换顺序/公式与预期不同")
+            print(f"  2. msmodelslim rearrange (用 model_dim=5120) 和 quantize (用 in_dim=8192) 不一致")
+            print(f"     - rearrange 按 {high_per_head_rearrange} cols/head 重排")
+            print(f"     - quantize 按 {high_per_head_quant} cols/head 分割 high/low")
             print(f"  3. 量化时可能使用了不同的配置")
         
         result = DiffResult("o_proj", 0, 0, 0, passed, f"corr={corr:.4f}")
