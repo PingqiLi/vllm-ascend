@@ -442,7 +442,13 @@ class ResQVerifier:
         direct = compute_diff(embed_A.float(), embed_O, "embed_A vs embed_O (直接)")
         print(f"  直接比较: rel={direct.rel_diff:.2%} (应该差异大)")
         
-        # 还原后比较: embed_O ≈ embed_A @ Ua.T
+        # 正向验证: embed_O @ Ua ≈ embed_A
+        # 如果融合正确，这个应该接近 0
+        embed_forward = torch.matmul(embed_O.float(), Ua)
+        forward_result = compute_diff(embed_forward, embed_A.float(), "embed_O @ Ua vs embed_A")
+        print(f"  正向验证: embed_O @ Ua vs embed_A: rel={forward_result.rel_diff:.2%}")
+        
+        # 逆向验证: embed_A @ Ua.T ≈ embed_O
         # 因为 embed_A = embed_O @ Ua，所以 embed_A @ Ua.T = embed_O @ Ua @ Ua.T = embed_O
         embed_restored = torch.matmul(embed_A.float(), Ua.T)
         result = compute_diff(embed_restored, embed_O, "embed_A @ Ua.T vs embed_O", 
@@ -494,6 +500,11 @@ class ResQVerifier:
                 if layer_idx == 0 and proj == 'q_proj':
                     direct_diff = compute_diff(W_A.float(), W_O, f"{proj} 直接比较")
                     print(f"  [DEBUG] {proj} 直接比较: rel={direct_diff.rel_diff:.2%}")
+                    
+                    # 正向验证: W_O @ Ua ≈ W_A
+                    W_forward = torch.matmul(W_O.float(), Ua)
+                    forward_diff = compute_diff(W_forward, W_A.float(), f"{proj} 正向")
+                    print(f"  [DEBUG] {proj} 正向验证 (W_O @ Ua vs W_A): rel={forward_diff.rel_diff:.2%}")
                 
                 # Q/K: W_A = W_O @ Ua
                 # 验证: W_O ≈ W_A @ Ua.T
