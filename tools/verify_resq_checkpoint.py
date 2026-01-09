@@ -700,6 +700,12 @@ class ResQVerifier:
         # argsort 得到逆映射: 对于每个原始列 j，它在重排后 W_A 中的位置
         restore_indices = torch.argsort(new_column_order)
         
+        # Debug: 验证 restore_indices
+        print(f"  new_column_order: len={len(new_column_order)}, first 5: {new_column_order[:5].tolist()}")
+        print(f"  restore_indices: first 5: {restore_indices[:5].tolist()}")
+        print(f"  restore_indices[112:117]: {restore_indices[112:117].tolist()}")  # head0 的 high 部分
+        print(f"  restore_indices[128:133]: {restore_indices[128:133].tolist()}")  # head1 的 low 部分
+        
         # 还原 W_A 的列顺序
         W_A_restored_order = W_A[:, restore_indices]
         print(f"  列重排还原: W_A shape {W_A.shape} -> 还原后相同")
@@ -719,10 +725,15 @@ class ResQVerifier:
         # Step 2: Ua @ W_tmp
         W_restored = torch.matmul(Ua.float(), W_tmp)
         
-        # Debug: 检查数值范围
+        # Debug: 检查数值范围和中间结果
         print(f"  W_A: range=[{W_A.min():.4f}, {W_A.max():.4f}]")
+        print(f"  W_A_restored: range=[{W_A_restored_order.min():.4f}, {W_A_restored_order.max():.4f}]")
         print(f"  W_O: range=[{W_O.min():.4f}, {W_O.max():.4f}]")
         print(f"  W_restored: range=[{W_restored.min():.4f}, {W_restored.max():.4f}]")
+        
+        # Debug: 不做旋转直接比较
+        corr_direct = torch.corrcoef(torch.stack([W_A_restored_order.flatten(), W_O.float().flatten()]))[0, 1].item()
+        print(f"  [DEBUG] 直接比较 W_A_restored vs W_O: corr={corr_direct:.4f}")
         
         # 使用相关系数验证（int4量化导致rel_diff很大）
         corr = torch.corrcoef(torch.stack([W_restored.flatten(), W_O.float().flatten()]))[0, 1].item()
