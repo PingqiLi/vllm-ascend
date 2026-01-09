@@ -220,12 +220,26 @@ class CheckpointManager:
         
         return dequantize_mixed_precision(weight_low, weight_high, scale_low, scale_high)
     
-    def get_ua(self, layer_idx: int) -> Optional[torch.Tensor]:
+    def get_ua(self, layer_idx: int, debug: bool = False) -> Optional[torch.Tensor]:
         """获取 Ua = Pa @ Ra"""
         Pa = self.ckpt_b.get(f'resq.layer.{layer_idx}.P_a')
         Ra = self.ckpt_b.get(f'resq.layer.{layer_idx}.R_a')
         if Pa is None or Ra is None:
+            if debug:
+                print(f"  [DEBUG] P_a or R_a not found for layer {layer_idx}")
             return None
+        
+        if debug:
+            print(f"  [DEBUG] P_a shape: {Pa.shape}, R_a shape: {Ra.shape}")
+            # 检查 P_a 正交性
+            Pa_f = Pa.float()
+            Pa_orth_err = (Pa_f @ Pa_f.T - torch.eye(Pa.shape[0])).abs().max().item()
+            print(f"  [DEBUG] P_a 正交性误差: {Pa_orth_err:.2e}")
+            # 检查 R_a 正交性
+            Ra_f = Ra.float()
+            Ra_orth_err = (Ra_f @ Ra_f.T - torch.eye(Ra.shape[0])).abs().max().item()
+            print(f"  [DEBUG] R_a 正交性误差: {Ra_orth_err:.2e}")
+        
         return torch.matmul(Pa.float(), Ra.float())
     
     def get_uc(self, layer_idx: int) -> Optional[torch.Tensor]:
@@ -334,6 +348,11 @@ class ResQVerifier:
         all_passed = True
         
         # 验证 Ua, Uc, Pd 的正交性
+        # 首次验证时启用 debug 输出
+        if layer_idx == 0:
+            print("  [DEBUG] 检查 P_a 和 R_a 的正交性:")
+            self.mgr.get_ua(layer_idx, debug=True)
+        
         for name, get_fn in [
             ("Ua", lambda: self.mgr.get_ua(layer_idx)),
             ("Uc", lambda: self.mgr.get_uc(layer_idx)),
@@ -455,6 +474,11 @@ class ResQVerifier:
             in_dim = W_A.shape[1]  # = hidden_size
             
             if proj in ['q_proj', 'k_proj']:
+                # 诊断：直接比较 W_A 和 W_O
+                if layer_idx == 0 and proj == 'q_proj':
+                    direct_diff = compute_diff(W_A.float(), W_O, f"{proj} 直接比较")
+                    print(f"  [DEBUG] {proj} 直接比较: rel={direct_diff.rel_diff:.2%}")
+                
                 # Q/K: W_A = W_O @ Ua
                 # 验证: W_O ≈ W_A @ Ua.T
                 W_restored = torch.matmul(W_A.float(), Ua.T)
