@@ -239,6 +239,22 @@ class CheckpointManager:
             Ra_f = Ra.float()
             Ra_orth_err = (Ra_f @ Ra_f.T - torch.eye(Ra.shape[0])).abs().max().item()
             print(f"  [DEBUG] R_a 正交性误差: {Ra_orth_err:.2e}")
+            
+            # 检查 R_a 是否是 block_diag 形式
+            # R1 = block_diag(R1_1, R1_2) 其中 R1_1:[4480,4480], R1_2:[640,640]
+            hidden_size = Ra.shape[0]
+            high_len = int(hidden_size * 0.125)  # 640
+            low_len = hidden_size - high_len  # 4480
+            
+            # 检查 off-diagonal blocks 是否接近 0
+            off_diag_low_high = Ra[:low_len, low_len:].abs().max().item()
+            off_diag_high_low = Ra[low_len:, :low_len].abs().max().item()
+            print(f"  [DEBUG] R_a 结构检查 (应该是 block_diag):")
+            print(f"    off-diag [low, high] max: {off_diag_low_high:.2e}")
+            print(f"    off-diag [high, low] max: {off_diag_high_low:.2e}")
+            
+            if off_diag_low_high > 0.01 or off_diag_high_low > 0.01:
+                print(f"  [DEBUG] ⚠ R_a 不是 block_diag 形式！")
         
         return torch.matmul(Pa.float(), Ra.float())
     
