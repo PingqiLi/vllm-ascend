@@ -498,11 +498,17 @@ class ResQVerifier:
             if proj in ['q_proj', 'k_proj']:
                 # 诊断：直接比较 W_A 和 W_O
                 if layer_idx == 0 and proj == 'q_proj':
+                    print(f"  [DEBUG] {proj} 形状: W_A={W_A.shape}, W_O={W_O.shape}")
+                    print(f"  [DEBUG] {proj} 数值范围:")
+                    print(f"    W_A: min={W_A.min().item():.4f}, max={W_A.max().item():.4f}, mean={W_A.float().mean().item():.4f}")
+                    print(f"    W_O: min={W_O.min().item():.4f}, max={W_O.max().item():.4f}, mean={W_O.float().mean().item():.4f}")
+                    
                     direct_diff = compute_diff(W_A.float(), W_O, f"{proj} 直接比较")
                     print(f"  [DEBUG] {proj} 直接比较: rel={direct_diff.rel_diff:.2%}")
                     
                     # 正向验证: W_O @ Ua ≈ W_A
                     W_forward = torch.matmul(W_O.float(), Ua)
+                    print(f"    W_O@Ua: min={W_forward.min().item():.4f}, max={W_forward.max().item():.4f}")
                     forward_diff = compute_diff(W_forward, W_A.float(), f"{proj} 正向")
                     print(f"  [DEBUG] {proj} 正向验证 (W_O @ Ua vs W_A): rel={forward_diff.rel_diff:.2%}")
                 
