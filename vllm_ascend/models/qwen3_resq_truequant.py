@@ -295,23 +295,8 @@ def apply_ud_rotation(
     # Normalize: divide by sqrt(n) to match msmodelslim's matmul_hadU_cpu
     x = x / math.sqrt(n)
     
-    # Compensate for msmodelslim bug: missing K factor in weight fusion
-    # 
-    # Original paper (project-resq) uses: K * hadK in matmul_hadU_cuda
-    # But msmodelslim uses: hadK (without K factor)
-    # 
-    # This means msmodelslim's fused weights are scaled by 1/K compared to paper.
-    # To compensate, we need to scale activations by K.
-    # 
-    # Combined with Hd normalization (elements ~1/sqrt(K)), the total compensation
-    # needed is K * sqrt(K) = K^1.5, but since matmul_hadU includes /sqrt(n) on
-    # both sides, the effective scale mismatch is just K.
-    #
-    # For now, apply K compensation to make scale = 1.0
-    if Hd is not None and K > 1:
-        hd_max = Hd.abs().max().item()
-        if hd_max < 0.5:  # Normalized Hd (elements ~±1/sqrt(K))
-            x = x * K
+    # Note: msmodelslim now correctly uses K * hadK in weight fusion (matching original paper).
+    # No additional compensation needed here - the Ud rotation is now a proper orthogonal transform.
     
     return x.reshape(original_shape).to(original_dtype)
 
