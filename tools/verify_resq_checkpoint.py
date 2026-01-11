@@ -1282,7 +1282,10 @@ class ResQVerifier:
                 else:
                     weight_fail += 1
                     print(f"  FAIL: {msg}")
-            else:
+            elif layer_key == 'lm_head_final_norm':
+                # Skip - already printed in verify_lm_head_and_final_norm
+                continue
+            elif layer_key.startswith('layer_'):
                 for name, (msg, passed) in layer_results.items():
                     if passed:
                         weight_pass += 1
