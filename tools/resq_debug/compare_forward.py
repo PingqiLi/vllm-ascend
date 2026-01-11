@@ -200,20 +200,37 @@ def compare_single_forward(
     input_ids: torch.Tensor,
     layers: List[int],
     tokenizer,
+    orig_device: str = "cpu",
+    resq_device: str = "npu",
     verbose: bool = True,
 ) -> Dict:
-    """Compare a single forward pass"""
+    """Compare a single forward pass
     
-    # Run original model
+    Models run on different devices, activations are moved to CPU for comparison.
+    """
+    
+    # Run original model on its device
+    orig_input_ids = input_ids.to(orig_device)
     orig_wrapper = OriginalModelWrapper(orig_model)
     with torch.no_grad():
-        orig_logits = orig_wrapper.forward_with_activations(input_ids, layers)
-    orig_acts = orig_wrapper.activations
+        orig_logits = orig_wrapper.forward_with_activations(orig_input_ids, layers)
+    # Move activations to CPU
+    orig_acts = {k: (v.cpu() if isinstance(v, torch.Tensor) else 
+                     {kk: vv.cpu() for kk, vv in v.items()} if isinstance(v, dict) else v)
+                 for k, v in orig_wrapper.activations.items()}
     
-    # Run ResQ model
+    # Run ResQ model on its device
+    resq_input_ids = input_ids.to(resq_device)
     with torch.no_grad():
-        resq_logits = resq_model(input_ids, save_activations=True, save_layers=layers)
-    resq_acts = resq_model.activations
+        resq_logits = resq_model(resq_input_ids, save_activations=True, save_layers=layers)
+    # Move activations to CPU
+    def to_cpu_recursive(d):
+        if isinstance(d, torch.Tensor):
+            return d.cpu()
+        elif isinstance(d, dict):
+            return {k: to_cpu_recursive(v) for k, v in d.items()}
+        return d
+    resq_acts = to_cpu_recursive(resq_model.activations)
     
     results = {}
     
@@ -296,13 +313,17 @@ def compare_generation(
     tokenizer,
     prompt: str,
     max_new_tokens: int = 20,
-    device: str = "cpu",
+    orig_device: str = "cpu",
+    resq_device: str = "npu",
 ) -> Dict:
-    """Compare token-by-token generation between original and ResQ models"""
+    """Compare token-by-token generation between original and ResQ models
     
-    inputs = tokenizer(prompt, return_tensors="pt").to(device)
-    orig_ids = inputs["input_ids"].clone()
-    resq_ids = inputs["input_ids"].clone()
+    Each model runs on its own device to avoid OOM.
+    """
+    
+    inputs = tokenizer(prompt, return_tensors="pt")
+    orig_ids = inputs["input_ids"].to(orig_device)
+    resq_ids = inputs["input_ids"].to(resq_device)
     
     print(f"Prompt: '{prompt}'")
     print("=" * 60)
@@ -312,13 +333,13 @@ def compare_generation(
     token_matches = []
     
     for step in range(max_new_tokens):
-        # Original model forward
+        # Original model forward (on orig_device)
         with torch.no_grad():
             orig_out = orig_model(orig_ids)
             orig_logits = orig_out.logits if hasattr(orig_out, 'logits') else orig_out
             orig_next = orig_logits[0, -1].argmax().item()
         
-        # ResQ model forward
+        # ResQ model forward (on resq_device)
         with torch.no_grad():
             resq_logits = resq_model(resq_ids)
             resq_next = resq_logits[0, -1].argmax().item()
@@ -327,9 +348,9 @@ def compare_generation(
         resq_tokens.append(resq_next)
         token_matches.append(orig_next == resq_next)
         
-        # Append to sequences
-        orig_ids = torch.cat([orig_ids, torch.tensor([[orig_next]], device=device)], dim=1)
-        resq_ids = torch.cat([resq_ids, torch.tensor([[resq_next]], device=device)], dim=1)
+        # Append to sequences (each on their own device)
+        orig_ids = torch.cat([orig_ids, torch.tensor([[orig_next]], device=orig_device)], dim=1)
+        resq_ids = torch.cat([resq_ids, torch.tensor([[resq_next]], device=resq_device)], dim=1)
         
         # Stop on EOS
         if orig_next == tokenizer.eos_token_id and resq_next == tokenizer.eos_token_id:
@@ -371,28 +392,41 @@ def compare_models(
     tokenizer,
     prompt: str,
     layers: List[int],
-    device: str = "cpu",
+    orig_device: str = "cpu",
+    resq_device: str = "npu",
     max_new_tokens: int = 20,
 ) -> Dict:
-    """Compare original and ResQ models - both single forward and generation"""
+    """Compare original and ResQ models - both single forward and generation
     
-    inputs = tokenizer(prompt, return_tensors="pt").to(device)
-    input_ids = inputs["input_ids"]
+    Args:
+        orig_model: Original Qwen3 model (on orig_device)
+        resq_model: ResQ Qwen3 model (on resq_device)
+        tokenizer: Tokenizer
+        prompt: Input prompt
+        layers: Layer indices to compare
+        orig_device: Device for original model (cpu recommended to avoid OOM)
+        resq_device: Device for ResQ model (npu/cuda)
+        max_new_tokens: Max tokens to generate
+    """
     
-    print(f"Input: '{prompt}' -> tokens={input_ids.shape[1]}")
+    # Tokenize
+    inputs = tokenizer(prompt, return_tensors="pt")
+    
+    print(f"Input: '{prompt}' -> tokens={inputs['input_ids'].shape[1]}")
     print("=" * 60)
     
     # Single forward comparison
     print("\n[1] Single Forward Pass Comparison")
     print("-" * 40)
     results, orig_logits, resq_logits = compare_single_forward(
-        orig_model, resq_model, input_ids, layers, tokenizer
+        orig_model, resq_model, inputs["input_ids"], layers, tokenizer,
+        orig_device, resq_device
     )
     
-    # Top tokens comparison
+    # Top tokens comparison (move to CPU for comparison)
     print(f"\n--- Top-5 Predicted Tokens ---")
-    orig_top = orig_logits[0, -1].topk(5)
-    resq_top = resq_logits[0, -1].topk(5)
+    orig_top = orig_logits[0, -1].float().cpu().topk(5)
+    resq_top = resq_logits[0, -1].float().cpu().topk(5)
     
     print(f"  Original: {[tokenizer.decode([t]) for t in orig_top.indices.tolist()]}")
     print(f"  ResQ:     {[tokenizer.decode([t]) for t in resq_top.indices.tolist()]}")
@@ -401,7 +435,8 @@ def compare_models(
     print(f"\n\n[2] Generation Comparison (max {max_new_tokens} tokens)")
     print("-" * 40)
     gen_results = compare_generation(
-        orig_model, resq_model, tokenizer, prompt, max_new_tokens, device
+        orig_model, resq_model, tokenizer, prompt, max_new_tokens, 
+        orig_device, resq_device
     )
     
     results['generation'] = gen_results
@@ -417,35 +452,50 @@ def main():
     parser.add_argument("--prompt", default="Hello, how are you?", help="Test prompt")
     parser.add_argument("--layers", default="0,63", help="Comma-separated layer indices to compare")
     parser.add_argument("--max-tokens", type=int, default=20, help="Max tokens to generate")
-    parser.add_argument("--device", default="cpu", help="Device (cpu/cuda/npu)")
+    parser.add_argument("--orig-device", default="cpu", help="Device for original model (cpu recommended to avoid OOM)")
+    parser.add_argument("--resq-device", default="npu", help="Device for ResQ model (npu/cuda)")
+    # Keep --device for backward compatibility
+    parser.add_argument("--device", default=None, help="[Deprecated] Use --orig-device and --resq-device instead")
     args = parser.parse_args()
+    
+    # Handle device arguments
+    if args.device:
+        orig_device = args.device
+        resq_device = args.device
+    else:
+        orig_device = args.orig_device
+        resq_device = args.resq_device
     
     layers = [int(x) for x in args.layers.split(",")]
     
     print(f"Loading original model from {args.original}...")
+    print(f"  Device: {orig_device} (use CPU to avoid OOM)")
     orig_model = AutoModelForCausalLM.from_pretrained(
         args.original, 
         torch_dtype=torch.bfloat16,
         trust_remote_code=True,
-    ).to(args.device).eval()
+    ).to(orig_device).eval()
     tokenizer = AutoTokenizer.from_pretrained(args.original, trust_remote_code=True)
     
     print(f"Loading ResQ model...")
+    print(f"  Device: {resq_device}")
     resq_model = Qwen3ResQForCausalLM.from_resq_checkpoint(
         args.original,
         args.ckpt_a,
         args.ckpt_b,
-        args.device,
+        resq_device,
     ).eval()
     
     print(f"\n" + "=" * 60)
     print(f"Prompt: '{args.prompt}'")
     print(f"Layers to check: {layers}")
     print(f"Max generation tokens: {args.max_tokens}")
+    print(f"Original model: {orig_device} | ResQ model: {resq_device}")
     print("=" * 60 + "\n")
     
     results = compare_models(
-        orig_model, resq_model, tokenizer, args.prompt, layers, args.device, args.max_tokens
+        orig_model, resq_model, tokenizer, args.prompt, layers, 
+        orig_device, resq_device, args.max_tokens
     )
     
     # Summary
