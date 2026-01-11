@@ -445,7 +445,11 @@ class Qwen3ResQForCausalLM(nn.Module):
         return model.to(device)
     
     def _load_resq_weights(self, ckpt_a: Dict, ckpt_b: Dict, device: str, dtype: torch.dtype):
-        """Load ResQ weights from checkpoints"""
+        """Load ResQ weights from checkpoints
+        
+        Note: ResQ params (Hd, Uc, Pd) can be in either ckpt_a or ckpt_b.
+        msmodelslim puts them in ckpt_a, so we check ckpt_a first.
+        """
         # Embed (already fused with Ua)
         if 'model.embed_tokens.weight' in ckpt_a:
             self.embed_tokens.weight.data = ckpt_a['model.embed_tokens.weight'].to(device, dtype)
@@ -458,10 +462,14 @@ class Qwen3ResQForCausalLM(nn.Module):
         if 'model.norm.weight' in ckpt_a:
             self.norm.weight.data = ckpt_a['model.norm.weight'].to(device, dtype)
         
-        # Global ResQ params
-        Hd = ckpt_b.get('resq.Hd')
-        K = int(ckpt_b.get('resq.Hd_K', torch.tensor(100)).item())
-        blocksize = int(ckpt_b.get('resq.down_proj_blocksize', torch.tensor(256)).item())
+        # Global ResQ params - check ckpt_a first (msmodelslim), then ckpt_b
+        Hd = ckpt_a.get('resq.Hd') or ckpt_b.get('resq.Hd')
+        K_tensor = ckpt_a.get('resq.Hd_K') or ckpt_b.get('resq.Hd_K') or torch.tensor(100)
+        K = int(K_tensor.item()) if isinstance(K_tensor, torch.Tensor) else int(K_tensor)
+        blocksize_tensor = ckpt_a.get('resq.down_proj_blocksize') or ckpt_b.get('resq.down_proj_blocksize') or torch.tensor(256)
+        blocksize = int(blocksize_tensor.item()) if isinstance(blocksize_tensor, torch.Tensor) else int(blocksize_tensor)
+        
+        print(f"  ResQ params: K={K}, blocksize={blocksize}, Hd={'loaded' if Hd is not None else 'missing'}")
         
         # Load each layer
         for i, layer in enumerate(self.layers):
@@ -491,12 +499,12 @@ class Qwen3ResQForCausalLM(nn.Module):
                 if weight is not None:
                     getattr(layer.mlp, proj).weight.data = weight.to(device, dtype)
             
-            # Rotation matrices
-            Uc = ckpt_b.get(f'resq.layer.{i}.Uc')
+            # Rotation matrices - check ckpt_a first (msmodelslim), then ckpt_b
+            Uc = ckpt_a.get(f'resq.layer.{i}.Uc') or ckpt_b.get(f'resq.layer.{i}.Uc')
             if Uc is not None:
                 layer.self_attn.Uc = Uc.to(device, dtype)
             
-            Pd = ckpt_b.get(f'resq.layer.{i}.Pd')
+            Pd = ckpt_a.get(f'resq.layer.{i}.Pd') or ckpt_b.get(f'resq.layer.{i}.Pd')
             if Pd is not None:
                 layer.mlp.Pd = Pd.to(device, dtype)
             
@@ -505,7 +513,9 @@ class Qwen3ResQForCausalLM(nn.Module):
             layer.mlp.K = K
             layer.mlp.blocksize = blocksize
             
-            print(f"  Layer {i}: loaded weights and rotations")
+            if i == 0:
+                print(f"  Layer {i}: Uc={'loaded' if Uc is not None else 'missing'}, "
+                      f"Pd={'loaded' if Pd is not None else 'missing'}")
     
     def _dequantize_linear(self, ckpt: Dict, prefix: str) -> Optional[torch.Tensor]:
         """Dequantize a linear layer's weight"""

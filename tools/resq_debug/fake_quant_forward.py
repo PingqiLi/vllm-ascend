@@ -133,13 +133,17 @@ def inject_resq_transforms(model: nn.Module, transforms_path: str, device: str =
     This modifies the model in-place to add:
     1. Hadamard transforms before down_proj
     2. Uc rotation after RoPE for Q/K
+    
+    Note: transforms_path can be either checkpoint_A.pt (msmodelslim) or transforms_B.pt
     """
     transforms = torch.load(transforms_path, map_location='cpu')
     
     # Get global Hadamard params
     Hd = transforms.get('resq.Hd')
-    K = int(transforms.get('resq.Hd_K', torch.tensor(100)).item())
-    blocksize = int(transforms.get('resq.down_proj_blocksize', torch.tensor(256)).item())
+    K_tensor = transforms.get('resq.Hd_K') or torch.tensor(100)
+    K = int(K_tensor.item()) if isinstance(K_tensor, torch.Tensor) else int(K_tensor)
+    blocksize_tensor = transforms.get('resq.down_proj_blocksize') or torch.tensor(256)
+    blocksize = int(blocksize_tensor.item()) if isinstance(blocksize_tensor, torch.Tensor) else int(blocksize_tensor)
     
     print(f"Injecting ResQ transforms: K={K}, blocksize={blocksize}")
     print(f"  Hd shape: {Hd.shape if Hd is not None else 'None'}")
