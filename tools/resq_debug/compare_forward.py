@@ -14,15 +14,14 @@ Usage:
 """
 
 import argparse
-import math
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from .modeling_qwen3_resq import Qwen3ResQForCausalLM, Qwen3ResQConfig
+from .modeling_qwen3_resq import Qwen3ResQForCausalLM
 
 
 @dataclass
@@ -38,7 +37,8 @@ class ComparisonResult:
     
     def __str__(self):
         status = "✓" if self.passed else "✗"
-        return f"{status} {self.name}: corr={self.corr:.4f}, rel_err={self.rel_err:.4f}, scale={self.scale:.4f}"
+        warn = " ⚠" if not self.passed else ""
+        return f"{status} {self.name}: corr={self.corr:.4f}, rel_err={self.rel_err:.4f}{warn}, scale={self.scale:.4f}"
 
 
 def compute_comparison(orig: torch.Tensor, resq: torch.Tensor, 
@@ -75,227 +75,193 @@ def compute_comparison(orig: torch.Tensor, resq: torch.Tensor,
     )
 
 
-class ModelComparator:
-    """Compare original and ResQ model outputs"""
+class OriginalModelWrapper:
+    """Wrapper to capture activations from original model using hooks"""
     
-    def __init__(
-        self,
-        orig_model: torch.nn.Module,
-        resq_model: Qwen3ResQForCausalLM,
-        tokenizer,
-        device: str = "cpu",
-    ):
-        self.orig_model = orig_model.to(device).eval()
-        self.resq_model = resq_model.to(device).eval()
-        self.tokenizer = tokenizer
-        self.device = device
-        
-        # Get Ua from ResQ checkpoint for space conversion
-        self.Ua = self._extract_Ua()
-    
-    def _extract_Ua(self) -> Optional[torch.Tensor]:
-        """Extract Ua matrix from ResQ model (for converting between spaces)"""
-        # Ua is implicitly stored in the weight fusion
-        # For now, we'll compare in the same space directly
-        return None
+    def __init__(self, model):
+        self.model = model
+        self.activations = {}
     
     @torch.no_grad()
-    def compare_logits(self, prompt: str) -> ComparisonResult:
-        """Compare final logits"""
-        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
-        input_ids = inputs["input_ids"]
-        
-        # Original model
-        orig_out = self.orig_model(input_ids)
-        orig_logits = orig_out.logits if hasattr(orig_out, 'logits') else orig_out
-        
-        # ResQ model
-        resq_logits = self.resq_model(input_ids)
-        
-        return compute_comparison(orig_logits, resq_logits, "logits")
-    
-    @torch.no_grad()
-    def compare_layers(
-        self, 
-        prompt: str, 
-        layers: List[int],
-        verbose: bool = True,
-    ) -> Dict[int, Dict[str, ComparisonResult]]:
-        """Compare intermediate activations for specified layers"""
-        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
-        input_ids = inputs["input_ids"]
-        
-        results = {}
-        
-        # Run ResQ model with activation saving
-        _ = self.resq_model(input_ids, save_activations=True, save_layers=layers)
-        resq_acts = self.resq_model.activations
-        
-        # Run original model with hooks to capture activations
-        orig_acts = self._capture_original_activations(input_ids, layers)
-        
-        # Compare
-        for layer_idx in layers:
-            layer_results = {}
-            resq_layer = resq_acts.get(f'layer_{layer_idx}', {})
-            orig_layer = orig_acts.get(f'layer_{layer_idx}', {})
-            
-            if verbose:
-                print(f"\n--- Layer {layer_idx} ---")
-            
-            # Compare each activation
-            for key in ['input', 'input_ln', 'post_attn', 'post_attn_ln', 'output']:
-                if key in resq_layer and key in orig_layer:
-                    result = compute_comparison(orig_layer[key], resq_layer[key], key)
-                    layer_results[key] = result
-                    if verbose:
-                        print(f"  {result}")
-            
-            # Compare attention sub-activations
-            resq_attn = self.resq_model.model.layers[layer_idx].self_attn.activations
-            orig_attn = orig_acts.get(f'layer_{layer_idx}_attn', {})
-            for key in ['q_proj', 'k_proj', 'v_proj', 'o_proj']:
-                if key in resq_attn and key in orig_attn:
-                    result = compute_comparison(orig_attn[key], resq_attn[key], f"attn.{key}")
-                    layer_results[f'attn.{key}'] = result
-                    if verbose:
-                        print(f"  {result}")
-            
-            # Compare MLP sub-activations
-            resq_mlp = self.resq_model.model.layers[layer_idx].mlp.activations
-            orig_mlp = orig_acts.get(f'layer_{layer_idx}_mlp', {})
-            for key in ['gate', 'up', 'mlp_hidden', 'down']:
-                if key in resq_mlp and key in orig_mlp:
-                    result = compute_comparison(orig_mlp[key], resq_mlp[key], f"mlp.{key}")
-                    layer_results[f'mlp.{key}'] = result
-                    if verbose:
-                        print(f"  {result}")
-            
-            results[layer_idx] = layer_results
-        
-        # Compare logits
-        if verbose:
-            print("\n--- Logits ---")
-        logits_result = compute_comparison(
-            orig_acts.get('logits', torch.zeros(1)),
-            resq_acts.get('logits', torch.zeros(1)),
-            "logits"
-        )
-        results['logits'] = {'logits': logits_result}
-        if verbose:
-            print(f"  {logits_result}")
-        
-        return results
-    
-    def _capture_original_activations(
+    def forward_with_activations(
         self, 
         input_ids: torch.Tensor,
         layers: List[int],
-    ) -> Dict[str, torch.Tensor]:
-        """Capture activations from original model using hooks"""
-        activations = {}
+    ) -> torch.Tensor:
+        """Run forward and capture activations"""
+        self.activations = {}
         handles = []
         
-        # Get model backbone
-        model = self.orig_model.model if hasattr(self.orig_model, 'model') else self.orig_model
+        backbone = self.model.model
         
-        # Hook for embeddings
-        def embed_hook(module, input, output):
-            activations['embed'] = output.clone()
-        handles.append(model.embed_tokens.register_forward_hook(embed_hook))
+        # Embed hook
+        def embed_hook(m, inp, out):
+            self.activations['embed'] = out.clone()
+        handles.append(backbone.embed_tokens.register_forward_hook(embed_hook))
         
-        # Hooks for each layer
+        # Layer hooks
         for i in layers:
-            if i >= len(model.layers):
+            if i >= len(backbone.layers):
                 continue
-            layer = model.layers[i]
+            layer = backbone.layers[i]
             
-            # Layer input/output
-            def make_layer_hook(idx):
-                def hook(module, input, output):
-                    if isinstance(output, tuple):
-                        activations[f'layer_{idx}'] = {
-                            'output': output[0].clone()
-                        }
+            def make_hooks(idx):
+                hooks = []
+                
+                def input_ln_hook(m, inp, out):
+                    if f'layer_{idx}' not in self.activations:
+                        self.activations[f'layer_{idx}'] = {}
+                    self.activations[f'layer_{idx}']['input_ln'] = out.clone()
+                hooks.append(layer.input_layernorm.register_forward_hook(input_ln_hook))
+                
+                def post_attn_ln_hook(m, inp, out):
+                    self.activations[f'layer_{idx}']['post_attn_ln'] = out.clone()
+                hooks.append(layer.post_attention_layernorm.register_forward_hook(post_attn_ln_hook))
+                
+                # Attention
+                attn = layer.self_attn
+                for proj_name in ['q_proj', 'k_proj', 'v_proj', 'o_proj']:
+                    proj = getattr(attn, proj_name)
+                    def make_proj_hook(name):
+                        def hook(m, inp, out):
+                            if f'layer_{idx}_attn' not in self.activations:
+                                self.activations[f'layer_{idx}_attn'] = {}
+                            self.activations[f'layer_{idx}_attn'][name] = out.clone()
+                        return hook
+                    hooks.append(proj.register_forward_hook(make_proj_hook(proj_name)))
+                
+                # MLP
+                mlp = layer.mlp
+                for proj_name in ['gate_proj', 'up_proj', 'down_proj']:
+                    proj = getattr(mlp, proj_name)
+                    def make_mlp_hook(name):
+                        def hook(m, inp, out):
+                            if f'layer_{idx}_mlp' not in self.activations:
+                                self.activations[f'layer_{idx}_mlp'] = {}
+                            self.activations[f'layer_{idx}_mlp'][name] = out.clone()
+                        return hook
+                    hooks.append(proj.register_forward_hook(make_mlp_hook(proj_name)))
+                
+                # Layer output
+                def layer_hook(m, inp, out):
+                    if isinstance(out, tuple):
+                        self.activations[f'layer_{idx}']['output'] = out[0].clone()
                     else:
-                        activations[f'layer_{idx}'] = {
-                            'output': output.clone()
-                        }
-                return hook
-            handles.append(layer.register_forward_hook(make_layer_hook(i)))
+                        self.activations[f'layer_{idx}']['output'] = out.clone()
+                hooks.append(layer.register_forward_hook(layer_hook))
+                
+                return hooks
             
-            # Input LayerNorm
-            def make_ln_hook(idx, key):
-                def hook(module, input, output):
-                    if f'layer_{idx}' not in activations:
-                        activations[f'layer_{idx}'] = {}
-                    activations[f'layer_{idx}'][key] = output.clone()
-                return hook
-            handles.append(layer.input_layernorm.register_forward_hook(make_ln_hook(i, 'input_ln')))
-            handles.append(layer.post_attention_layernorm.register_forward_hook(make_ln_hook(i, 'post_attn_ln')))
-            
-            # Attention projections
-            attn = layer.self_attn
-            def make_attn_hook(idx, proj_name):
-                def hook(module, input, output):
-                    if f'layer_{idx}_attn' not in activations:
-                        activations[f'layer_{idx}_attn'] = {}
-                    activations[f'layer_{idx}_attn'][proj_name] = output.clone()
-                return hook
-            handles.append(attn.q_proj.register_forward_hook(make_attn_hook(i, 'q_proj')))
-            handles.append(attn.k_proj.register_forward_hook(make_attn_hook(i, 'k_proj')))
-            handles.append(attn.v_proj.register_forward_hook(make_attn_hook(i, 'v_proj')))
-            handles.append(attn.o_proj.register_forward_hook(make_attn_hook(i, 'o_proj')))
-            
-            # MLP projections
-            mlp = layer.mlp
-            def make_mlp_hook(idx, proj_name):
-                def hook(module, input, output):
-                    if f'layer_{idx}_mlp' not in activations:
-                        activations[f'layer_{idx}_mlp'] = {}
-                    activations[f'layer_{idx}_mlp'][proj_name] = output.clone()
-                return hook
-            handles.append(mlp.gate_proj.register_forward_hook(make_mlp_hook(i, 'gate')))
-            handles.append(mlp.up_proj.register_forward_hook(make_mlp_hook(i, 'up')))
-            handles.append(mlp.down_proj.register_forward_hook(make_mlp_hook(i, 'down')))
+            handles.extend(make_hooks(i))
         
         # Final norm
-        def final_norm_hook(module, input, output):
-            activations['final_norm'] = output.clone()
-        handles.append(model.norm.register_forward_hook(final_norm_hook))
+        def final_norm_hook(m, inp, out):
+            self.activations['final_norm'] = out.clone()
+        handles.append(backbone.norm.register_forward_hook(final_norm_hook))
         
         # LM head
-        if hasattr(self.orig_model, 'lm_head'):
-            def lm_head_hook(module, input, output):
-                activations['logits'] = output.clone()
-            handles.append(self.orig_model.lm_head.register_forward_hook(lm_head_hook))
+        def lm_head_hook(m, inp, out):
+            self.activations['logits'] = out.clone()
+        handles.append(self.model.lm_head.register_forward_hook(lm_head_hook))
         
-        # Run forward
-        with torch.no_grad():
-            _ = self.orig_model(input_ids)
+        # Forward
+        output = self.model(input_ids)
         
-        # Remove hooks
-        for handle in handles:
-            handle.remove()
+        # Cleanup
+        for h in handles:
+            h.remove()
         
-        return activations
+        return output.logits if hasattr(output, 'logits') else output
 
 
 def compare_models(
-    orig_model: torch.nn.Module,
+    orig_model,
     resq_model: Qwen3ResQForCausalLM,
     tokenizer,
     prompt: str,
-    layers: Optional[List[int]] = None,
+    layers: List[int],
     device: str = "cpu",
 ) -> Dict:
-    """Main comparison function"""
-    comparator = ModelComparator(orig_model, resq_model, tokenizer, device)
+    """Compare original and ResQ models"""
     
-    if layers is None:
-        layers = [0]
+    inputs = tokenizer(prompt, return_tensors="pt").to(device)
+    input_ids = inputs["input_ids"]
     
-    results = comparator.compare_layers(prompt, layers, verbose=True)
+    print(f"Input: '{prompt}' -> {input_ids.tolist()}")
+    print("=" * 60)
+    
+    # Run original model
+    orig_wrapper = OriginalModelWrapper(orig_model)
+    with torch.no_grad():
+        orig_logits = orig_wrapper.forward_with_activations(input_ids, layers)
+    orig_acts = orig_wrapper.activations
+    
+    # Run ResQ model
+    with torch.no_grad():
+        resq_logits = resq_model(input_ids, save_activations=True, save_layers=layers)
+    resq_acts = resq_model.activations
+    
+    results = {}
+    
+    # Compare embed
+    if 'embed' in orig_acts and 'embed' in resq_acts:
+        result = compute_comparison(orig_acts['embed'], resq_acts['embed'], 'embed')
+        results['embed'] = result
+        print(f"{result}")
+    
+    # Compare each layer
+    for layer_idx in layers:
+        print(f"\n--- Layer {layer_idx} ---")
+        layer_results = {}
+        
+        orig_layer = orig_acts.get(f'layer_{layer_idx}', {})
+        resq_layer_data = resq_acts.get(f'layer_{layer_idx}', {})
+        resq_layer = resq_layer_data.get('layer', {})
+        resq_attn = resq_layer_data.get('attn', {})
+        resq_mlp = resq_layer_data.get('mlp', {})
+        orig_attn = orig_acts.get(f'layer_{layer_idx}_attn', {})
+        orig_mlp = orig_acts.get(f'layer_{layer_idx}_mlp', {})
+        
+        # Layer-level
+        for key in ['input_ln', 'post_attn_ln', 'output']:
+            if key in orig_layer and key in resq_layer:
+                result = compute_comparison(orig_layer[key], resq_layer[key], key)
+                layer_results[key] = result
+                print(f"  {result}")
+        
+        # Attention
+        for key in ['q_proj', 'k_proj', 'v_proj', 'o_proj']:
+            if key in orig_attn and key in resq_attn:
+                result = compute_comparison(orig_attn[key], resq_attn[key], f'attn.{key}')
+                layer_results[f'attn.{key}'] = result
+                print(f"  {result}")
+        
+        # MLP
+        for key in ['gate', 'up', 'down']:
+            orig_key = key if key != 'gate' else 'gate'
+            mlp_key = key + '_proj' if key in ['gate', 'up'] else key
+            if mlp_key in orig_mlp and key in resq_mlp:
+                result = compute_comparison(orig_mlp[mlp_key], resq_mlp[key], f'mlp.{key}')
+                layer_results[f'mlp.{key}'] = result
+                print(f"  {result}")
+        
+        results[f'layer_{layer_idx}'] = layer_results
+    
+    # Compare logits
+    print(f"\n--- Logits ---")
+    if 'logits' in orig_acts and 'logits' in resq_acts:
+        result = compute_comparison(orig_acts['logits'], resq_acts['logits'], 'logits')
+        results['logits'] = result
+        print(f"  {result}")
+    
+    # Top tokens comparison
+    print(f"\n--- Top Predicted Tokens ---")
+    orig_top = orig_logits[0, -1].topk(5)
+    resq_top = resq_logits[0, -1].topk(5)
+    
+    print(f"  Original: {[tokenizer.decode([t]) for t in orig_top.indices.tolist()]}")
+    print(f"  ResQ:     {[tokenizer.decode([t]) for t in resq_top.indices.tolist()]}")
+    
     return results
 
 
@@ -316,30 +282,21 @@ def main():
         args.original, 
         torch_dtype=torch.bfloat16,
         trust_remote_code=True,
-    )
+    ).to(args.device).eval()
     tokenizer = AutoTokenizer.from_pretrained(args.original, trust_remote_code=True)
     
-    print(f"Loading ResQ model from checkpoints...")
-    # Create config from original model
-    orig_config = orig_model.config
-    resq_config = Qwen3ResQConfig(
-        hidden_size=orig_config.hidden_size,
-        intermediate_size=orig_config.intermediate_size,
-        num_attention_heads=orig_config.num_attention_heads,
-        num_key_value_heads=orig_config.num_key_value_heads,
-        num_hidden_layers=orig_config.num_hidden_layers,
-        head_dim=getattr(orig_config, 'head_dim', orig_config.hidden_size // orig_config.num_attention_heads),
-        vocab_size=orig_config.vocab_size,
-        rms_norm_eps=orig_config.rms_norm_eps,
-    )
-    
+    print(f"Loading ResQ model...")
     resq_model = Qwen3ResQForCausalLM.from_resq_checkpoint(
-        args.ckpt_a, args.ckpt_b, resq_config, args.device
-    )
+        args.original,
+        args.ckpt_a,
+        args.ckpt_b,
+        args.device,
+    ).eval()
     
-    print(f"\nComparing with prompt: '{args.prompt}'")
-    print(f"Layers to compare: {layers}")
-    print("=" * 60)
+    print(f"\n" + "=" * 60)
+    print(f"Comparing with prompt: '{args.prompt}'")
+    print(f"Layers: {layers}")
+    print("=" * 60 + "\n")
     
     results = compare_models(
         orig_model, resq_model, tokenizer, args.prompt, layers, args.device
@@ -351,13 +308,19 @@ def main():
     print("=" * 60)
     total_pass = 0
     total_fail = 0
-    for layer_key, layer_results in results.items():
-        for name, result in layer_results.items():
-            if result.passed:
+    for key, val in results.items():
+        if isinstance(val, ComparisonResult):
+            if val.passed:
                 total_pass += 1
             else:
                 total_fail += 1
-                print(f"  FAIL {layer_key}.{name}: rel_err={result.rel_err:.4f}, scale={result.scale:.4f}")
+                print(f"  FAIL {key}: {val}")
+        elif isinstance(val, dict):
+            for name, result in val.items():
+                if result.passed:
+                    total_pass += 1
+                else:
+                    total_fail += 1
     
     print(f"\nTotal: {total_pass} passed, {total_fail} failed")
 
