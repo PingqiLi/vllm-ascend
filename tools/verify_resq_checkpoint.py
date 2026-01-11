@@ -387,6 +387,77 @@ class ResQVerifier:
         self.results['embed'] = metrics
         return metrics
     
+    def verify_lm_head_and_final_norm(self) -> dict:
+        """Verify lm_head and final_norm fusion
+        
+        msmodelslim does:
+        1. fuse_ln_linear(model.model.norm, [model.lm_head]) - fuses gamma into lm_head
+        2. model.model.norm.weight = ones - sets gamma to 1
+        3. rotate_head(model, Ua) - lm_head_new = lm_head_fused @ Ua
+        
+        So the expected value is: (lm_head_O * gamma) @ Ua
+        
+        Returns:
+            Dict with final_norm and lm_head metrics
+        """
+        results = {}
+        
+        # Get the last layer's Ua (used for lm_head rotation)
+        num_layers = len([k for k in self.mgr.ckpt_b.keys() if 'P_a' in k and 'layer' in k])
+        last_layer_idx = num_layers - 1 if num_layers > 0 else 0
+        Ua = self.mgr.get_ua(last_layer_idx)
+        
+        # Final norm check: should be all ones after fusion
+        final_norm_A = self.mgr.ckpt_a.get('model.norm.weight')
+        final_norm_O = self.mgr.get_original('model.norm')
+        
+        if final_norm_A is not None:
+            ones = torch.ones_like(final_norm_A.float())
+            norm_diff = (final_norm_A.float() - ones).abs().max().item()
+            norm_mean = final_norm_A.float().mean().item()
+            is_ones = norm_diff < 0.01
+            results['final_norm'] = {
+                'is_ones': is_ones,
+                'max_diff_from_1': norm_diff,
+                'mean': norm_mean,
+                'status': '✓' if is_ones else '✗'
+            }
+            print(f"  Final norm gamma: mean={norm_mean:.4f}, max_diff_from_1={norm_diff:.4f} "
+                  f"{'✓ (correctly fused to 1)' if is_ones else '✗ (NOT fused!)'}")
+        
+        # LM head check: should match (lm_head_O * gamma) @ Ua
+        lm_head_A = self.mgr.ckpt_a.get('lm_head.weight')
+        lm_head_O = self.mgr.get_original('lm_head')
+        
+        if all(x is not None for x in [lm_head_A, lm_head_O, Ua, final_norm_O]):
+            # lm_head_O @ Ua (with gamma fusion)
+            lm_head_fused = lm_head_O.float() * final_norm_O.float().unsqueeze(0)  # [vocab, hidden] * [1, hidden]
+            expected = torch.matmul(lm_head_fused, Ua)
+            metrics = compute_metrics(lm_head_A, expected)
+            results['lm_head_with_gamma'] = metrics
+            
+            # Also check without gamma (in case msmodelslim didn't fuse)
+            expected_no_gamma = torch.matmul(lm_head_O.float(), Ua)
+            metrics_no_gamma = compute_metrics(lm_head_A, expected_no_gamma)
+            results['lm_head_no_gamma'] = metrics_no_gamma
+            
+            # Determine which matches better
+            better = 'with_gamma' if metrics['rel_err'] < metrics_no_gamma['rel_err'] else 'no_gamma'
+            results['lm_head_fusion'] = better
+            
+            print(f"  LM head (with gamma fusion): {format_metrics(metrics)}")
+            print(f"  LM head (without gamma):     {format_metrics(metrics_no_gamma)}")
+            print(f"  Better match: {better}")
+        elif lm_head_A is not None and lm_head_O is not None and Ua is not None:
+            # Just check basic rotation without gamma
+            expected = torch.matmul(lm_head_O.float(), Ua)
+            metrics = compute_metrics(lm_head_A, expected)
+            results['lm_head_no_gamma'] = metrics
+            print(f"  LM head: {format_metrics(metrics)}")
+        
+        self.results['lm_head_final_norm'] = results
+        return results
+    
     def verify_qkv(self, layer_idx: int, debug: bool = False) -> Dict[str, dict]:
         """Verify Q/K/V weight fusion with LayerNorm fusion
         
@@ -1137,6 +1208,11 @@ class ResQVerifier:
         all_results['embed'] = (msg, passed)
         if not summary_only:
             print(msg)
+        
+        # LM head and final norm (critical for correct output!)
+        print("\n--- LM Head & Final Norm 验证 ---")
+        lm_head_results = self.verify_lm_head_and_final_norm()
+        all_results['lm_head_final_norm'] = lm_head_results
         
         # Layer-wise weight verification
         for i in range(num_layers):
