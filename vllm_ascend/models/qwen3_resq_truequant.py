@@ -703,12 +703,18 @@ class Qwen3ResQTrueQuantForCausalLM(nn.Module):
             if param_name in params_dict:
                 param = params_dict[param_name]
                 weight_loader = getattr(param, 'weight_loader', default_weight_loader)
-                # DEBUG: Log norm weight loading
-                if 'q_norm' in param_name or 'input_layernorm' in param_name:
-                    logger.warning(f"[ResQ DEBUG] Loading {param_name}: param.device={param.device}, loaded_weight.device={loaded_weight.device}")
+                # DEBUG: Log critical weight loading
+                if param_name == 'norm.weight':
+                    # Final norm gamma - should be all 1s after fusion
+                    gamma_mean = loaded_weight.float().mean().item()
+                    gamma_max_diff = (loaded_weight.float() - 1.0).abs().max().item()
+                    logger.warning(f"[ResQ] Loading final_norm: mean={gamma_mean:.4f}, "
+                                  f"max_diff_from_1={gamma_max_diff:.4f} "
+                                  f"({'OK (fused)' if gamma_max_diff < 0.01 else 'WARNING: NOT fused!'})")
+                if param_name == 'lm_head.weight':
+                    lm_norm = loaded_weight.float().norm().item()
+                    logger.warning(f"[ResQ] Loading lm_head: shape={loaded_weight.shape}, ||weight||={lm_norm:.2f}")
                 weight_loader(param, loaded_weight)
-                if 'q_norm' in param_name or 'input_layernorm' in param_name:
-                    logger.warning(f"[ResQ DEBUG] After load {param_name}: param.device={param.device}")
         
         # Load layers - ResQ specific parts
         for i, layer in enumerate(self.layers):
