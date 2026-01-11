@@ -152,6 +152,9 @@ class Qwen3ResQAttention(nn.Module, ActivationTracker):
     ) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
         
+        # 保存 linear 之前的输入
+        self.save('qkv_input', hidden_states)  # Q/K/V proj 的共同输入
+        
         # Projections
         q = self.q_proj(hidden_states)
         k = self.k_proj(hidden_states)
@@ -231,6 +234,9 @@ class Qwen3ResQMLP(nn.Module, ActivationTracker):
         self.blocksize = 256
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 保存 gate/up proj 之前的输入
+        self.save('gate_up_input', x)
+        
         gate = self.gate_proj(x)
         up = self.up_proj(x)
         

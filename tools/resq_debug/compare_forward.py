@@ -120,6 +120,16 @@ class OriginalModelWrapper:
                 
                 # Attention
                 attn = layer.self_attn
+                
+                # 保存 QKV 输入 (用 q_proj 的输入，三者共享)
+                def make_qkv_input_hook(layer_idx):
+                    def hook(m, inp, out):
+                        if f'layer_{layer_idx}_attn' not in self.activations:
+                            self.activations[f'layer_{layer_idx}_attn'] = {}
+                        self.activations[f'layer_{layer_idx}_attn']['qkv_input'] = inp[0].clone()
+                    return hook
+                hooks.append(attn.q_proj.register_forward_hook(make_qkv_input_hook(idx)))
+                
                 for proj_name in ['q_proj', 'k_proj', 'v_proj', 'o_proj']:
                     proj = getattr(attn, proj_name)
                     def make_proj_hook(name):
@@ -132,6 +142,16 @@ class OriginalModelWrapper:
                 
                 # MLP
                 mlp = layer.mlp
+                
+                # 保存 gate/up 输入
+                def make_mlp_input_hook(layer_idx):
+                    def hook(m, inp, out):
+                        if f'layer_{layer_idx}_mlp' not in self.activations:
+                            self.activations[f'layer_{layer_idx}_mlp'] = {}
+                        self.activations[f'layer_{layer_idx}_mlp']['gate_up_input'] = inp[0].clone()
+                    return hook
+                hooks.append(mlp.gate_proj.register_forward_hook(make_mlp_input_hook(idx)))
+                
                 for proj_name in ['gate_proj', 'up_proj', 'down_proj']:
                     proj = getattr(mlp, proj_name)
                     def make_mlp_hook(name):
@@ -226,7 +246,13 @@ def compare_single_forward(
                 if verbose:
                     print(f"  {result}")
         
-        # Attention
+        # Attention - 先比较输入，再比较输出
+        if 'qkv_input' in orig_attn and 'qkv_input' in resq_attn:
+            result = compute_comparison(orig_attn['qkv_input'], resq_attn['qkv_input'], 'attn.qkv_input')
+            layer_results['attn.qkv_input'] = result
+            if verbose:
+                print(f"  {result}")
+        
         for key in ['q_proj', 'k_proj', 'v_proj', 'o_proj']:
             if key in orig_attn and key in resq_attn:
                 result = compute_comparison(orig_attn[key], resq_attn[key], f'attn.{key}')
@@ -234,7 +260,13 @@ def compare_single_forward(
                 if verbose:
                     print(f"  {result}")
         
-        # MLP
+        # MLP - 先比较输入，再比较输出
+        if 'gate_up_input' in orig_mlp and 'gate_up_input' in resq_mlp:
+            result = compute_comparison(orig_mlp['gate_up_input'], resq_mlp['gate_up_input'], 'mlp.gate_up_input')
+            layer_results['mlp.gate_up_input'] = result
+            if verbose:
+                print(f"  {result}")
+        
         for key in ['gate', 'up', 'down']:
             orig_key = key if key != 'gate' else 'gate'
             mlp_key = key + '_proj' if key in ['gate', 'up'] else key
