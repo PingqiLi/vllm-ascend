@@ -265,7 +265,7 @@ class ResQModelRunner:
         return activations
 
 
-def compare_activations(orig_file: str, resq_file: str):
+def compare_activations(orig_file: str, resq_file: str, summary_only: bool = False):
     """Compare saved activations from two files"""
     print(f"Loading original activations from {orig_file}...")
     orig = torch.load(orig_file, map_location='cpu')
@@ -273,22 +273,42 @@ def compare_activations(orig_file: str, resq_file: str):
     print(f"Loading ResQ activations from {resq_file}...")
     resq = torch.load(resq_file, map_location='cpu')
     
+    # Auto-detect layers from saved data
+    orig_layers = orig.get('layers', [])
+    resq_layers = resq.get('layers', [])
+    
+    # Find common layers
+    if orig_layers and resq_layers:
+        layers = sorted(set(orig_layers) & set(resq_layers))
+    else:
+        # Fallback: detect from keys
+        orig_layer_keys = [k for k in orig.keys() if k.startswith('layer_') and '_attn' not in k and '_mlp' not in k]
+        resq_layer_keys = [k for k in resq.keys() if k.startswith('layer_') and '_attn' not in k and '_mlp' not in k]
+        orig_layer_nums = sorted(set(int(k.split('_')[1]) for k in orig_layer_keys))
+        resq_layer_nums = sorted(set(int(k.split('_')[1]) for k in resq_layer_keys))
+        layers = sorted(set(orig_layer_nums) & set(resq_layer_nums))
+    
     print(f"\nPrompt: '{orig.get('prompt', 'unknown')}'")
-    print(f"Layers: {orig.get('layers', [])}")
+    print(f"Comparing {len(layers)} layers: {layers[0]}...{layers[-1]}" if len(layers) > 5 else f"Comparing layers: {layers}")
     print("=" * 60)
     
     results = []
+    layer_results = {}  # For per-layer summary
     
     # Embed
     if 'embed' in orig and 'embed' in resq:
         result = compute_comparison(orig['embed'], resq['embed'], 'embed')
         results.append(result)
-        print(f"{result}")
+        if not summary_only:
+            print(f"{result}")
     
     # Layers
-    layers = orig.get('layers', [])
     for layer_idx in layers:
-        print(f"\n--- Layer {layer_idx} ---")
+        layer_passed = 0
+        layer_failed = 0
+        
+        if not summary_only:
+            print(f"\n--- Layer {layer_idx} ---")
         
         orig_layer = orig.get(f'layer_{layer_idx}', {})
         orig_attn = orig.get(f'layer_{layer_idx}_attn', {})
@@ -304,38 +324,67 @@ def compare_activations(orig_file: str, resq_file: str):
             if key in orig_layer and key in resq_layer:
                 result = compute_comparison(orig_layer[key], resq_layer[key], key)
                 results.append(result)
-                print(f"  {result}")
+                if result.passed:
+                    layer_passed += 1
+                else:
+                    layer_failed += 1
+                if not summary_only:
+                    print(f"  {result}")
         
         # Attention
         if 'q_proj_input' in orig_attn and 'qkv_input' in resq_attn:
             result = compute_comparison(orig_attn['q_proj_input'], resq_attn['qkv_input'], 'attn.qkv_input')
             results.append(result)
-            print(f"  {result}")
+            if result.passed:
+                layer_passed += 1
+            else:
+                layer_failed += 1
+            if not summary_only:
+                print(f"  {result}")
         
         for key in ['q_proj', 'k_proj', 'v_proj', 'o_proj']:
             if key in orig_attn and key in resq_attn:
                 result = compute_comparison(orig_attn[key], resq_attn[key], f'attn.{key}')
                 results.append(result)
-                print(f"  {result}")
+                if result.passed:
+                    layer_passed += 1
+                else:
+                    layer_failed += 1
+                if not summary_only:
+                    print(f"  {result}")
         
         # MLP
         if 'gate_proj_input' in orig_mlp and 'gate_up_input' in resq_mlp:
             result = compute_comparison(orig_mlp['gate_proj_input'], resq_mlp['gate_up_input'], 'mlp.gate_up_input')
             results.append(result)
-            print(f"  {result}")
+            if result.passed:
+                layer_passed += 1
+            else:
+                layer_failed += 1
+            if not summary_only:
+                print(f"  {result}")
         
         for orig_key, resq_key in [('gate_proj', 'gate'), ('up_proj', 'up'), ('down_proj', 'down')]:
             if orig_key in orig_mlp and resq_key in resq_mlp:
                 result = compute_comparison(orig_mlp[orig_key], resq_mlp[resq_key], f'mlp.{resq_key}')
                 results.append(result)
-                print(f"  {result}")
+                if result.passed:
+                    layer_passed += 1
+                else:
+                    layer_failed += 1
+                if not summary_only:
+                    print(f"  {result}")
+        
+        layer_results[layer_idx] = {'passed': layer_passed, 'failed': layer_failed}
     
     # Logits
     if 'logits' in orig and 'logits' in resq:
-        print(f"\n--- Logits ---")
+        if not summary_only:
+            print(f"\n--- Logits ---")
         result = compute_comparison(orig['logits'], resq['logits'], 'logits')
         results.append(result)
-        print(f"  {result}")
+        if not summary_only:
+            print(f"  {result}")
     
     # Generation comparison
     print(f"\n--- Generation ---")
@@ -347,24 +396,52 @@ def compare_activations(orig_file: str, resq_file: str):
     print(f"  Original: '{orig_text}'")
     print(f"  ResQ:     '{resq_text}'")
     
+    token_match_rate = 0
     if orig_tokens and resq_tokens:
         matches = sum(o == r for o, r in zip(orig_tokens, resq_tokens))
         total = max(len(orig_tokens), len(resq_tokens))
-        print(f"  Token match: {matches}/{total} ({100*matches/total:.1f}%)")
+        token_match_rate = matches / total
+        print(f"  Token match: {matches}/{total} ({100*token_match_rate:.1f}%)")
     
     # Summary
     print("\n" + "=" * 60)
     print("Summary")
     print("=" * 60)
-    passed = sum(1 for r in results if r.passed)
-    failed = sum(1 for r in results if not r.passed)
-    print(f"Passed: {passed}, Failed: {failed}")
     
-    if failed > 0:
-        print("\nFailed checks:")
+    total_passed = sum(1 for r in results if r.passed)
+    total_failed = sum(1 for r in results if not r.passed)
+    print(f"Total checks: {total_passed} passed, {total_failed} failed")
+    
+    # Per-layer summary
+    if summary_only and layer_results:
+        print(f"\nPer-layer summary:")
+        failed_layers = [idx for idx, lr in layer_results.items() if lr['failed'] > 0]
+        passed_layers = [idx for idx, lr in layer_results.items() if lr['failed'] == 0]
+        print(f"  Layers all passed: {len(passed_layers)}")
+        if failed_layers:
+            print(f"  Layers with failures: {failed_layers}")
+    
+    if total_failed > 0:
+        print("\nFailed checks (first 20):")
+        count = 0
         for r in results:
             if not r.passed:
                 print(f"  {r}")
+                count += 1
+                if count >= 20:
+                    remaining = total_failed - 20
+                    if remaining > 0:
+                        print(f"  ... and {remaining} more failures")
+                    break
+    
+    # Final verdict
+    print("\n" + "=" * 60)
+    if total_failed == 0 and token_match_rate >= 0.9:
+        print("✓ PASS: All activation checks passed, generation matches")
+    elif total_failed == 0:
+        print(f"⚠ PARTIAL: Activations OK but generation only {token_match_rate*100:.0f}% match")
+    else:
+        print(f"✗ FAIL: {total_failed} activation checks failed")
 
 
 def main():
@@ -379,7 +456,7 @@ def main():
     
     # Run args
     parser.add_argument("--prompt", default="Hello, how are you?", help="Test prompt")
-    parser.add_argument("--layers", default="0,63", help="Layers to check")
+    parser.add_argument("--layers", default="all", help="Layers to check: 'all' or comma-separated indices like '0,15,31'")
     parser.add_argument("--max-tokens", type=int, default=20, help="Max tokens to generate")
     parser.add_argument("--device", default="cpu", help="Device")
     
@@ -388,19 +465,34 @@ def main():
     parser.add_argument("--orig-file", help="Original activations file (for compare mode)")
     parser.add_argument("--resq-file", help="ResQ activations file (for compare mode)")
     
+    # Compare args
+    parser.add_argument("--summary-only", action="store_true", help="Only show summary, hide per-layer details")
+    
     args = parser.parse_args()
     
-    layers = [int(x) for x in args.layers.split(",")]
+    # Parse layers - 'all' means None (will be resolved after model loading)
+    if args.layers.lower() == 'all':
+        layers = None  # Will be set to all layers after model loads
+    else:
+        layers = [int(x) for x in args.layers.split(",")]
     
     if args.mode == "original":
         if not args.model or not args.output:
             parser.error("--model and --output required for original mode")
         
         runner = OriginalModelRunner(args.model, args.device)
+        
+        # If layers is None (all), get all layer indices
+        if layers is None:
+            num_layers = len(runner.model.model.layers)
+            layers = list(range(num_layers))
+            print(f"Saving activations for all {num_layers} layers")
+        
         activations = runner.run(args.prompt, layers, args.max_tokens)
         
         print(f"\nSaving activations to {args.output}...")
         torch.save(activations, args.output)
+        print(f"Saved {len(layers)} layers")
         print(f"Generated text: '{activations['generated_text']}'")
         print("Done!")
         
@@ -409,10 +501,18 @@ def main():
             parser.error("--model, --ckpt-a, --ckpt-b, and --output required for resq mode")
         
         runner = ResQModelRunner(args.model, args.ckpt_a, args.ckpt_b, args.device)
+        
+        # If layers is None (all), get all layer indices
+        if layers is None:
+            num_layers = len(runner.model.layers)
+            layers = list(range(num_layers))
+            print(f"Saving activations for all {num_layers} layers")
+        
         activations = runner.run(args.prompt, layers, args.max_tokens)
         
         print(f"\nSaving activations to {args.output}...")
         torch.save(activations, args.output)
+        print(f"Saved {len(layers)} layers")
         print(f"Generated text: '{activations['generated_text']}'")
         print("Done!")
         
@@ -420,7 +520,7 @@ def main():
         if not args.orig_file or not args.resq_file:
             parser.error("--orig-file and --resq-file required for compare mode")
         
-        compare_activations(args.orig_file, args.resq_file)
+        compare_activations(args.orig_file, args.resq_file, args.summary_only)
 
 
 if __name__ == "__main__":
