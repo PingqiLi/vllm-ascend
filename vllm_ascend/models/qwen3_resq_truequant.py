@@ -675,10 +675,18 @@ class Qwen3ResQTrueQuantForCausalLM(nn.Module):
         # Load global ResQ parameters (stored as attributes, not in state_dict)
         if 'resq.Hd' in weights_dict:
             self.resq_Hd = weights_dict['resq.Hd'].to(target_device)
+            # Debug: verify Hd is correctly loaded
+            hd_max = self.resq_Hd.abs().max().item()
+            hd_min = self.resq_Hd.abs().min().item()
+            logger.warning(f"[ResQ] Loaded Hd: shape={self.resq_Hd.shape}, "
+                          f"abs_max={hd_max:.4f}, abs_min={hd_min:.4f}, "
+                          f"expected ~0.1 for normalized Hd (1/sqrt(K))")
         if 'resq.Hd_K' in weights_dict:
             self.resq_Hd_K = int(weights_dict['resq.Hd_K'].item())
+            logger.warning(f"[ResQ] Loaded Hd_K={self.resq_Hd_K}")
         if 'resq.down_proj_blocksize' in weights_dict:
             self.resq_blocksize = int(weights_dict['resq.down_proj_blocksize'].item())
+            logger.warning(f"[ResQ] Loaded blocksize={self.resq_blocksize}")
         
         # Load standard parameters using default_weight_loader (handles device correctly)
         # This includes: embed_tokens, all norms, lm_head

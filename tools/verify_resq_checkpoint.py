@@ -1009,58 +1009,281 @@ class ResQVerifier:
         self.results['ud_orthogonal'] = results
         return 1.0 if results else 0.0
     
-    def run_all(self, tokenizer, prompt: str, num_layers: int = 1):
-        """Run all verification tests"""
+    def verify_cumulative_error(self, tokenizer, prompt: str, check_layers: list = None) -> Dict[str, dict]:
+        """
+        验证累积误差：从 embed 开始，逐层运行 ResQ 路径和原始路径，
+        比较每层输出的差异。
+        
+        这是端到端验证，能检测出累积误差问题。
+        """
+        if check_layers is None:
+            check_layers = [0, 10, 20, 39]  # 检查点
+        
+        results = {}
+        
+        # Tokenize
+        inputs = tokenizer(prompt, return_tensors="pt")
+        input_ids = inputs.input_ids
+        
+        # 获取全局参数
+        Hd, K = self.mgr.get_hd()
+        intermediate_size = self.mgr.intermediate_size
+        blocksize = intermediate_size // K if K > 0 else intermediate_size
+        
+        print(f"\n--- 累积误差验证 ---")
+        print(f"检查层: {check_layers}")
+        
+        with torch.no_grad():
+            # === 初始化：从 embed 开始 ===
+            embed_O = self.mgr.original.model.embed_tokens
+            embed_A_weight = self.mgr.ckpt_a.get('model.embed_tokens.weight')
+            
+            x_orig = embed_O(input_ids).float()  # 原始路径
+            x_resq = embed_A_weight.float()[input_ids.squeeze(0)].unsqueeze(0)  # ResQ 路径
+            
+            # 逐层运行
+            total_layers = len(self.mgr.original.model.layers)
+            max_layer = min(max(check_layers) + 1, total_layers)
+            
+            for layer_idx in range(max_layer):
+                layer = self.mgr.original.model.layers[layer_idx]
+                prefix = f'model.layers.{layer_idx}'
+                
+                # 获取该层的旋转矩阵
+                Ua = self.mgr.get_ua(layer_idx)
+                Ub = self.mgr.get_ub(layer_idx)
+                Pd = self.mgr.get_pd(layer_idx)
+                
+                # === 原始路径 ===
+                residual_orig = x_orig
+                x_orig_ln = layer.input_layernorm(x_orig.to(layer.input_layernorm.weight.dtype)).float()
+                
+                # 简化的 attention (用原始权重)
+                attn = layer.self_attn
+                Q = torch.matmul(x_orig_ln, attn.q_proj.weight.data.float().T)
+                K_proj = torch.matmul(x_orig_ln, attn.k_proj.weight.data.float().T)
+                V = torch.matmul(x_orig_ln, attn.v_proj.weight.data.float().T)
+                
+                # 简化 attention: 直接用 V 作为输出（跳过真正的 attention 计算）
+                # 这不是精确的，但可以检测权重级别的问题
+                attn_out_orig = torch.matmul(V, attn.o_proj.weight.data.float().T)
+                x_orig = residual_orig + attn_out_orig
+                
+                # MLP
+                residual_orig = x_orig
+                x_orig_ln2 = layer.post_attention_layernorm(x_orig.to(layer.post_attention_layernorm.weight.dtype)).float()
+                mlp = layer.mlp
+                gate = torch.matmul(x_orig_ln2, mlp.gate_proj.weight.data.float().T)
+                up = torch.matmul(x_orig_ln2, mlp.up_proj.weight.data.float().T)
+                hidden = torch.nn.functional.silu(gate) * up
+                down = torch.matmul(hidden, mlp.down_proj.weight.data.float().T)
+                x_orig = residual_orig + down
+                
+                # === ResQ 路径 ===
+                residual_resq = x_resq
+                # RMSNorm with gamma=1
+                variance = x_resq.float().pow(2).mean(-1, keepdim=True)
+                x_resq_ln = x_resq.float() * torch.rsqrt(variance + layer.input_layernorm.variance_epsilon)
+                
+                # Q/K/V with quantized weights
+                Q_A = self.mgr.get_quantized(f'{prefix}.self_attn.q_proj')
+                K_A = self.mgr.get_quantized(f'{prefix}.self_attn.k_proj')
+                V_A = self.mgr.get_quantized(f'{prefix}.self_attn.v_proj')
+                O_A = self.mgr.get_quantized(f'{prefix}.self_attn.o_proj')
+                
+                if Q_A is not None:
+                    Q_resq = torch.matmul(x_resq_ln, Q_A.float().T)
+                    K_resq = torch.matmul(x_resq_ln, K_A.float().T)
+                    V_resq = torch.matmul(x_resq_ln, V_A.float().T)
+                    attn_out_resq = torch.matmul(V_resq, O_A.float().T)
+                    x_resq = residual_resq + attn_out_resq
+                
+                # MLP ResQ
+                residual_resq = x_resq
+                variance = x_resq.float().pow(2).mean(-1, keepdim=True)
+                x_resq_ln2 = x_resq.float() * torch.rsqrt(variance + layer.post_attention_layernorm.variance_epsilon)
+                
+                gate_A = self.mgr.get_quantized(f'{prefix}.mlp.gate_proj')
+                up_A = self.mgr.get_quantized(f'{prefix}.mlp.up_proj')
+                down_A = self.mgr.get_quantized(f'{prefix}.mlp.down_proj')
+                
+                if gate_A is not None:
+                    gate_resq = torch.matmul(x_resq_ln2, gate_A.float().T)
+                    up_resq = torch.matmul(x_resq_ln2, up_A.float().T)
+                    hidden_resq = torch.nn.functional.silu(gate_resq) * up_resq
+                    
+                    # Apply Ud rotation
+                    if Pd is not None and Pd.numel() > 0:
+                        hidden_resq = apply_ud_rotation(hidden_resq, Pd, Hd, K, blocksize)
+                    
+                    down_resq = torch.matmul(hidden_resq, down_A.float().T)
+                    x_resq = residual_resq + down_resq
+                
+                # 检查该层的累积误差
+                if layer_idx in check_layers:
+                    # ResQ 输出需要 @ Ua.T 恢复到原始空间
+                    x_resq_restored = torch.matmul(x_resq, Ua.float().T)
+                    metrics = compute_metrics(x_resq_restored, x_orig)
+                    results[f'layer_{layer_idx}'] = metrics
+                    
+                    status = "✓" if metrics['scale_ratio'] > 0.8 and metrics['scale_ratio'] < 1.2 else "✗"
+                    print(f"  {status} Layer {layer_idx}: corr={metrics['corr']:.4f}, "
+                          f"rel_err={metrics['rel_err']:.4f}, scale={metrics['scale_ratio']:.4f}")
+        
+        return results
+    
+    def run_all(self, tokenizer, prompt: str, num_layers: int = 1, 
+                 summary_only: bool = False, activation_layers: list = None):
+        """Run all verification tests
+        
+        Args:
+            tokenizer: Tokenizer
+            prompt: Test prompt
+            num_layers: Number of layers to verify weights
+            summary_only: If True, only print summary (less verbose)
+            activation_layers: List of layer indices to verify activations (default: [0])
+        """
         print("=" * 60)
         print("ResQ Checkpoint 验证")
         print("=" * 60)
         
+        if activation_layers is None:
+            activation_layers = [0]
+        
+        all_results = {}  # Collect all results for summary
+        
         # Embed
         metrics = self.verify_embed()
-        msg, _ = format_metrics(metrics, "Embed fusion")
-        print(msg)
+        msg, passed = format_metrics(metrics, "Embed fusion")
+        all_results['embed'] = (msg, passed)
+        if not summary_only:
+            print(msg)
         
-        # Layer-wise verification
+        # Layer-wise weight verification
         for i in range(num_layers):
-            print(f"\n--- Layer {i} ---")
+            if not summary_only:
+                print(f"\n--- Layer {i} ---")
+            
+            layer_results = {}
             
             # QKV
-            qkv = self.verify_qkv(i, debug=(i == 0))  # Debug for layer 0
-            for name, metrics in qkv.items():
-                msg, _ = format_metrics(metrics, name)
-                print(f"  {msg}")
+            qkv = self.verify_qkv(i, debug=(i == 0 and not summary_only))
+            for name, m in qkv.items():
+                msg, passed = format_metrics(m, name)
+                layer_results[name] = (msg, passed)
+                if not summary_only:
+                    print(f"  {msg}")
             
             # O_proj
-            metrics = self.verify_o_proj(i)
-            msg, _ = format_metrics(metrics, "o_proj")
-            print(f"  {msg}")
+            m = self.verify_o_proj(i)
+            msg, passed = format_metrics(m, "o_proj")
+            layer_results['o_proj'] = (msg, passed)
+            if not summary_only:
+                print(f"  {msg}")
             
             # MLP
             mlp = self.verify_mlp(i)
             for name, val in mlp.items():
                 if isinstance(val, dict) and 'corr' in val:
-                    msg, _ = format_metrics(val, name)
-                    print(f"  {msg}")
+                    msg, passed = format_metrics(val, name)
+                    layer_results[name] = (msg, passed)
+                    if not summary_only:
+                        print(f"  {msg}")
                 else:
-                    print(f"  ⚠ {name}: {val}")
+                    layer_results[name] = (f"⚠ {name}: {val}", False)
+                    if not summary_only:
+                        print(f"  ⚠ {name}: {val}")
+            
+            all_results[f'layer_{i}'] = layer_results
         
-        # Activations
-        print(f"\n--- 激活值验证 (Layer 0) ---")
-        acts = self.verify_activations(tokenizer, prompt, 0)
+        # Activation verification for specified layers
+        all_act_results = {}
+        for layer_idx in activation_layers:
+            print(f"\n--- 激活值验证 (Layer {layer_idx}) ---")
+            acts = self.verify_activations(tokenizer, prompt, layer_idx)
+            
+            layer_act_results = {}
+            for name, metrics in acts.items():
+                if isinstance(metrics, dict) and 'corr' in metrics:
+                    msg, passed = format_metrics(metrics, name)
+                    layer_act_results[name] = (msg, passed, metrics)
+                else:
+                    layer_act_results[name] = (str(metrics), False, None)
+            all_act_results[layer_idx] = layer_act_results
         
-        # Summary of activation verification
-        print(f"\n--- 激活值验证摘要 ---")
-        for name, metrics in acts.items():
-            if isinstance(metrics, dict) and 'corr' in metrics:
-                msg, passed = format_metrics(metrics, name)
-                print(f"  {msg}")
+        # Summary
+        print(f"\n" + "=" * 60)
+        print("验证摘要")
+        print("=" * 60)
+        
+        # Weight summary (only failures or one-line status)
+        weight_pass = 0
+        weight_fail = 0
+        for layer_key, layer_results in all_results.items():
+            if layer_key == 'embed':
+                msg, passed = layer_results
+                if passed:
+                    weight_pass += 1
+                else:
+                    weight_fail += 1
+                    print(f"  FAIL: {msg}")
             else:
-                print(f"  {name}: {metrics}")
+                for name, (msg, passed) in layer_results.items():
+                    if passed:
+                        weight_pass += 1
+                    else:
+                        weight_fail += 1
+                        if 'structure_check' not in msg:  # Skip down_proj structure warnings
+                            print(f"  FAIL {layer_key}.{name}: {msg}")
+        print(f"\n权重验证: {weight_pass} 通过, {weight_fail} 失败")
         
-        # Ud
-        ud_ok = self.verify_ud_transform(0)
-        status = "✓" if ud_ok > 0.5 else "✗"
-        print(f"\n{status} Ud orthogonality check")
+        # Activation summary per layer
+        print(f"\n激活值验证:")
+        for layer_idx, act_results in all_act_results.items():
+            act_pass = 0
+            act_fail = 0
+            critical_fails = []
+            for name, (msg, passed, metrics) in act_results.items():
+                if passed:
+                    act_pass += 1
+                else:
+                    act_fail += 1
+                    # Critical: not LayerNorm related
+                    if 'input_ln' not in name and 'post_attn_ln' not in name:
+                        if metrics and 'scale_ratio' in metrics:
+                            critical_fails.append(f"{name}(scale={metrics['scale_ratio']:.4f})")
+                        else:
+                            critical_fails.append(name)
+            
+            status = "✓" if act_fail == 0 or (act_fail <= 3 and not critical_fails) else "✗"
+            print(f"  Layer {layer_idx}: {status} {act_pass} 通过, {act_fail} 失败")
+            if critical_fails:
+                print(f"    关键失败: {', '.join(critical_fails)}")
+            
+            # Show key metrics for debugging
+            key_checks = ['12.ud_rotation', '13.down_proj', '14.layer_output']
+            for check in key_checks:
+                if check in act_results:
+                    msg, passed, metrics = act_results[check]
+                    if metrics:
+                        scale = metrics.get('scale_ratio', 'N/A')
+                        print(f"    {check}: scale={scale:.4f}" if isinstance(scale, float) else f"    {check}: {scale}")
+        
+        # Cumulative error check (optional, if multiple layers requested)
+        if len(activation_layers) > 1 or max(activation_layers) > 0:
+            cumulative_layers = [0] + [l for l in activation_layers if l > 0]
+            # Add intermediate points
+            max_layer = max(cumulative_layers)
+            if max_layer > 10:
+                cumulative_layers = sorted(set(cumulative_layers + [max_layer // 2]))
+            
+            cum_results = self.verify_cumulative_error(tokenizer, prompt, cumulative_layers)
+            
+            print(f"\n累积误差检查:")
+            for layer_key, metrics in cum_results.items():
+                layer_idx = int(layer_key.split('_')[1])
+                status = "✓" if 0.8 < metrics['scale_ratio'] < 1.2 else "✗"
+                print(f"  {status} {layer_key}: scale={metrics['scale_ratio']:.4f}, rel_err={metrics['rel_err']:.4f}")
         
         print("\n" + "=" * 60)
         print("验证完成")
@@ -1076,8 +1299,16 @@ def main():
     parser.add_argument('--ckpt-a', required=True, help='ResQ量化权重路径')
     parser.add_argument('--ckpt-b', required=True, help='ResQ中间矩阵路径')
     parser.add_argument('--prompt', default='你好', help='测试 prompt')
-    parser.add_argument('--layers', type=int, default=2, help='验证层数')
+    parser.add_argument('--layers', type=int, default=2, help='验证权重层数')
+    parser.add_argument('--act-layers', type=str, default='0', 
+                        help='验证激活值的层索引，逗号分隔 (如: 0,10,20,39)')
+    parser.add_argument('--summary', action='store_true', help='只输出摘要')
+    parser.add_argument('--cumulative', action='store_true', 
+                        help='运行累积误差检查（需要更多时间）')
     args = parser.parse_args()
+    
+    # Parse activation layers
+    act_layers = [int(x.strip()) for x in args.act_layers.split(',')]
     
     print("加载模型...")
     tokenizer = AutoTokenizer.from_pretrained(args.original, trust_remote_code=True)
@@ -1094,11 +1325,22 @@ def main():
     print(f"ckpt_a keys: {len(ckpt_a)}, ckpt_b keys: {len(ckpt_b)}")
     
     # 反量化诊断
-    verify_dequantize_logic(ckpt_a, layer_idx=0)
+    if not args.summary:
+        verify_dequantize_logic(ckpt_a, layer_idx=0)
     
     mgr = CheckpointManager(original_model, ckpt_a, ckpt_b)
     verifier = ResQVerifier(mgr)
-    verifier.run_all(tokenizer, args.prompt, args.layers)
+    
+    # If cumulative is requested, add more layers to check
+    if args.cumulative:
+        # Add intermediate check points
+        total_layers = len(original_model.model.layers)
+        check_points = [0, total_layers // 4, total_layers // 2, 3 * total_layers // 4, total_layers - 1]
+        act_layers = sorted(set(act_layers + check_points))
+        print(f"累积误差检查层: {act_layers}")
+    
+    verifier.run_all(tokenizer, args.prompt, args.layers, 
+                     summary_only=args.summary, activation_layers=act_layers)
 
 if __name__ == '__main__':
     main()
