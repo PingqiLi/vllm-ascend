@@ -269,16 +269,21 @@ class Qwen3ResQMLP(nn.Module):
         # 2a. Apply H_butterfly (symmetric, so H = H.T)
         x = hadamard_transform(x)  # acts on last dim (blocksize)
         
-        # 2b. Apply Hd on K dimension: x @ Hd
+        # 2b. Apply Hd on K dimension: x @ Hd.T (Inverse of fusion)
+        # H(100) is NOT symmetric, so we must use transpose to invert fusion (which uses H).
         # x shape: [batch, K, blocksize]
-        # Transpose to [batch, blocksize, K], multiply by Hd, transpose back
+        # Transpose to [batch, blocksize, K], multiply by Hd.T, transpose back
         Hd_f32 = self.Hd.to(x.device, torch.float32)
         x = x.transpose(-1, -2)  # [batch, blocksize, K]
-        x = torch.matmul(x, Hd_f32)  # [batch, blocksize, K] @ [K, K]
+        # We need x_new @ H = x, so x_new = x @ H.T
+        x = torch.matmul(x, Hd_f32.t())  # [batch, blocksize, K] @ [K, K]
         x = x.transpose(-1, -2)  # [batch, K, blocksize]
         
         # Step 3: Normalize
-        x = x / math.sqrt(n)
+        # msmodelslim matmul_hadU_cpu applies 1/sqrt(K) scaling (divides by sqrt(n) instead of sqrt(blocksize))
+        # vllm also applies 1/sqrt(K) scaling here.
+        # Total scaling is 1/K. We must compensate by multiplying by K.
+        x = x * self.K / math.sqrt(n)
         
         return x.reshape(original_shape).to(dtype)
 
