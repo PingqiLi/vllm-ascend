@@ -30,6 +30,7 @@ from .w8a8 import (AscendC8KVCacheMethod, AscendW8A8FusedMoEMethod,
                    AscendW8A8LinearMethod)
 from .w8a8_dynamic import (AscendW8A8DynamicFusedMoEMethod,
                            AscendW8A8DynamicLinearMethod)
+from .w8a16 import AscendW8A16LinearMethod
 
 CUSTOMIZED_QUANTIZER_TYPE: List[str] = []
 
@@ -303,9 +304,17 @@ class W8A8DYNAMICQuantizer(VLLMAscendQuantizer):
         return AscendW8A8DynamicFusedMoEMethod()
 
 
+class W8A16Quantizer(VLLMAscendQuantizer):
+
+    @staticmethod
+    def build_linear_method():
+        return AscendW8A16LinearMethod()
+
+
 SUPPORT_ASCEND_QUANTIZER_TYPE = {
     "W4A8_DYNAMIC": W4A8DYNAMICQuantizer,
     "W8A8": W8A8Quantizer,
     "W8A8_DYNAMIC": W8A8DYNAMICQuantizer,
     "C8": W8A8Quantizer,
+    "W8A16": W8A16Quantizer,
 }

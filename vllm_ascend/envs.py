@@ -85,6 +85,12 @@ env_variables: Dict[str, Callable[[], Any]] = {
     # Whether to enable DBO feature for deepseek model.
     "VLLM_ASCEND_ENABLE_DBO":
     lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_DBO", '0'))),
+    # Whether to enable TOP_N_SIGMA for deepseek model.
+    "VLLM_ASCEND_ENABLE_TOP_N_SIGMA":
+    lambda: bool(
+        int(os.getenv("VLLM_ASCEND_ENABLE_TOP_N_SIGMA", '0'))),
+    "VLLM_ASCEND_ENABLE_NZ":
+    lambda: int(os.getenv("VLLM_ASCEND_ENABLE_NZ", "1")),
     # Whether to enable the model execute time observe profile. Disable it when
     # running vllm ascend in production environment.
     "VLLM_ASCEND_MODEL_EXECUTE_TIME_OBSERVE":

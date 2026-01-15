@@ -192,6 +192,21 @@ def maybe_converting_weight_acl_format(model, format=ACL_FORMAT_FRACTAL_NZ):
                 module.w2_weight.data, format)
 
 
+def maybe_trans_nz(weight: torch.Tensor):
+    if not envs_ascend.VLLM_ASCEND_ENABLE_NZ:
+        # NZ is not enabled
+        return weight
+    if weight.dtype == torch.float:
+        # fp32 can not support NZ
+        return weight
+    elif weight.dtype in {torch.bfloat16, torch.float16, torch.int8}:
+        # bf16/fp16 will trans nz when VLLM_ASCEND_ENABLE_NZ is 2
+        # int8 will trans nz when VLLM_ASCEND_ENABLE_NZ is 1 or 2
+        if weight.dtype == torch.int8 or envs_ascend.VLLM_ASCEND_ENABLE_NZ == 2:
+            return torch_npu.npu_format_cast(weight, ACL_FORMAT_FRACTAL_NZ)
+    return weight
+
+
 def try_register_lib(lib_name: str, lib_info: str = ""):
     import importlib
     import importlib.util
