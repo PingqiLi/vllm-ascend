@@ -17,17 +17,21 @@ Checkpoint 格式:
     python -m tools.resq_debug.compare save-orig \
         --model ${CKPT_O} --out orig.pt
 
-    # 保存 ResQ 模型激活 (伪量化)
+    # 保存 ResQ 模型激活 (伪量化) CPU
     python -m tools.resq_debug.compare save-resq \
-        --ckpt-a ${CKPT_A} --ckpt-b ${CKPT_B} --out resq.pt
+        --ckpt-a ${CKPT_A} --out resq.pt
 
-    # 保存 ResQ 模型激活 (真量化)
+    # 保存 ResQ 模型激活 (真量化) NPU
     python -m tools.resq_debug.compare save-resq-true \
-        --ckpt-a ${CKPT_A} --ckpt-b ${CKPT_B} --out resq_true.pt
+        --ckpt-a ${CKPT_A} --out resq_true.pt
 
-    # 比较
+    # 比较伪量化和原始激活值
     python -m tools.resq_debug.compare compare \
-        --orig orig.pt --resq resq.pt
+        --orig orig.pt --resq resq.pt --ckpt-b ${CKPT_B}
+
+    # 比较真量化和原始激活值
+    python -m tools.resq_debug.compare compare \
+        --orig orig.pt --resq resq_true.pt --ckpt-b ${CKPT_B}
 """
 
 import argparse
@@ -549,7 +553,7 @@ def main():
     p2t.add_argument("--ckpt-a", required=True, help="ResQ checkpoint A (含 config.json、量化权重、Uc/Pd)")
     p2t.add_argument("--out", required=True)
     p2t.add_argument("--prompt", default="default", help="Text input or 'default' for built-in text")
-    p2t.add_argument("--device", default="cpu")
+    p2t.add_argument("--device", default="npu")
     p2t.add_argument("--layers", default="all", help="'all' or comma-separated indices")
     p2t.add_argument("--seq-len", type=int, default=4, help="Input sequence length")
     

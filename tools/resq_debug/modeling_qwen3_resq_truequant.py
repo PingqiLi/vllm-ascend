@@ -20,94 +20,65 @@ import torch
 import torch.nn as nn
 from typing import Dict, Optional, Tuple
 from transformers import Qwen3Config
+from transformers.models.qwen3.modeling_qwen3 import (
+    Qwen3RMSNorm,
+    apply_rotary_pos_emb,
+)
 from pathlib import Path
 from safetensors import safe_open
 
-# Import unified quantized matmul operations (supports CPU and NPU)
-from .quant_ops import resq_quant_matmul
-
+import torch_npu
 
 # ============================================================================
-# RMSNorm
+# utils
 # ============================================================================
 
-class Qwen3RMSNorm(nn.Module):
-    def __init__(self, hidden_size: int, eps: float = 1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.eps = eps
+def pack_int4_to_int8_signed(x: torch.Tensor) -> torch.Tensor:
+    """
+    x: int8 tensor, shape (E, K, N)，值域 ∈ [-8, 7]
+    return: int8 tensor, shape (E, K, N/2)，每个元素打包两个有符号 int4
+    """
+    assert x.dtype == torch.int8
+    K, N = x.shape
+    assert N % 2 == 0
     
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        input_dtype = x.dtype
-        variance = x.float().pow(2).mean(-1, keepdim=True)
-        x = x.float() * torch.rsqrt(variance + self.eps)
-        return (self.weight.float() * x).to(input_dtype)
+    # 转成无符号补码 [0, 15]
+    x_unsigned = torch.where(x < 0, x + 16, x).to(torch.int32)
+
+    low = x_unsigned[..., 0::2]   # 偶数 -> 低 4 位
+    high = x_unsigned[..., 1::2]  # 奇数 -> 高 4 位
+
+    out = (low | (high << 4)).to(torch.int8)
+    return out
 
 
 # ============================================================================
 # Rotary Embedding
 # ============================================================================
 
-class Qwen3RotaryEmbedding(nn.Module):
-    def __init__(self, dim: int, max_seq_len: int = 4096, base: float = 1000000.0):
-        super().__init__()
-        self.dim = dim
-        self.max_seq_len = max_seq_len
-        self.base = base
-        
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
-        self.register_buffer("inv_freq", inv_freq)
-        self._update_cos_sin_cache(max_seq_len)
-    
-    def _update_cos_sin_cache(self, seq_len: int):
-        t = torch.arange(seq_len, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
-        freqs = torch.outer(t, self.inv_freq)
-        emb = torch.cat([freqs, freqs], dim=-1)
-        self.register_buffer("cos_cached", emb.cos())
-        self.register_buffer("sin_cached", emb.sin())
-    
-    def forward(self, x: torch.Tensor, position_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        seq_len = position_ids.max().item() + 1
-        if seq_len > self.cos_cached.shape[0]:
-            self._update_cos_sin_cache(seq_len)
-        cos = self.cos_cached[position_ids]
-        sin = self.sin_cached[position_ids]
-        return cos, sin
-
-
-def rotate_half(x: torch.Tensor) -> torch.Tensor:
-    x1, x2 = x[..., :x.shape[-1]//2], x[..., x.shape[-1]//2:]
-    return torch.cat([-x2, x1], dim=-1)
-
-
-def apply_rotary_pos_emb(q, k, cos, sin):
-    cos = cos.unsqueeze(1)
-    sin = sin.unsqueeze(1)
-    q_embed = q * cos + rotate_half(q) * sin
-    k_embed = k * cos + rotate_half(k) * sin
-    return q_embed, k_embed
 
 
 # ============================================================================
 # Hadamard Transform
 # ============================================================================
 
-def hadamard_transform(u: torch.Tensor) -> torch.Tensor:
-    """Fast Hadamard transform using butterfly algorithm."""
-    n = u.shape[-1]
-    original_shape = u.shape
-    x = u.reshape(-1, n).clone()
+def hadamard_transform(x: torch.Tensor) -> torch.Tensor:
+    """Fast Walsh-Hadamard Transform using butterfly algorithm (unnormalized)."""
+    n = x.shape[-1]
+    assert (n & (n - 1)) == 0, f"n must be power of 2, got {n}"
+    
+    original_shape = x.shape
+    u = x.reshape(-1, n).clone()
     
     h = 1
     while h < n:
-        x = x.view(-1, n // (2 * h), 2, h)
-        a = x[:, :, 0, :]
-        b = x[:, :, 1, :]
-        x = torch.stack([a + b, a - b], dim=2)
-        x = x.view(-1, n)
+        u = u.view(-1, n // (2 * h), 2, h)
+        a, b = u[:, :, 0, :], u[:, :, 1, :]
+        u = torch.stack([a + b, a - b], dim=2)
+        u = u.view(-1, n)
         h *= 2
     
-    return x.view(original_shape)
+    return u.view(original_shape)
 
 
 # ============================================================================
@@ -141,26 +112,24 @@ class ResQTrueQuantLinear(nn.Module):
         M = x_2d.shape[0]
         
         # Split input
-        x_low = x_2d[:, :self.in_low]
-        x_high = x_2d[:, self.in_low:]
+        x_low = x_2d[:, :self.in_low].to(torch.float16).npu()
+        x_high = x_2d[:, self.in_low:].to(torch.float16).npu()
         
-        # Dynamic per-token quantization
-        x_low_abs_max = x_low.abs().amax(dim=-1).clamp(min=1e-10)
-        lxScale = (x_low_abs_max / 7.0).to(torch.float32)
+
+        # NPU implement
+        x_low_abs_max, lxScale = torch_npu.npu_dynamic_quant(x_low, dst_type=torch.quint4x2)
+        x_high_abs_max, rxScale = torch_npu.npu_dynamic_quant(x_high, dst_type=torch.int8)
         
-        x_high_abs_max = x_high.abs().amax(dim=-1).clamp(min=1e-10)
-        rxScale = (x_high_abs_max / 127.0).to(torch.float32)
-        
-        # Call quantized matmul (supports only NPU)
-        output = resq_quant_matmul(
-            x_2d, self.weight_low, self.weight_high,
-            self.scale_low, self.scale_high,
-            lxScale, rxScale,
-            out_dtype=x.dtype
-        )
-        
-        output_shape = list(original_shape[:-1]) + [self.out_features]
-        return output.view(output_shape)
+        weight_low = pack_int4_to_int8_signed(self.weight_low)
+        weight_low = weight_low.view(torch.int32).transpose(-1, -2).npu()
+        # weight_low = torch_npu.npu_format_cast(weight_low.npu(), 29).view(torch.int32)
+        output_low = torch_npu.npu_quant_matmul(x_low_abs_max, weight_low, self.scale_low.to(torch.float).npu(), 
+                                                pertoken_scale=lxScale, output_dtype=torch.float16)
+
+        weight_nz_high = torch_npu.npu_format_cast(self.weight_high.npu(), 29).transpose(-1,-2)
+        output_high = torch_npu.npu_quant_matmul(x_high_abs_max, weight_nz_high, self.scale_high.to(torch.float).npu(), 
+                                                pertoken_scale=rxScale, output_dtype=torch.float16)
+        return torch.add(output_low, output_high)
 
 
 # ============================================================================
@@ -184,8 +153,8 @@ class Qwen3ResQTrueQuantAttention(nn.Module):
         self.o_proj = ResQTrueQuantLinear(self.num_heads * self.head_dim, self.hidden_size)
         
         # QK norms
-        self.q_norm = Qwen3RMSNorm(self.head_dim)
-        self.k_norm = Qwen3RMSNorm(self.head_dim)
+        self.q_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         
         # ResQ: Uc rotation
         self.register_buffer('Uc', torch.empty(0))
@@ -211,26 +180,25 @@ class Qwen3ResQTrueQuantAttention(nn.Module):
         # RoPE
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
         
-        # ResQ: Uc rotation after RoPE
+        # ResQ: Uc rotation after RoPE (project-resq QKRotationWrapper)
         if self.Uc.numel() > 0:
-            Uc = self.Uc.to(device=q.device, dtype=q.dtype)
-            q = torch.matmul(q, Uc)
-            k = torch.matmul(k, Uc)
-        
-        # GQA: expand KV
-        if self.num_kv_groups > 1:
-            k = k.unsqueeze(2).expand(-1, -1, self.num_kv_groups, -1, -1).reshape(bsz, self.num_heads, seq_len, self.head_dim)
-            v = v.unsqueeze(2).expand(-1, -1, self.num_kv_groups, -1, -1).reshape(bsz, self.num_heads, seq_len, self.head_dim)
+            q = torch.matmul(q, self.Uc.to(q.dtype))
+            k = torch.matmul(k, self.Uc.to(k.dtype))
+
+        k = k.repeat_interleave(self.num_kv_groups, dim=1)
+        v = v.repeat_interleave(self.num_kv_groups, dim=1)
         
         # Attention
         attn_weights = torch.matmul(q, k.transpose(-2, -1)) * self.scaling
-        attn_weights = attn_weights + attention_mask
+        if attention_mask is not None:
+            attn_weights = attn_weights + attention_mask[:, :, :seq_len, :seq_len]
+        
         attn_weights = torch.softmax(attn_weights.float(), dim=-1).to(v.dtype)
         attn_output = torch.matmul(attn_weights, v)
         
-        attn_output = attn_output.transpose(1, 2).reshape(bsz, seq_len, -1)
+        attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, seq_len, -1)
         
-        # ResQ: reorder columns before o_proj
+        # ResQ: reorder columns before o_proj (rearrange_o_proj in project-resq)
         if self.o_proj_column_order.numel() > 0:
             attn_output = attn_output[..., self.o_proj_column_order]
         
@@ -259,40 +227,49 @@ class Qwen3ResQTrueQuantMLP(nn.Module):
         self.blocksize: int = 256
     
     def _apply_ud_rotation(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply Ud = block_diag(Pd).T @ H rotation before down_proj"""
-        if self.Pd.numel() == 0 or self.Hd is None:
-            return x
+        """
+        Apply Ud = block_diag(Pd) @ H.T / sqrt(n)
         
+        推导:
+        - 权重融合: W_fused = Ua.T @ W @ block_diag(Pd) @ H.T / sqrt(n)
+        - 推理: y = (x @ Ud) @ W_fused.T = x @ W.T @ Ua
+        - 所以: Ud @ sqrt(n) * H @ block_diag(Pd.T) = I
+        - 解得: Ud = block_diag(Pd) @ H.T / sqrt(n)
+        
+        操作顺序: 1. x @ block_diag(Pd)  2. x @ H.T  3. / sqrt(n)
+        """
         original_shape = x.shape
+        n = x.shape[-1]
         dtype = x.dtype
-        device = x.device
-        x = x.float()
         
-        # Move rotation matrices to same device as x
-        Pd = self.Pd.to(device).float()
-        Hd = self.Hd.to(device).float()
+        # Reshape to [..., K, blocksize]
+        x = x.float().reshape(-1, self.K, self.blocksize)
         
-        # 1. Apply block_diag(Pd).T
-        blocksize = Pd.shape[0]
-        num_blocks = x.shape[-1] // blocksize
-        x_blocked = x.reshape(*original_shape[:-1], num_blocks, blocksize)
-        x_blocked = torch.matmul(x_blocked, Pd.T)
-        x = x_blocked.reshape(original_shape)
+        # Step 1: x @ block_diag(Pd) (per-block multiplication)
+        Pd_f32 = self.Pd.to(x.device, torch.float32)
+        x = torch.matmul(x, Pd_f32)  # [batch, K, blocksize] @ [blocksize, blocksize]
         
-        # 2. Apply Hadamard: H = Hd ⊗ H_butterfly
-        K = Hd.shape[0]
-        x_blocked = x.reshape(*original_shape[:-1], K, self.blocksize)
-        # Block Hadamard on Hd dimension
-        x_blocked = torch.matmul(Hd, x_blocked)
-        # Butterfly Hadamard on blocksize dimension
-        x_blocked = hadamard_transform(x_blocked) / math.sqrt(self.blocksize)
-        x = x_blocked.reshape(original_shape)
+        # Step 2: x @ H.T where H = Hd ⊗ H_butterfly
+        # H.T = Hd.T ⊗ H_butterfly.T = Hd ⊗ H_butterfly (symmetric for real Hadamard)
         
-        return x.to(dtype)
-    
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        gate = self.gate_proj(hidden_states)
-        up = self.up_proj(hidden_states)
+        # 2a. Apply H_butterfly (symmetric, so H = H.T)
+        x = hadamard_transform(x)  # acts on last dim (blocksize)
+        
+        # 2b. Apply Hd on K dimension: x @ Hd.T (Inverse of fusion)
+        Hd_f32 = self.Hd.to(x.device, torch.float32)
+        x = x.transpose(-1, -2)  # [batch, blocksize, K]
+        # We need x_new @ H = x, so x_new = x @ H.T
+        x = torch.matmul(x, Hd_f32.t())  # [batch, blocksize, K] @ [K, K]
+        x = x.transpose(-1, -2)  # [batch, K, blocksize]
+        
+        # Step 3: Normalize
+        x = x * self.K / math.sqrt(n)
+        
+        return x.reshape(original_shape).to(dtype)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate = self.gate_proj(x)
+        up = self.up_proj(x)
         intermediate = self.act_fn(gate) * up
         
         # ResQ: apply Ud rotation before down_proj
@@ -314,13 +291,19 @@ class Qwen3ResQTrueQuantDecoderLayer(nn.Module):
         self.input_layernorm = Qwen3RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.post_attention_layernorm = Qwen3RMSNorm(config.hidden_size, config.rms_norm_eps)
     
-    def forward(self, hidden_states: torch.Tensor, position_embeddings: Tuple, 
-                attention_mask: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        # Self attention
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(hidden_states, position_embeddings, attention_mask)
         hidden_states = residual + hidden_states
         
+        # MLP
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
@@ -348,8 +331,9 @@ class Qwen3ResQTrueQuantForCausalLM(nn.Module):
         self.norm = Qwen3RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         
-        head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
-        self.rotary_emb = Qwen3RotaryEmbedding(head_dim, config.max_position_embeddings, config.rope_theta)
+        # RoPE
+        from transformers.models.qwen3.modeling_qwen3 import Qwen3RotaryEmbedding
+        self.rotary_emb = Qwen3RotaryEmbedding(config)
         
         # Global ResQ params
         self.Hd: Optional[torch.Tensor] = None
@@ -360,8 +344,10 @@ class Qwen3ResQTrueQuantForCausalLM(nn.Module):
         bsz, seq_len = input_ids.shape
         device = input_ids.device
         
+        # Embed
         hidden_states = self.embed_tokens(input_ids)
         
+        # RoPE
         position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(bsz, -1)
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
         
@@ -371,13 +357,19 @@ class Qwen3ResQTrueQuantForCausalLM(nn.Module):
             diagonal=1
         ).unsqueeze(0).unsqueeze(0)
         
+        # Combine with attention_mask if provided
         if attention_mask is not None:
-            padding_mask = (1.0 - attention_mask[:, None, None, :].float()) * float('-inf')
+            # attention_mask: [bsz, seq_len] -> [bsz, 1, 1, seq_len]
+            # Note: 0 * -inf = nan in IEEE float, so use torch.where
+            padding_mask = attention_mask[:, None, None, :].float()
+            padding_mask = torch.where(padding_mask == 0, float('-inf'), 0.0)
             causal_mask = causal_mask + padding_mask
         
+        # Layers
         for layer in self.layers:
             hidden_states = layer(hidden_states, position_embeddings, causal_mask)
         
+        # Final norm + LM head
         hidden_states = self.norm(hidden_states)
         logits = self.lm_head(hidden_states)
         
@@ -449,16 +441,16 @@ class Qwen3ResQTrueQuantForCausalLM(nn.Module):
             prefix = f'model.layers.{i}'
             
             # Norms
-            for norm_name in ['input_layernorm', 'post_attention_layernorm']:
-                key = f'{prefix}.{norm_name}.weight'
-                if key in ckpt_a:
-                    getattr(layer, norm_name).weight.data = ckpt_a[key].to(dtype)
+            if f'{prefix}.input_layernorm.weight' in ckpt_a:
+                layer.input_layernorm.weight.data = ckpt_a[f'{prefix}.input_layernorm.weight'].to(dtype)
+            if f'{prefix}.post_attention_layernorm.weight' in ckpt_a:
+                layer.post_attention_layernorm.weight.data = ckpt_a[f'{prefix}.post_attention_layernorm.weight'].to(dtype)
             
             # QK norms
-            for qk in ['q_norm', 'k_norm']:
-                key = f'{prefix}.self_attn.{qk}.weight'
-                if key in ckpt_a:
-                    getattr(layer.self_attn, qk).weight.data = ckpt_a[key].to(dtype)
+            if f'{prefix}.self_attn.q_norm.weight' in ckpt_a:
+                layer.self_attn.q_norm.weight.data = ckpt_a[f'{prefix}.self_attn.q_norm.weight'].to(dtype)
+            if f'{prefix}.self_attn.k_norm.weight' in ckpt_a:
+                layer.self_attn.k_norm.weight.data = ckpt_a[f'{prefix}.self_attn.k_norm.weight'].to(dtype)
             
             # Load quantized weights for projections
             for proj in ['q_proj', 'k_proj', 'v_proj', 'o_proj']:
@@ -518,21 +510,23 @@ class Qwen3ResQTrueQuantForCausalLM(nn.Module):
                 linear.scale_high.data = scale
     
     def _setup_o_proj_column_order(self, attn):
-        """Setup o_proj column reordering based on high_fraction"""
-        high_fraction = 0.125
-        num_heads = attn.num_heads
+        """Setup o_proj column reorder (rearrange_o_proj in project-resq)"""
         head_dim = attn.head_dim
+        num_heads = attn.num_heads
         in_dim = num_heads * head_dim
+        high_fraction = 0.125
         
-        high_per_head = int(head_dim * high_fraction)
-        low_per_head = head_dim - high_per_head
+        high_bits_length = int(in_dim * high_fraction)
+        high_per_head = high_bits_length // num_heads
         
-        low_indices = []
-        high_indices = []
-        for h in range(num_heads):
-            base = h * head_dim
-            low_indices.extend(range(base, base + low_per_head))
-            high_indices.extend(range(base + low_per_head, base + head_dim))
+        chunk_starts = torch.arange(0, in_dim, head_dim)
+        high_precision_columns = torch.arange(head_dim - high_per_head, head_dim)
+        columns_to_end = (chunk_starts.unsqueeze(1) + high_precision_columns).flatten()
         
-        column_order = torch.tensor(low_indices + high_indices, dtype=torch.long)
-        attn.o_proj_column_order = column_order
+        all_columns = torch.arange(in_dim)
+        mask = torch.ones(in_dim, dtype=torch.bool)
+        mask[columns_to_end] = False
+        remaining_columns = all_columns[mask]
+        
+        new_column_order = torch.cat([remaining_columns, columns_to_end])
+        attn.o_proj_column_order = new_column_order
