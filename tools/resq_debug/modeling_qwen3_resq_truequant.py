@@ -129,6 +129,44 @@ class ResQTrueQuantLinear(nn.Module):
         weight_nz_high = torch_npu.npu_format_cast(self.weight_high.npu(), 29).transpose(-1,-2)
         output_high = torch_npu.npu_quant_matmul(x_high_abs_max, weight_nz_high, self.scale_high.to(torch.float).npu(), 
                                                 pertoken_scale=rxScale, output_dtype=torch.float16)
+        import numpy as np
+
+        def CPU_MM_golden(x_low_abs_max, weight_low, scale_low, lxScale, islow):
+            def unpack_int32_to_int4_signed(x: torch.Tensor) -> torch.Tensor:
+                """
+                x: int32 tensor, shape (K, N/8)
+                return: int8 tensor, shape ( K, N)，存储 signed int4 ∈ [-8, 7]
+                """
+                assert x.dtype == torch.int32
+                K, N_ = x.shape  # N_ = N/8
+
+                # 取出 8 个 4bit
+                out = torch.stack([(x >> (4 * i)) & 0xF for i in range(8)], dim=-1)  # (E,K,M,8)
+
+                # 转成有符号 int4
+                out = out.to(torch.int8)
+                out = torch.where(out >= 8, out - 16, out)  # [-8,7]
+
+                out = out.reshape(K, N_ * 8).to(torch.int8)  # (E, K, N)
+                return out
+            if islow:
+                weight_low = unpack_int32_to_int4_signed(weight_low).numpy().astype(np.float64)
+                x_low_abs_max = unpack_int32_to_int4_signed(x_low_abs_max).numpy().astype(np.float64)
+            else:
+                weight_low = (weight_low).numpy().astype(np.float64)
+                x_low_abs_max = (x_low_abs_max).numpy().astype(np.float64)
+            mm = np.matmul(x_low_abs_max, weight_low.T).astype(float)
+            mm = mm * scale_low.astype(float).reshape(1, -1)
+            mm = mm * lxScale.reshape(-1,1)
+            return mm
+        mm_low = CPU_MM_golden(x_low_abs_max.cpu(), weight_low.T.cpu(), self.scale_low.to(torch.float32).cpu().numpy(), lxScale.cpu().numpy(), True)
+        mm_high = CPU_MM_golden(x_high_abs_max.cpu(), self.weight_high.cpu(), self.scale_high.to(torch.float32).cpu().numpy(), rxScale.cpu().numpy(), False)
+        print(f"low mm error:{torch.mean(output_low.cpu() - mm_low)}")
+        print(f"high mm error:{torch.mean(output_high.cpu() - mm_high)}")
+        diff = (output_low.cpu() - mm_low).abs().max()
+        print(f"Low-bit NPU vs Golden Max Diff: {diff}")
+        diff = (output_high.cpu() - mm_high).abs().max()
+        print(f"High-bit NPU vs Golden Max Diff: {diff}")
         return torch.add(output_low, output_high)
 
 

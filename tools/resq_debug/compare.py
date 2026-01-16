@@ -82,7 +82,11 @@ def save_original(model_path: str, out_path: str, prompt: str, device: str, laye
         def make_hook(idx, name, is_last_hook=False):
             def hook(m, inp, out):
                 key = f"L{idx}.{name}"
-                acts[key] = (out[0] if isinstance(out, tuple) else out).cpu().clone()
+                t = out[0] if isinstance(out, tuple) else out
+                if t.device.type == 'npu':
+                    import torch_npu
+                    torch_npu.npu.synchronize()
+                acts[key] = t.detach().cpu().clone()
                 if is_last_hook:
                     raise EarlyStopException()
             return hook
@@ -158,7 +162,11 @@ def save_resq(ckpt_a: str, out_path: str,
         def make_hook(idx, name, is_last_hook=False):
             def hook(m, inp, out):
                 key = f"L{idx}.{name}"
-                acts[key] = (out[0] if isinstance(out, tuple) else out).cpu().clone()
+                t = out[0] if isinstance(out, tuple) else out
+                if t.device.type == 'npu':
+                    import torch_npu
+                    torch_npu.npu.synchronize()
+                acts[key] = t.detach().cpu().clone()
                 if is_last_hook:
                     raise EarlyStopException()
             return hook
@@ -234,7 +242,11 @@ def save_resq_true(ckpt_a: str, out_path: str,
         def make_hook(idx, name, is_last_hook=False):
             def hook(m, inp, out):
                 key = f"L{idx}.{name}"
-                acts[key] = (out[0] if isinstance(out, tuple) else out).cpu().clone()
+                t = out[0] if isinstance(out, tuple) else out
+                if t.device.type == 'npu':
+                    import torch_npu
+                    torch_npu.npu.synchronize()
+                acts[key] = t.detach().cpu().clone()
                 if is_last_hook:
                     raise EarlyStopException()
             return hook
@@ -439,11 +451,21 @@ def compare(orig_path: str, resq_path: str, ckpt_b_path: str = None):
         o, r = orig[key].float(), resq[key].float()
         
         # 检查 NaN/Inf
-        if torch.isnan(r).any() or torch.isinf(r).any():
+        nan_mask = torch.isnan(r)
+        inf_mask = torch.isinf(r)
+        if nan_mask.any() or inf_mask.any():
             failed += 1
-            print(f"✗ {key}: NaN/Inf detected in ResQ tensor!")
+            nan_count = nan_mask.sum().item()
+            inf_count = inf_mask.sum().item()
+            print(f"✗ {key}: Detected {nan_count} NaNs and {inf_count} Infs in ResQ tensor!")
             failures.append((key, float('nan'), float('nan'), float('nan')))
+            
+            # Print stats anyway to see when it happened
+            r_clean = r[~(nan_mask | inf_mask)]
+            if r_clean.numel() > 0:
+                print(f"    [stats] non-nan mean={r_clean.mean():.4f}, std={r_clean.std():.4f}, max={r_clean.max():.4f}")
             continue
+            
         if torch.isnan(o).any() or torch.isinf(o).any():
             failed += 1
             print(f"✗ {key}: NaN/Inf detected in original tensor!")
@@ -522,8 +544,14 @@ def compare(orig_path: str, resq_path: str, ckpt_b_path: str = None):
         if key in orig and key in resq:
             o, r = orig[key].float(), resq[key].float()
             print(f"  {key}: shape={o.shape}")
-            print(f"  orig: mean={o.mean():.4f}, std={o.std():.4f}, norm={o.norm():.4f}")
-            print(f"  resq: mean={r.mean():.4f}, std={r.std():.4f}, norm={r.norm():.4f}")
+            print(f"  orig: mean={o.mean():.4f}, std={o.std():.4f}, norm={o.norm():.4f}, range=[{o.min():.4f}, {o.max():.4f}]")
+            print(f"  resq: mean={r.mean():.4f}, std={r.std():.4f}, norm={r.norm():.4f}, range=[{r.min():.4f}, {r.max():.4f}]")
+            
+            # Check for specific patterns
+            if (o.abs() < 1e-8).all() and not (r.abs() < 1e-8).all():
+                print("  [hint] Original is all zeros, but ResQ is not. Check bias or initialization.")
+            if r.norm() / (o.norm() + 1e-8) > 100 or r.norm() / (o.norm() + 1e-8) < 0.01:
+                print("  [hint] Norm scale mismatch! Check quantization scales (multiplier vs reciprocal).")
 
 
 def main():
