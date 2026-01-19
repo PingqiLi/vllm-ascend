@@ -87,3 +87,5 @@ class AscendW8A16LinearMethod:
         layer.weight.data = maybe_trans_nz(layer.weight.data)
         layer.weight_scale.data = torch.flatten(layer.weight_scale.data)
         layer.weight_offset.data = torch.flatten(layer.weight_offset.data)
+        if hasattr(layer, "bias") and layer.bias is not None:
+            layer.bias.data = layer.bias.data.to(torch.float32)
