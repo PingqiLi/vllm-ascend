@@ -188,9 +188,13 @@ class ResQMixedPrecisionLinear(nn.Module):
         
         if self.bias is not None:
             output = output + self.bias
-            
-        # Restore shape
+        
+        # Restore shape to match input (vLLM passes [num_tokens, hidden_size])
         output_shape = list(original_shape[:-1]) + [self.out_features]
+        # Convert to bfloat16 to match RMSNorm weights dtype
+        # NPU's npu_rms_norm requires x and gamma to have compatible dtypes
+        # Supported combos: (fp16,fp16), (bf16,bf16), (fp16,fp32), (bf16,fp32), (fp32,fp32)
+        # Since model weights are loaded as bfloat16, output must also be bfloat16
         return output.view(output_shape).to(torch.bfloat16)
 
 
@@ -281,7 +285,8 @@ def apply_ud_rotation(
     x = hadamard_transform(x.contiguous())
     
     # Then apply Hd on the K dimension (second-to-last dim)
-    # This matches matmul_hadU_cpu: hadK @ input_tensor where input has shape [batch, K, n//K]
+    # Reference: x @ Hd.T (right-multiply with Hd transpose)
+    # x: [batch, K, blocksize], Hd: [K, K]
     if Hd is not None and K > 1:
         batch_shape = x.shape[:-2]
         batch_size = 1
@@ -290,8 +295,11 @@ def apply_ud_rotation(
         x = x.reshape(batch_size, K, blocksize)
         
         Hd_f32 = Hd.to(device=x.device, dtype=torch.float32)
-        # Apply Hd: [K, K] @ [batch, K, blocksize] -> [batch, K, blocksize]
-        x = torch.einsum('ij,bjk->bik', Hd_f32, x)
+        # Match reference: transpose, right-multiply Hd.T, transpose back
+        # x = x.transpose(-1, -2) @ Hd.T then transpose back
+        x = x.transpose(-1, -2)  # [batch, blocksize, K]
+        x = torch.matmul(x, Hd_f32.t())  # [batch, blocksize, K] @ [K, K]
+        x = x.transpose(-1, -2)  # [batch, K, blocksize]
         
         x = x.reshape(*batch_shape, K, blocksize)
     
@@ -451,7 +459,8 @@ class Qwen3ResQTrueQuantMLP(nn.Module):
         intermediate = torch.nn.functional.silu(gate) * up
         
         # U_d rotation before down_proj
-        if self.rotation_Pd.numel() > 0:
+        # Match reference: check both Pd and Hd exist
+        if self.rotation_Pd.numel() > 0 and self.shared_Hd is not None:
             intermediate = apply_ud_rotation(
                 intermediate,
                 Pd=self.rotation_Pd,
