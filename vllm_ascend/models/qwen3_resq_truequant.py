@@ -51,6 +51,7 @@ from vllm.distributed import get_tensor_model_parallel_world_size
 logger = logging.getLogger(__name__)
 
 RESQ_DEBUG = os.environ.get("RESQ_DEBUG", "0") == "1"
+UB_FUSED = os.environ.get("UB_FUSED", "1") == "1"
 
 # ============================================================================
 # Hadamard Transform Utilities
@@ -228,6 +229,7 @@ def apply_ud_rotation(
     x: torch.Tensor,
     Pd: torch.Tensor,
     Hd: Optional[torch.Tensor],
+    h_butterfly: Optional[torch.Tensor], # Add pre-computed matrix
     K: int,
     blocksize: int,
 ) -> torch.Tensor:
@@ -282,7 +284,15 @@ def apply_ud_rotation(
     
     # Step 2: Apply H = Hd ⊗ H_butterfly
     # First apply butterfly Hadamard on the blocksize dimension (last dim)
-    x = hadamard_transform(x.contiguous())
+    
+    # Optimization: Use pre-computed H_butterfly matrix if available
+    # x @ h_butterfly is equivalent to hadamard_transform(x) along last dim
+    if h_butterfly is not None:
+        h_butterfly_f32 = h_butterfly.to(device=x.device, dtype=torch.float32)
+        x = torch.matmul(x, h_butterfly_f32)
+    else:
+        # Fallback to loop if not pre-computed (shouldn't happen with correct initialization)
+        x = hadamard_transform(x.contiguous())
     
     # Then apply Hd on the K dimension (second-to-last dim)
     # Reference: x @ Hd.T (right-multiply with Hd transpose)
@@ -412,7 +422,11 @@ class Qwen3ResQTrueQuantAttention(nn.Module):
         attn_output = self.attn(q, k, v)
         
         # Reorder attn_output columns to match o_proj weight layout [mid | high]
-        if self.o_proj_column_order.numel() > 0:
+        # This is only needed if weights are NOT fused with Ub (i.e., UB_FUSED is False)
+        # If UB_FUSED is True (default), weights are already adapted and reordering is redundant/harmful?
+        # Actually, if UB_FUSED is True, we MIGHT still need reordering depending on how exactly o_proj is prepared.
+        # But per user request: "在线的reorder... 可选的，这取决于v_proj.weight权重是否融合了Ub，可以通过一个环境变量来控制UB_FUSED(默认为真)"
+        if self.o_proj_column_order.numel() > 0 and not UB_FUSED:
             attn_output = attn_output[..., self.o_proj_column_order]
         
         # O projection
@@ -443,6 +457,9 @@ class Qwen3ResQTrueQuantMLP(nn.Module):
         
         # U_d rotation parameters
         self.register_buffer('rotation_Pd', torch.empty(0))
+        # H_butterfly buffer for optimization
+        self.register_buffer('h_butterfly', torch.empty(0))
+        
         self.shared_Hd: Optional[torch.Tensor] = None
         self.shared_Hd_K: int = 1
         self.blocksize: int = 256
@@ -451,7 +468,16 @@ class Qwen3ResQTrueQuantMLP(nn.Module):
         self.shared_Hd = Hd
         self.shared_Hd_K = Hd_K
         self.blocksize = blocksize
-    
+        
+        # Pre-compute H_butterfly matrix if not already waiting
+        if self.h_butterfly.numel() == 0 or self.h_butterfly.shape[0] != blocksize:
+            # Create identity matrix and apply transform to get the matrix form
+            eye = torch.eye(blocksize, dtype=torch.float32)
+            # We need to apply transform to columns, so we can use the existing function
+            # or just apply to rows since it's symmetric
+            h_matrix = hadamard_transform(eye)
+            self.h_butterfly = h_matrix.to(self.rotation_Pd.device if self.rotation_Pd.numel() > 0 else 'cpu')
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate = self.gate_proj(x)
         up = self.up_proj(x)
@@ -461,10 +487,15 @@ class Qwen3ResQTrueQuantMLP(nn.Module):
         # U_d rotation before down_proj
         # Match reference: check both Pd and Hd exist
         if self.rotation_Pd.numel() > 0 and self.shared_Hd is not None:
+            # Ensure h_butterfly is on the correct device
+            if self.h_butterfly.device != x.device:
+                self.h_butterfly = self.h_butterfly.to(x.device)
+
             intermediate = apply_ud_rotation(
                 intermediate,
                 Pd=self.rotation_Pd,
                 Hd=self.shared_Hd,
+                h_butterfly=self.h_butterfly,
                 K=self.shared_Hd_K,
                 blocksize=self.blocksize,
             )
