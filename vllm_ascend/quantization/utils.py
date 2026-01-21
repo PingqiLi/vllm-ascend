@@ -9,6 +9,7 @@ from .w8a8 import (AscendC8KVCacheMethod, AscendW8A8FusedMoEMethod,
                    AscendW8A8LinearMethod)
 from .w8a8_dynamic import (AscendW8A8DynamicFusedMoEMethod,
                            AscendW8A8DynamicLinearMethod)
+from .resq_linear import ResQLinearMethod
 
 ASCEND_QUANTIZATION_METHOD_MAP: Dict[str, Dict[str, Type[Any]]] = {
     "W4A8_DYNAMIC": {
@@ -30,11 +31,16 @@ ASCEND_QUANTIZATION_METHOD_MAP: Dict[str, Dict[str, Type[Any]]] = {
     "C8": {
         "attention": AscendC8KVCacheMethod,
     },
+    "RESQ": {
+        "linear": ResQLinearMethod,
+    },
 }
 
 
 def get_linear_quant_type(quant_description: Dict[str, Any], prefix: str,
                           packed_modules_mapping: Dict[str, Any]):
+    if quant_description.get("model_quant_type") == "RESQ":
+        return "RESQ"
     proj_name = prefix.split(".")[-1]
     if proj_name in packed_modules_mapping:
         quant_type = None
@@ -64,6 +70,11 @@ def get_quant_method(quant_description: Dict[str, Any],
     logger.info_once("Using the vLLM Ascend Quantization now!")
     if packed_modules_mapping is None:
         packed_modules_mapping = dict()
+    
+    # Global shortcut for RESQ linear layers
+    if quant_description.get("model_quant_type") == "RESQ" and layer_type == "linear":
+        return ASCEND_QUANTIZATION_METHOD_MAP["RESQ"]["linear"](quant_description, prefix, packed_modules_mapping)
+
     # Attention
     if '.attn' in prefix and 'fa_quant_type' in quant_description.keys():
         quant_type = quant_description['fa_quant_type']
