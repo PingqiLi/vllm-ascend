@@ -422,11 +422,10 @@ class Qwen3ResQTrueQuantAttention(nn.Module):
         attn_output = self.attn(q, k, v)
         
         # Reorder attn_output columns to match o_proj weight layout [mid | high]
-        # This is only needed if weights are NOT fused with Ub (i.e., UB_FUSED is False)
-        # If UB_FUSED is True (default), weights are already adapted and reordering is redundant/harmful?
-        # Actually, if UB_FUSED is True, we MIGHT still need reordering depending on how exactly o_proj is prepared.
-        # But per user request: "在线的reorder... 可选的，这取决于v_proj.weight权重是否融合了Ub，可以通过一个环境变量来控制UB_FUSED(默认为真)"
-        if self.o_proj_column_order.numel() > 0 and not UB_FUSED:
+        # Controlled by UB_FUSED (default=True). 
+        # If True: weights fused with Ub -> Requires reordering.
+        # If False: weights not fused -> Skip reordering.
+        if self.o_proj_column_order.numel() > 0 and UB_FUSED:
             attn_output = attn_output[..., self.o_proj_column_order]
         
         # O projection
