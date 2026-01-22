@@ -37,6 +37,18 @@ import torch.nn as nn
 import logging
 import os
 
+def resq_log(msg: str):
+    print(msg, flush=True)
+    log_file_env = os.environ.get("RESQ_LOG_FILE")
+    if log_file_env:
+        root, ext = os.path.splitext(log_file_env)
+        log_file = f"{root}_resqv1{ext}"
+        try:
+            with open(log_file, "a") as f:
+                f.write(msg + "\n")
+        except Exception as e:
+            print(f"WARN: Failed to write to {log_file}: {e}")
+
 from transformers import Qwen2Config as Qwen3Config
 
 from vllm.config import VllmConfig, CacheConfig, QuantizationConfig
@@ -125,8 +137,10 @@ class ResQMixedPrecisionLinear(nn.Module):
         out_features: int,
         high_fraction: float = 0.125,
         bias: bool = False,
+        prefix: str = "",
     ):
         super().__init__()
+        self.prefix = prefix
         self.in_features = in_features
         self.out_features = out_features
         self.high_fraction = high_fraction
@@ -184,9 +198,14 @@ class ResQMixedPrecisionLinear(nn.Module):
             pertoken_scale=rxScale, 
             output_dtype=torch.float16
         )
-        
+
         output = torch.add(output_low, output_high)
         
+        if RESQ_DEBUG and "layers.0." in self.prefix:
+            resq_log(f"DEBUG [Ref] {self.prefix} Output Low mean: {output_low.float().mean()}")
+            resq_log(f"DEBUG [Ref] {self.prefix} Output High mean: {output_high.float().mean()}")
+            resq_log(f"DEBUG [Ref] {self.prefix} Final Output mean: {output.float().mean()}")
+
         if self.bias is not None:
             output = output + self.bias
         
@@ -352,10 +371,10 @@ class Qwen3ResQTrueQuantAttention(nn.Module):
         self.kv_size = num_kv_heads * head_dim
         
         # Projections with mixed-precision quantization
-        self.q_proj = ResQMixedPrecisionLinear(hidden_size, self.q_size)
-        self.k_proj = ResQMixedPrecisionLinear(hidden_size, self.kv_size)
-        self.v_proj = ResQMixedPrecisionLinear(hidden_size, self.kv_size)
-        self.o_proj = ResQMixedPrecisionLinear(self.q_size, hidden_size)
+        self.q_proj = ResQMixedPrecisionLinear(hidden_size, self.q_size, prefix=f"{prefix}.q_proj")
+        self.k_proj = ResQMixedPrecisionLinear(hidden_size, self.kv_size, prefix=f"{prefix}.k_proj")
+        self.v_proj = ResQMixedPrecisionLinear(hidden_size, self.kv_size, prefix=f"{prefix}.v_proj")
+        self.o_proj = ResQMixedPrecisionLinear(self.q_size, hidden_size, prefix=f"{prefix}.o_proj")
         
         # QK Norm with custom weight_loader for proper device handling
         from vllm.model_executor.layers.layernorm import RMSNorm
@@ -414,9 +433,9 @@ class Qwen3ResQTrueQuantAttention(nn.Module):
         q, k = self.rotary_emb(positions, q, k)
         
         # U_c rotation after RoPE
-        if self.rotation_R3.numel() > 0:
-            q = apply_block_rotation(q, self.rotation_R3)
-            k = apply_block_rotation(k, self.rotation_R3)
+        # if self.rotation_R3.numel() > 0:
+        #     q = apply_block_rotation(q, self.rotation_R3)
+        #     k = apply_block_rotation(k, self.rotation_R3)
         
         # Attention
         attn_output = self.attn(q, k, v)
@@ -444,15 +463,16 @@ class Qwen3ResQTrueQuantMLP(nn.Module):
         hidden_size: int,
         intermediate_size: int,
         hidden_act: str,
+        prefix: str = "",
     ):
         super().__init__()
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         
         # Note: gate and up are separate in true quant (not fused)
-        self.gate_proj = ResQMixedPrecisionLinear(hidden_size, intermediate_size)
-        self.up_proj = ResQMixedPrecisionLinear(hidden_size, intermediate_size)
-        self.down_proj = ResQMixedPrecisionLinear(intermediate_size, hidden_size)
+        self.gate_proj = ResQMixedPrecisionLinear(hidden_size, intermediate_size, prefix=f"{prefix}.gate_proj")
+        self.up_proj = ResQMixedPrecisionLinear(hidden_size, intermediate_size, prefix=f"{prefix}.up_proj")
+        self.down_proj = ResQMixedPrecisionLinear(intermediate_size, hidden_size, prefix=f"{prefix}.down_proj")
         
         # U_d rotation parameters
         self.register_buffer('rotation_Pd', torch.empty(0))
@@ -536,6 +556,7 @@ class Qwen3ResQTrueQuantDecoderLayer(nn.Module):
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
+            prefix=f"{prefix}.mlp",
         )
         
         from vllm.model_executor.layers.layernorm import RMSNorm
