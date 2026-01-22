@@ -2,13 +2,24 @@
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 # This file is a part of the vllm-ascend project.
 #
-
+import os
 import math
 from typing import Optional
 
 import torch
 import torch_npu
 
+def resq_log(msg: str):
+    print(msg, flush=True)
+    log_file_env = os.environ.get("RESQ_LOG_FILE")
+    if log_file_env:
+        root, ext = os.path.splitext(log_file_env)
+        log_file = f"{root}_resqv2{ext}"
+        try:
+            with open(log_file, "a") as f:
+                f.write(msg + "\n")
+        except Exception as e:
+            print(f"WARN: Failed to write to {log_file}: {e}")
 
 def is_pow2(n: int) -> bool:
     return (n & (n - 1) == 0) and (n > 0)
@@ -86,6 +97,7 @@ def apply_ud_rotation(
     h_butterfly: Optional[torch.Tensor], 
     K: int,
     blocksize: int,
+    debug: bool=False,
 ) -> torch.Tensor:
     """
     Apply Ud rotation before down_proj for ResQ inference.
@@ -113,12 +125,28 @@ def apply_ud_rotation(
     original_dtype = x.dtype
     x = x.float()
     
+    # DEBUG: Log input stats
+    if debug:
+        resq_log(f"DEBUG [ResQ] apply_ud_rotation INPUT x mean: {x.mean().item()}")
+        if Pd is not None:
+            resq_log(f"DEBUG [ResQ] Pd mean: {Pd.float().mean().item()}, shape: {Pd.shape}")
+        else:
+            resq_log(f"DEBUG [ResQ] Pd is None!")
+            
+        if Hd is not None:
+            resq_log(f"DEBUG [ResQ] Hd mean: {Hd.float().mean().item()}, shape: {Hd.shape}")
+        else:
+            resq_log(f"DEBUG [ResQ] Hd is None!")
+        resq_log(f"DEBUG [ResQ] K={K}, blocksize={blocksize}")
+
     # Reshape: (..., n) -> (..., K, blocksize) where K = num_blocks
     # K is the number of blocks, blocksize is the size of each block
     x = x.reshape(*original_shape[:-1], K, blocksize)
     
     # Step 1: Apply block_diag(Pd) block-wise (x @ Pd for each block)
     Pd_f32 = Pd.to(device=x.device, dtype=torch.float32)
+    # Reverted transpose: Matches resqv1 reference.
+    # print(f"DEBUG [ResQ] Applying Pd rotation. x.shape={x.shape}, Pd.shape={Pd.shape}")
     x = torch.matmul(x, Pd_f32)
     
     # Step 2: Apply H = Hd ⊗ H_butterfly
@@ -131,6 +159,10 @@ def apply_ud_rotation(
         x = hadamard_transform(x.contiguous())
     
     # Then apply Hd on the K dimension (second-to-last dim)
+    if "layers.0" in str(x.device): # Primitive check or just print once
+         # print(f"DEBUG [ResQ] apply_ud_rotation K={K}. Hd is None? {Hd is None}")
+         pass
+
     if Hd is not None and K > 1:
         batch_shape = x.shape[:-2]
         batch_size = 1
@@ -149,5 +181,8 @@ def apply_ud_rotation(
     
     # Normalize: divide by sqrt(n) AND multiply by K (matching debug script)
     x = x * K / math.sqrt(n)
+    
+    if "layers.0" in str(x.device):
+         print(f"DEBUG [ResQ] apply_ud_rotation OUTPUT x mean: {x.float().mean().item()}")
     
     return x.reshape(original_shape).to(original_dtype)

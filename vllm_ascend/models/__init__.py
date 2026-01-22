@@ -46,3 +46,16 @@ def register_model():
     ModelRegistry.register_model(
         "Qwen3NextForCausalLM",
         "vllm_ascend.models.qwen3_next:CustomQwen3NextForCausalLM")
+
+    # Patch Qwen3ForCausalLM to support ResQ reordering
+    ModelRegistry.register_model(
+        "Qwen3ForCausalLM",
+        "vllm_ascend.models.qwen3_resq_patch:Qwen3ResQForCausalLM"
+    )
+
+    # Allow explicit usage of Qwen3ResQForCausalLM
+    ModelRegistry.register_model(
+        "Qwen3ResQForCausalLM",
+        "vllm_ascend.models.qwen3_resq_patch:Qwen3ResQForCausalLM"
+    )
+

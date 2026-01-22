@@ -16,8 +16,10 @@ import os
 
 def resq_log(msg: str):
     print(msg, flush=True)
-    log_file = os.environ.get("RESQ_LOG_FILE")
-    if log_file:
+    log_file_env = os.environ.get("RESQ_LOG_FILE")
+    if log_file_env:
+        root, ext = os.path.splitext(log_file_env)
+        log_file = f"{root}_resqv2{ext}"
         try:
             with open(log_file, "a") as f:
                 f.write(msg + "\n")
@@ -38,9 +40,6 @@ class ResQLinearMethod(LinearMethodBase):
         self.prefix = prefix
         self.packed_modules_mapping = packed_modules_mapping
         self.is_down_proj = "down_proj" in prefix
-        if self.is_down_proj:
-            resq_log(f"DEBUG [ResQ] {prefix}")
-
 
     def create_weights(
         self,
@@ -118,19 +117,6 @@ class ResQLinearMethod(LinearMethodBase):
                     # Use shard_sort_key to handle ['k', 'q', 'v'] case -> [0, 1, 2] -> Q, K, V
                     sorted_keys = sorted(param._shards.keys(), key=shard_sort_key)
                     sorted_shards = [param._shards[k] for k in sorted_keys]
-                    
-                    if "gate_up_proj" in self.prefix and name == "weight_low":
-                        pass
-                        # Debugging removed for clarity
-
-                    if "qkv_proj" in self.prefix and name == "weight_low":
-                        resq_log(f"DEBUG [ResQ] Assembly {self.prefix} {name}: Shards found: {list(param._shards.keys())}")
-                        resq_log(f"DEBUG [ResQ] Assembly order: {sorted_keys}")
-                    
-                    if "gate_up_proj" in self.prefix and name == "weight_low":
-                        resq_log(f"DEBUG [ResQ] Assembly {self.prefix} {name}: Shards found: {list(param._shards.keys())}")
-                        resq_log(f"DEBUG [ResQ] Assembly order: {sorted_keys}")
-
 
                     # Concatenate along output dimension (dim 0)
                     # Ensure all shards are on same device/dtype (should be)
@@ -193,18 +179,8 @@ class ResQLinearMethod(LinearMethodBase):
         **kwargs,
     ) -> torch.Tensor:
         
-        should_log = ("layers.0." in self.prefix) and (self.is_down_proj or "qkv" in self.prefix)
+        should_log = "layers.0." in self.prefix
         
-        if should_log:
-             resq_log(f"DEBUG [ResQ] {self.prefix} INPUT 'x' stats: min={x.min()}, max={x.max()}, mean={x.float().mean()}, std={x.float().std()}")
-             resq_log(f"DEBUG [ResQ] {self.prefix} weight_low stats: mean={layer.weight_low.float().mean()}, dtype={layer.weight_low.dtype}")
-             if hasattr(layer, 'scale_low'):
-                 resq_log(f"DEBUG [ResQ] {self.prefix} scale_low stats: min={layer.scale_low.min()}, max={layer.scale_low.max()}, mean={layer.scale_low.mean()}")
-             if hasattr(layer, 'scale_high'):
-                 resq_log(f"DEBUG [ResQ] {self.prefix} scale_high stats: min={layer.scale_high.min()}, max={layer.scale_high.max()}, mean={layer.scale_high.mean()}")
-
-
-
         # CRITICAL FIX 1: Enforce input contiguousness at the start
         if not x.is_contiguous():
             x = x.contiguous()
@@ -226,7 +202,8 @@ class ResQLinearMethod(LinearMethodBase):
                 Hd=Hd,
                 h_butterfly=layer.h_butterfly if layer.h_butterfly.numel() > 0 else None,
                 K=K,
-                blocksize=blocksize
+                blocksize=blocksize,
+                debug=should_log
             )
             
         # 2. ResQ Mixed Precision Matmul
@@ -266,12 +243,6 @@ class ResQLinearMethod(LinearMethodBase):
         # We need to recreate that here.
         w_low_packed = layer.weight_low_packed.transpose(-1, -2)
         
-        if should_log:
-            resq_log(f"DEBUG [ResQ] {self.prefix} MatMul Shapes:")
-            resq_log(f"  x_low: {x_low.shape} {x_low.dtype}")
-            resq_log(f"  x_low_abs_max: {x_low_abs_max.shape} {x_low_abs_max.dtype}")
-            resq_log(f"  w_low_packed: {w_low_packed.shape} {w_low_packed.dtype}")
-            resq_log(f"  lxScale: {lxScale.shape}")
         
         output_low = torch_npu.npu_quant_matmul(
             x_low_abs_max, 
@@ -290,18 +261,16 @@ class ResQLinearMethod(LinearMethodBase):
             output_dtype=torch.float16
         )
 
-        if should_log:
-             resq_log(f"DEBUG [ResQ] {self.prefix} Output Low stats: min={output_low.min()}, max={output_low.max()}, mean={output_low.float().mean()}, nan={torch.isnan(output_low).any()}")
-             resq_log(f"DEBUG [ResQ] {self.prefix} Output High stats: min={output_high.min()}, max={output_high.max()}, mean={output_high.float().mean()}, nan={torch.isnan(output_high).any()}")
-
-        
         output = torch.add(output_low, output_high)
+
+        if should_log:
+             resq_log(f"DEBUG [ResQ] {self.prefix} Output Low mean: {output_low.float().mean()}")
+             resq_log(f"DEBUG [ResQ] {self.prefix} Output High mean: {output_high.float().mean()}")
+             resq_log(f"DEBUG [ResQ] {self.prefix} Final Output mean: {output.float().mean()}")
         
         if bias is not None:
              # Check if bias seems valid (not all zero?)
              # Only print if bias is 0 (suspicious)? Or just print mean for QKV
-            if should_log and "qkv" in self.prefix:
-                 resq_log(f"DEBUG [ResQ] {self.prefix} Bias stats: min={bias.min()}, max={bias.max()}")
             output = output + bias
             
         output_shape = list(original_shape[:-1]) + [output.shape[-1]]
