@@ -91,10 +91,14 @@ class ResQLinearMethod(LinearMethodBase):
         # We buffer them and assemble in process_weights_after_loading.
         if shard_id is None:
             shard_id = 0
-            
+
+        # Debug logging for layer 0 only (down_proj and qkv_proj to verify merged loading)
+        if "layers.0." in self.prefix and (self.is_down_proj or "qkv_proj" in self.prefix):
+            resq_log(f"DEBUG [ResQ] weight_loader: {self.prefix}, shard_id={shard_id}, shape={loaded_weight.shape}")
+
         if not hasattr(param, "_shards"):
             param._shards = {}
-        
+
         # Store shard on CPU/NPU as loaded (usually CPU during load)
         param._shards[shard_id] = loaded_weight
 
@@ -127,6 +131,21 @@ class ResQLinearMethod(LinearMethodBase):
                     
                     # Cleanup
                     del param._shards
+
+        # Debug: Log weight shapes AFTER assembly for layer 0
+        if "layers.0." in self.prefix and (self.is_down_proj or "qkv_proj" in self.prefix):
+            wl_shape = layer.weight_low.shape if hasattr(layer, 'weight_low') and layer.weight_low.numel() > 0 else "EMPTY"
+            wh_shape = layer.weight_high.shape if hasattr(layer, 'weight_high') and layer.weight_high.numel() > 0 else "EMPTY"
+            resq_log(f"DEBUG [ResQ] {self.prefix} AFTER assembly: weight_low.shape={wl_shape}, weight_high.shape={wh_shape}")
+
+        # Check rotation matrices for ALL down_proj layers (critical: verify all layers have Pd/Hd)
+        if self.is_down_proj:
+            pd_shape = layer.rotation_Pd.shape if hasattr(layer, 'rotation_Pd') and layer.rotation_Pd.numel() > 0 else "EMPTY"
+            hd_shape = layer.rotation_Hd.shape if hasattr(layer, 'rotation_Hd') and layer.rotation_Hd.numel() > 0 else "EMPTY"
+            if pd_shape == "EMPTY" or hd_shape == "EMPTY":
+                resq_log(f"WARNING [ResQ] {self.prefix} MISSING rotation: Pd={pd_shape}, Hd={hd_shape}")
+            elif "layers.0." in self.prefix:
+                resq_log(f"DEBUG [ResQ] {self.prefix} AFTER assembly: rotation_Pd.shape={pd_shape}, rotation_Hd.shape={hd_shape}")
 
         # Optimization 1: Pre-compute h_butterfly if Pd/Hd are present
         if self.is_down_proj and hasattr(layer, "rotation_Pd") and layer.rotation_Pd.numel() > 0:

@@ -125,19 +125,9 @@ def apply_ud_rotation(
     original_dtype = x.dtype
     x = x.float()
     
-    # DEBUG: Log input stats
+    # DEBUG: Log rotation params (only once for layer 0)
     if debug:
-        resq_log(f"DEBUG [ResQ] apply_ud_rotation INPUT x mean: {x.mean().item()}")
-        if Pd is not None:
-            resq_log(f"DEBUG [ResQ] Pd mean: {Pd.float().mean().item()}, shape: {Pd.shape}")
-        else:
-            resq_log(f"DEBUG [ResQ] Pd is None!")
-            
-        if Hd is not None:
-            resq_log(f"DEBUG [ResQ] Hd mean: {Hd.float().mean().item()}, shape: {Hd.shape}")
-        else:
-            resq_log(f"DEBUG [ResQ] Hd is None!")
-        resq_log(f"DEBUG [ResQ] K={K}, blocksize={blocksize}")
+        resq_log(f"DEBUG [ResQ] apply_ud_rotation: K={K}, blocksize={blocksize}, Pd={'OK' if Pd is not None else 'None'}, Hd={'OK' if Hd is not None else 'None'}")
 
     # Reshape: (..., n) -> (..., K, blocksize) where K = num_blocks
     # K is the number of blocks, blocksize is the size of each block
@@ -159,10 +149,6 @@ def apply_ud_rotation(
         x = hadamard_transform(x.contiguous())
     
     # Then apply Hd on the K dimension (second-to-last dim)
-    if "layers.0" in str(x.device): # Primitive check or just print once
-         # print(f"DEBUG [ResQ] apply_ud_rotation K={K}. Hd is None? {Hd is None}")
-         pass
-
     if Hd is not None and K > 1:
         batch_shape = x.shape[:-2]
         batch_size = 1
@@ -181,8 +167,5 @@ def apply_ud_rotation(
     
     # Normalize: divide by sqrt(n) AND multiply by K (matching debug script)
     x = x * K / math.sqrt(n)
-    
-    if "layers.0" in str(x.device):
-         print(f"DEBUG [ResQ] apply_ud_rotation OUTPUT x mean: {x.float().mean().item()}")
-    
+
     return x.reshape(original_shape).to(original_dtype)
