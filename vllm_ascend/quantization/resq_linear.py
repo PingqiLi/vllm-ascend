@@ -12,6 +12,8 @@ import torch_npu
 from vllm.model_executor.layers.linear import LinearMethodBase
 from vllm.model_executor.utils import set_weight_attrs
 
+from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, is_enable_nz
+
 
 def _is_pow2(n: int) -> bool:
     """Check if n is a power of 2."""
@@ -36,27 +38,6 @@ def _hadamard_transform(u: torch.Tensor) -> torch.Tensor:
         h *= 2
 
     return x.view(original_shape)
-
-
-def _pack_int4_to_int8_signed(x: torch.Tensor) -> torch.Tensor:
-    """Pack two signed int4 values into one int8."""
-    assert x.dtype == torch.int8
-    if x.dim() < 1:
-        return x
-
-    if x.shape[-1] % 2 != 0:
-        raise ValueError(
-            f"Last dimension must be even for packing, got {x.shape[-1]}"
-        )
-
-    # Convert to unsigned complement [0, 15]
-    x_unsigned = torch.where(x < 0, x + 16, x).to(torch.int32)
-
-    low = x_unsigned[..., 0::2]   # even indices -> low 4 bits
-    high = x_unsigned[..., 1::2]  # odd indices -> high 4 bits
-
-    out = (low | (high << 4)).to(torch.int8)
-    return out
 
 
 def _apply_ud_rotation(
@@ -233,11 +214,21 @@ class ResQLinearMethod(LinearMethodBase):
                 h_matrix = _hadamard_transform(eye)
                 layer.h_butterfly.data = h_matrix.to(layer.rotation_Pd.device)
 
-        # Pack weight_low into int4x2 format
-        if hasattr(layer, "weight_low") and layer.weight_low.numel() > 0:
-            w_low_packed = _pack_int4_to_int8_signed(layer.weight_low)
-            w_low_packed = w_low_packed.view(torch.int32).contiguous()
-            layer.register_buffer("weight_low_packed", w_low_packed)
+        # Process weight_low (int4): use NPU native packing
+        # weight_low shape: (n, k_low) -> pack to (n, k_low//8)
+        w_low = layer.weight_low.data.to(torch.int32).npu()
+        w_low_packed = torch_npu.npu_convert_weight_to_int4pack(w_low)
+        layer.register_buffer("weight_low_packed", w_low_packed)
+
+        # Process weight_high (int8): transpose to (k_high, n) + NZ format
+        w_high = layer.weight_high.data.transpose(0, 1).contiguous().npu()
+        if is_enable_nz():
+            w_high = torch_npu.npu_format_cast(w_high, ACL_FORMAT_FRACTAL_NZ)
+        layer.weight_high.data = w_high
+
+        # Process scales: flatten to 1D float32
+        layer.scale_low.data = layer.scale_low.data.flatten().to(torch.float32).npu()
+        layer.scale_high.data = layer.scale_high.data.flatten().to(torch.float32).npu()
 
     def apply(
         self,
@@ -271,43 +262,42 @@ class ResQLinearMethod(LinearMethodBase):
         original_shape = x.shape
         x_2d = x.contiguous().view(-1, x.shape[-1]).float()
 
-        if layer.weight_high.numel() == 0:
-            return x
-
-        in_high = layer.weight_high.shape[1]
+        # weight_high is now (k_high, n) after preprocessing
+        in_high = layer.weight_high.shape[0]
         in_low = x_2d.shape[-1] - in_high
 
         x_low = x_2d[:, :in_low].to(torch.float16).npu()
         x_high = x_2d[:, in_low:].to(torch.float16).npu()
 
-        x_low = x_low.contiguous()
         x_low_quant, lx_scale = torch_npu.npu_dynamic_quant(
-            x_low, dst_type=torch.quint4x2
+            x_low.contiguous(), dst_type=torch.quint4x2
         )
         x_high_quant, rx_scale = torch_npu.npu_dynamic_quant(
             x_high, dst_type=torch.int8
         )
 
-        w_low_packed = layer.weight_low_packed.transpose(-1, -2)
+        # int4 matmul: weight_low_packed (n, k_low//8) -> transpose to (k_low//8, n)
         output_low = torch_npu.npu_quant_matmul(
             x_low_quant,
-            w_low_packed,
-            layer.scale_low.to(torch.float).reshape(-1).npu(),
+            layer.weight_low_packed.t(),
+            layer.scale_low,
             pertoken_scale=lx_scale,
             output_dtype=torch.float16,
         )
 
-        w_high_nz = torch_npu.npu_format_cast(layer.weight_high.npu(), 29).transpose(-1, -2)
+        # int8 matmul: weight_high already (k_high, n) with NZ format
         output_high = torch_npu.npu_quant_matmul(
             x_high_quant,
-            w_high_nz,
-            layer.scale_high.to(torch.float).reshape(-1).npu(),
+            layer.weight_high,
+            layer.scale_high,
             pertoken_scale=rx_scale,
             output_dtype=torch.float16,
         )
 
         output = torch.add(output_low, output_high)
 
+        # TODO: this could be an issue if bias is not None, as so far 
+        # we do not consider how and if bias should be reordered during quantization
         if bias is not None:
             output = output + bias
 
