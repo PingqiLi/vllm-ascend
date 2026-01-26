@@ -76,32 +76,76 @@ def unpack_from_int32(
     return unpacked_weight
 
 
-def pack_to_int32(weight: torch.Tensor) -> torch.Tensor:
+def unpack_int32_to_int4_signed(x: torch.Tensor) -> torch.Tensor:
     """
-    Packs quantized weights into int32 format for storage.
-
-    :param weight: The 3D tensor to pack, must be int8 or int32 dtype
-    :return: Packed tensor with int32 dtype optimized for storage
+    x: int32 tensor, shape (E, K, N/8)
+    return: int8 tensor, shape (E, K, N)，存储 signed int4 ∈ [-8, 7]
     """
-    assert weight.dim(
-    ) == 3, f"Expecting `weight.dim()` is 3 ([e, n, k] or [e, k, n]) but got {weight.dim()}."
-    assert weight.dtype in [
-        torch.int8, torch.int32
-    ], f"Expecting `weight.dtype` is torch.int8 or torch.int32 bug got {weight.dtype}."
-
-    if weight.dtype == torch.int32:
-        assert weight.shape[
-            -1] % 8 == 0, "the last dim of weight needs to be divided by 8."
-        packed_weight = torch_npu.npu_convert_weight_to_int4pack(
-            weight.flatten(0, 1))
-        packed_weight = packed_weight.view(weight.shape[0], weight.shape[1],
-                                           -1)
+    assert x.dtype == torch.int32
+    if x.dim() == 2:
+        x = x.unsqueeze(0)
+        is_2d = True
     else:
-        assert weight.shape[
-            -1] % 4 == 0, "the last dim of weight needs to be divided by 4."
-        packed_weight = weight.view(torch.int32).contiguous()
+        is_2d = False
+        
+    E, K, N_ = x.shape  # N_ = N/8
 
-    return packed_weight
+    # 取出 8 个 4bit
+    out = torch.stack([(x >> (4 * i)) & 0xF for i in range(8)], dim=-1)  # (E,K,M,8)
+
+    # 转成有符号 int4
+    out = out.to(torch.int8)
+    out = torch.where(out >= 8, out - 16, out)  # [-8,7]
+
+    out = out.reshape(E, K, N_ * 8).to(torch.int8)  # (E, K, N)
+    
+    if is_2d:
+        out = out.squeeze(0)
+        
+    return out
+
+
+def pack_int4_to_int8_signed(x: torch.Tensor) -> torch.Tensor:
+    """
+    x: int8 tensor, shape (E, K, N)，值域 ∈ [-8, 7]
+    return: int8 tensor, shape (E, K, N/2)，每个元素打包两个有符号 int4
+    """
+    assert x.dtype == torch.int8
+    if x.dim() == 2:
+        x = x.unsqueeze(0)
+        is_2d = True
+    else:
+        is_2d = False
+
+    E, K, N = x.shape
+    assert N % 2 == 0
+    
+    # 转成无符号补码 [0, 15]
+    x_unsigned = torch.where(x < 0, x + 16, x).to(torch.int32)
+
+    low = x_unsigned[..., 0::2]   # 偶数 -> 低 4 位
+    high = x_unsigned[..., 1::2]  # 奇数 -> 高 4 位
+
+    out = (low | (high << 4)).to(torch.int8)
+    
+    if is_2d:
+        out = out.squeeze(0)
+        
+    return out
+
+
+def to_nz(weight_i32):
+    # Process weight with simplified logic
+    weight = unpack_int32_to_int4_signed(weight_i32)
+    weight_i8 = pack_int4_to_int8_signed(weight)
+    
+    # Ensure tensor is on NPU for format cast
+    if weight_i8.device.type != 'npu':
+         weight_i8 = weight_i8.npu()
+         
+    # 29 is ACL_FORMAT_FRACTAL_NZ
+    weight_nz = torch_npu.npu_format_cast(weight_i8, 29).view(torch.int32)
+    return weight_nz
 
 
 class AscendW4A16FusedMoEMethod:
@@ -281,3 +325,103 @@ class AscendW4A16FusedMoEMethod:
                 1, 2).contiguous()
             layer.w2_weight_offset.data = layer.w2_weight_offset.data.transpose(
                 1, 2).contiguous()
+
+
+class AscendW4A16LinearMethod:
+    """Linear method for Ascend W4A16.
+    """
+
+    def __init__(self) -> None:
+        self.num_bits = 4
+        self.pack_factor = 8 // self.num_bits  # 2
+
+    def get_weight(
+        self,
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype = torch.bfloat16,
+    ) -> Dict[str, Any]:
+        if input_size % self.pack_factor != 0:
+            raise ValueError(
+                f"The input_size {input_size} is not a multiple of {self.pack_factor}."
+            )
+        params_dict = {
+            "weight":
+            torch.empty(output_size,
+                        input_size // self.pack_factor,
+                        dtype=torch.int8)
+        }
+        return params_dict
+
+    def get_pertensor_param(self, params_dtype: torch.dtype) -> Dict[str, Any]:
+        return {}
+
+    def get_perchannel_param(
+        self,
+        output_size: int,
+        params_dtype: torch.dtype,
+    ) -> Dict[str, Any]:
+        params_dict = {}
+        params_dict["weight_scale"] = torch.empty(output_size,
+                                                  1,
+                                                  dtype=params_dtype)
+        params_dict["weight_offset"] = torch.empty(output_size,
+                                                   1,
+                                                   dtype=params_dtype)
+        return params_dict
+
+    def get_pergroup_param(self,
+                           input_size: int,
+                           output_size: int,
+                           params_dtype: torch.dtype,
+                           layer_type: Optional[str] = None) -> Dict[str, Any]:
+        return {}
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+        tp_rank: Optional[int] = 0,
+    ) -> torch.Tensor:
+        output = torch_npu.npu_weight_quant_batchmatmul(
+            x=x,
+            weight=layer.weight.transpose(0, 1),
+            antiquant_scale=layer.weight_scale,
+            antiquant_offset=layer.weight_offset,
+            bias=bias)
+        return output
+
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # Check if we need to transpose FIRST before unpacking
+        # But `unpack_from_int32` usually works on loaded weight shape.
+        # WEIGHT IS: [N, K/2] INT8.
+        # View as INT32: [N, K/8] INT32.
+        
+        weight = layer.weight.data
+        # Ensure alignment for int32 view
+        if weight.numel() % 4 != 0:
+             pass
+        w_int32 = weight.view(dtype=torch.int32)
+        
+        # 1. Unpack to signed int4 [N, K]
+        w_unpacked = unpack_int32_to_int4_signed(w_int32)
+        
+        # 2. Transpose to [K, N] so we can pack along N dimension
+        # We need to pack along N to satisfy (K, N/8) input requirements of the op
+        w_transposed = w_unpacked.transpose(0, 1).contiguous()
+        
+        # 3. Pack to int8 [K, N/2]
+        w_packed = pack_int4_to_int8_signed(w_transposed)
+        if w_packed.device.type != 'npu':
+             w_packed = w_packed.npu()
+
+        # 4. Cast to FRACTAL_NZ (29) and View as int32
+        # Result shape [K, N/8] (int32)
+        layer.weight.data = torch_npu.npu_format_cast(w_packed, 29).view(torch.int32)
+        
+        layer.weight_scale.data = torch.flatten(layer.weight_scale.data)
+        layer.weight_offset.data = torch.flatten(layer.weight_offset.data)
+        if hasattr(layer, "bias") and layer.bias is not None:
+             layer.bias.data = layer.bias.data.to(torch.float32)

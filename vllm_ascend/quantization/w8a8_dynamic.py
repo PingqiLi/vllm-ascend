@@ -92,6 +92,9 @@ class AscendW8A8DynamicLinearMethod:
         return output
 
     def process_weights_after_loading(self, layer):
+        setattr(layer.weight, "transposed", True)
+        setattr(layer.weight, "output_dim", 1)
+        setattr(layer.weight, "input_dim", 0)
         layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
         # cast quantized weight tensors in NZ format for higher inference speed
         layer.weight.data = maybe_trans_nz(layer.weight.data)
