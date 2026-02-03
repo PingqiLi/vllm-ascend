@@ -6,6 +6,7 @@
 
 import math
 from typing import Any, Dict, List, Optional
+import numpy as np
 
 import torch
 import torch_npu
@@ -96,6 +97,36 @@ def _apply_ud_rotation(
     return x.reshape(original_shape).to(original_dtype)
 
 
+def _pack_int4_to_int8_signed(x: torch.Tensor) -> torch.Tensor:
+    """
+    x: int8 tensor, shape (E, K, N)，值域 ∈ [-8, 7]
+    return: int8 tensor, shape (E, K, N/2)，每个元素打包两个有符号 int4
+    """
+    assert x.dtype == torch.int8
+    K, N = x.shape
+    assert N % 2 == 0
+    
+    # 转成无符号补码 [0, 15]
+    x_unsigned = torch.where(x < 0, x + 16, x).to(torch.int32)
+
+    low = x_unsigned[..., 0::2]   # 偶数 -> 低 4 位
+    high = x_unsigned[..., 1::2]  # 奇数 -> 高 4 位
+
+    out = (low | (high << 4)).to(torch.int8)
+    return out
+
+
+def _convert_scales(scales):
+    N = scales.shape[0]
+    scaleUint32 = scales.cpu().to(torch.float32).clone().numpy().astype(np.float32).reshape(1, N)
+    scaleUint32.dtype = np.uint32
+    scaleUint64 = np.zeros((1, N * 2), dtype=np.uint32)
+    scaleUint64[...,::2] = scaleUint32
+    scaleUint64.dtype = np.int64
+    scale = torch.from_numpy(scaleUint64).npu()
+    return scale
+
+
 class ResQLinearMethod(LinearMethodBase):
     """Linear method for ResQ mixed-precision quantization.
 
@@ -153,6 +184,14 @@ class ResQLinearMethod(LinearMethodBase):
             layer.register_parameter("h_butterfly", h_butterfly)
             set_weight_attrs(h_butterfly, extra_weight_attrs)
 
+        # Register high_fraction from checkpoint, default to 0.0 scalar
+        high_fraction = torch.nn.Parameter(
+            torch.tensor(0.0, dtype=torch.float32), requires_grad=False
+        )
+        layer.register_parameter("high_fraction", high_fraction)
+        set_weight_attrs(high_fraction, extra_weight_attrs)
+        setattr(high_fraction, "weight_loader", self.weight_loader)
+
     def weight_loader(
         self,
         param: torch.nn.Parameter,
@@ -202,6 +241,14 @@ class ResQLinearMethod(LinearMethodBase):
 
                     del param._shards
 
+        # Process high_fraction (scalar, no concatenation needed)
+        if hasattr(layer, "high_fraction"):
+            param = layer.high_fraction
+            if hasattr(param, "_shards") and len(param._shards) > 0:
+                first_shard = list(param._shards.values())[0]
+                param.data = first_shard.to(param.device, dtype=param.dtype)
+                del param._shards
+
         # Pre-compute butterfly Hadamard matrix
         if (
             self.is_down_proj
@@ -214,21 +261,27 @@ class ResQLinearMethod(LinearMethodBase):
                 h_matrix = _hadamard_transform(eye)
                 layer.h_butterfly.data = h_matrix.to(layer.rotation_Pd.device)
 
+        # TODO: .squeeze(0) operations need to be removed for MoE model
         # Process weight_low (int4): use NPU native packing
         # weight_low shape: (n, k_low) -> pack to (n, k_low//8)
-        w_low = layer.weight_low.data.to(torch.int32).npu()
-        w_low_packed = torch_npu.npu_convert_weight_to_int4pack(w_low)
+        w_low = layer.weight_low.data
+        # w_low_packed = torch_npu.npu_convert_weight_to_int4pack(w_low)
+        w_low_packed = _pack_int4_to_int8_signed(w_low).contiguous().npu()
+        # Transpose to (k_low//8, n) and make contiguous to match weight_high's layout status
         layer.register_buffer("weight_low_packed", w_low_packed)
 
         # Process weight_high (int8): transpose to (k_high, n) + NZ format
-        w_high = layer.weight_high.data.transpose(0, 1).contiguous().npu()
+        w_high = layer.weight_high.data.npu()
         if is_enable_nz():
             w_high = torch_npu.npu_format_cast(w_high, ACL_FORMAT_FRACTAL_NZ)
+            w_low_packed = torch_npu.npu_format_cast(w_low_packed, ACL_FORMAT_FRACTAL_NZ).view(torch.int32)
         layer.weight_high.data = w_high
+        layer.weight_low_packed.data = w_low_packed
 
         # Process scales: flatten to 1D float32
-        layer.scale_low.data = layer.scale_low.data.flatten().to(torch.float32).npu()
-        layer.scale_high.data = layer.scale_high.data.flatten().to(torch.float32).npu()
+        layer.scale_low.data = _convert_scales(layer.scale_low.data.flatten().to(torch.float32).npu())
+        layer.scale_high.data = _convert_scales(layer.scale_high.data.flatten().to(torch.float32).npu())
+
 
     def apply(
         self,
@@ -237,69 +290,55 @@ class ResQLinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
         tp_rank: int = 0,
         **kwargs,
-    ) -> torch.Tensor:
-        """Apply ResQ quantized linear transformation."""
-        if not x.is_contiguous():
-            x = x.contiguous()
+        ) -> torch.Tensor:
+            """Apply ResQ quantized linear transformation."""
+            if not x.is_contiguous():
+                x = x.contiguous()
 
-        # Apply Ud rotation for down_proj
-        if self.is_down_proj and layer.rotation_Pd.numel() > 0:
-            Hd = layer.rotation_Hd if layer.rotation_Hd.numel() > 0 else None
-            K = Hd.shape[0] if Hd is not None else 1
-            blocksize = layer.rotation_Pd.shape[0]
+            # Apply Ud rotation for down_proj
+            if self.is_down_proj and layer.rotation_Pd.numel() > 0:
+                Hd = layer.rotation_Hd if layer.rotation_Hd.numel() > 0 else None
+                K = Hd.shape[0] if Hd is not None else 1
+                blocksize = layer.rotation_Pd.shape[0]
 
-            x = x.contiguous()
-            x = _apply_ud_rotation(
-                x,
-                Pd=layer.rotation_Pd,
-                Hd=Hd,
-                h_butterfly=layer.h_butterfly if layer.h_butterfly.numel() > 0 else None,
-                K=K,
-                blocksize=blocksize,
+                x = x.contiguous()
+                x = _apply_ud_rotation(
+                    x,
+                    Pd=layer.rotation_Pd,
+                    Hd=Hd,
+                    h_butterfly=layer.h_butterfly if layer.h_butterfly.numel() > 0 else None,
+                    K=K,
+                    blocksize=blocksize,
+                )
+
+            # Mixed precision matmul
+            original_shape = x.shape
+            x_2d = x.contiguous().view(-1, x.shape[-1]).float()
+
+            in_high = layer.weight_high.shape[-1]
+            in_low = x_2d.shape[-1] - in_high
+
+            x_low = x_2d[:, :in_low].to(torch.float16).npu()
+            x_high = x_2d[:, in_low:].to(torch.float16).npu()
+
+            x_low_quant, lx_scale = torch_npu.npu_dynamic_quant(
+                x_low.contiguous(), dst_type=torch.quint4x2
             )
+            x_high_quant, rx_scale = torch_npu.npu_dynamic_quant(
+                x_high, dst_type=torch.int8
+            )
+            # int4 matmul: weight_low_packed (n, k_low//8) -> transpose to (k_low//8, n)
+            # int8 matmul: weight_high already (k_high, n) with NZ format
+            output = torch_npu.npu_mixprecise_quant_matmul(x_low_quant, layer.weight_low_packed.transpose(-1,-2),
+                                                        rx=x_high_quant, hweight=layer.weight_high.transpose(-1,-2),
+                                                        bias=None, lscale=layer.scale_low, hscale=layer.scale_high, 
+                                                        lper_token_scale=lx_scale, rper_token_scale=rx_scale,
+                                                        output_dtype=torch.float16, mix_type=0, split_kpos=in_low)
 
-        # Mixed precision matmul
-        original_shape = x.shape
-        x_2d = x.contiguous().view(-1, x.shape[-1]).float()
+            # TODO: this could be an issue if bias is not None, as so far 
+            # we do not consider how and if bias should be reordered during quantization
+            if bias is not None:
+                output = output + bias
 
-        # weight_high is now (k_high, n) after preprocessing
-        in_high = layer.weight_high.shape[0]
-        in_low = x_2d.shape[-1] - in_high
-
-        x_low = x_2d[:, :in_low].to(torch.float16).npu()
-        x_high = x_2d[:, in_low:].to(torch.float16).npu()
-
-        x_low_quant, lx_scale = torch_npu.npu_dynamic_quant(
-            x_low.contiguous(), dst_type=torch.quint4x2
-        )
-        x_high_quant, rx_scale = torch_npu.npu_dynamic_quant(
-            x_high, dst_type=torch.int8
-        )
-
-        # int4 matmul: weight_low_packed (n, k_low//8) -> transpose to (k_low//8, n)
-        output_low = torch_npu.npu_quant_matmul(
-            x_low_quant,
-            layer.weight_low_packed.t(),
-            layer.scale_low,
-            pertoken_scale=lx_scale,
-            output_dtype=torch.float16,
-        )
-
-        # int8 matmul: weight_high already (k_high, n) with NZ format
-        output_high = torch_npu.npu_quant_matmul(
-            x_high_quant,
-            layer.weight_high,
-            layer.scale_high,
-            pertoken_scale=rx_scale,
-            output_dtype=torch.float16,
-        )
-
-        output = torch.add(output_low, output_high)
-
-        # TODO: this could be an issue if bias is not None, as so far 
-        # we do not consider how and if bias should be reordered during quantization
-        if bias is not None:
-            output = output + bias
-
-        output_shape = list(original_shape[:-1]) + [output.shape[-1]]
-        return output.view(output_shape).to(torch.bfloat16)
+            output_shape = list(original_shape[:-1]) + [output.shape[-1]]
+            return output.view(output_shape).to(torch.bfloat16)
