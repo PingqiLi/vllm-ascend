@@ -108,7 +108,8 @@ class AscendQuantConfig(QuantizationConfig):
             prefix = prefix.split('.', 1)[-1]
 
         # Shortcut for RESQ to bypass is_layer_skipped_ascend check
-        if self.quant_description.get("model_quant_type") == "RESQ":
+        model_quant_type = self.quant_description.get("model_quant_type", "")
+        if model_quant_type.upper() == "RESQ":
             if isinstance(layer, LinearBase):
                 return AscendLinearMethod(self, prefix,
                                           self.packed_modules_mapping)

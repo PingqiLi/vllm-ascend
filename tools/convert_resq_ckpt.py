@@ -25,8 +25,15 @@ from safetensors.torch import load_file, save_file
 from tqdm import tqdm
 
 
-def convert_key(key: str, num_layers: int) -> list:
-    """Convert ResQ checkpoint key to vLLM format."""
+def convert_key(key: str, num_layers: int, down_proj_is_resq: bool = True) -> list:
+    """Convert ResQ checkpoint key to vLLM format.
+
+    Args:
+        key: The original checkpoint key
+        num_layers: Number of layers in the model
+        down_proj_is_resq: If True, down_proj uses RESQ and needs rotation matrices.
+                          If False, down_proj uses W8A8_DYNAMIC and rotation matrices are dropped.
+    """
     # Model weights - keep as is
     if key.startswith("model.layers."):
         return [key]
@@ -37,14 +44,20 @@ def convert_key(key: str, num_layers: int) -> list:
     if key == "model.norm.weight":
         return [key]
 
-    # ResQ rotation matrices
+    # ResQ rotation matrices - only keep if down_proj uses RESQ
     if key.startswith("resq.layer.") and key.endswith(".Pd"):
-        parts = key.split(".")
-        layer_idx = parts[2]
-        return [f"model.layers.{layer_idx}.mlp.down_proj.rotation_Pd"]
+        if down_proj_is_resq:
+            parts = key.split(".")
+            layer_idx = parts[2]
+            return [f"model.layers.{layer_idx}.mlp.down_proj.rotation_Pd"]
+        else:
+            return []
 
     if key == "resq.Hd":
-        return [f"model.layers.{i}.mlp.down_proj.rotation_Hd" for i in range(num_layers)]
+        if down_proj_is_resq:
+            return [f"model.layers.{i}.mlp.down_proj.rotation_Hd" for i in range(num_layers)]
+        else:
+            return []
 
     # Uc matrices - not needed for inference
     if ".Uc" in key:
@@ -54,17 +67,89 @@ def convert_key(key: str, num_layers: int) -> list:
     return []
 
 
+def get_down_proj_quant_type(quant_desc: dict) -> str:
+    """Get the quantization type for down_proj layers from quant description.
+
+    Returns 'RESQ' if down_proj uses RESQ, otherwise returns the actual type (e.g., 'W8A8_DYNAMIC').
+    """
+    # Check for down_proj weight type in quant description
+    for key, value in quant_desc.items():
+        if "down_proj.weight" in key and not key.endswith("_low") and not key.endswith("_high"):
+            return value.upper()
+        # Also check weight_low for RESQ format
+        if "down_proj.weight_low" in key:
+            return value.upper()
+    return "RESQ"  # Default to RESQ if not found
+
+
+def convert_quant_description(input_dir: str, output_dir: str, num_layers: int,
+                              down_proj_is_resq: bool) -> None:
+    """Convert quant_model_description.json to match new weight names."""
+    quant_desc_filename = "quant_model_description.json"
+    quant_desc_path = os.path.join(input_dir, quant_desc_filename)
+
+    if not os.path.exists(quant_desc_path):
+        print(f"WARNING: {quant_desc_filename} not found, skipping quant description conversion.")
+        return
+
+    with open(quant_desc_path, "r") as f:
+        quant_desc = json.load(f)
+
+    new_quant_desc = {}
+
+    for key, value in quant_desc.items():
+        # Keep model_quant_type
+        if key == "model_quant_type":
+            new_quant_desc[key] = value
+            continue
+
+        # Skip resq.* entries (Pd, Uc, Hd)
+        if key.startswith("resq."):
+            continue
+
+        # Keep all other entries
+        new_quant_desc[key] = value
+
+    # Only add rotation_Pd and rotation_Hd entries if down_proj uses RESQ
+    if down_proj_is_resq:
+        for i in range(num_layers):
+            new_quant_desc[f"model.layers.{i}.mlp.down_proj.rotation_Pd"] = "FLOAT"
+            new_quant_desc[f"model.layers.{i}.mlp.down_proj.rotation_Hd"] = "FLOAT"
+        print(f"Updated {quant_desc_filename} with rotation matrices entries.")
+    else:
+        print(f"down_proj uses W8A8_DYNAMIC, skipping rotation matrices entries.")
+
+    with open(os.path.join(output_dir, quant_desc_filename), "w") as f:
+        json.dump(new_quant_desc, f, indent=2)
+
+
 def convert_checkpoint(input_dir: str, output_dir: str) -> None:
     """Convert ResQ checkpoint to vLLM format."""
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
     index_filename = "model.safetensors.index.json"
+    quant_desc_filename = "quant_model_description.json"
+
+    # Read quant description to determine down_proj quantization type
+    quant_desc_path = os.path.join(input_dir, quant_desc_filename)
+    down_proj_is_resq = True  # Default to RESQ
+    if os.path.exists(quant_desc_path):
+        with open(quant_desc_path, "r") as f:
+            quant_desc = json.load(f)
+        down_proj_type = get_down_proj_quant_type(quant_desc)
+        down_proj_is_resq = (down_proj_type == "RESQ")
+        print(f"down_proj quantization type: {down_proj_type}, is_resq: {down_proj_is_resq}")
+    else:
+        print(f"WARNING: {quant_desc_filename} not found, assuming down_proj uses RESQ.")
+
     for filename in os.listdir(input_dir):
-        if not filename.endswith(".safetensors") and filename != index_filename:
-            src_path = os.path.join(input_dir, filename)
-            if os.path.isfile(src_path):
-                shutil.copy(src_path, os.path.join(output_dir, filename))
+        # Skip files that will be converted separately
+        if filename.endswith(".safetensors") or filename in [index_filename, quant_desc_filename]:
+            continue
+        src_path = os.path.join(input_dir, filename)
+        if os.path.isfile(src_path):
+            shutil.copy(src_path, os.path.join(output_dir, filename))
 
     index_path = os.path.join(input_dir, index_filename)
     has_index = os.path.exists(index_path)
@@ -89,7 +174,7 @@ def convert_checkpoint(input_dir: str, output_dir: str) -> None:
         new_state_dict = {}
 
         for key, tensor in state_dict.items():
-            new_keys = convert_key(key, num_layers)
+            new_keys = convert_key(key, num_layers, down_proj_is_resq)
             if len(new_keys) > 1:
                 for nk in new_keys:
                     new_state_dict[nk] = tensor.clone()
@@ -107,6 +192,9 @@ def convert_checkpoint(input_dir: str, output_dir: str) -> None:
         with open(os.path.join(output_dir, index_filename), "w") as f:
             json.dump(index_data, f, indent=2)
         print(f"Updated {index_filename} with {len(new_weight_map)} entries.")
+
+    # Convert quant_model_description.json
+    convert_quant_description(input_dir, output_dir, num_layers, down_proj_is_resq)
 
     print(f"Conversion complete. Output saved to {output_dir}")
 
