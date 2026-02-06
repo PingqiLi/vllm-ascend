@@ -38,6 +38,32 @@ def _is_real_inference():
         return False
 
 
+def _get_diag_layers():
+    """Parse RESQ_DIAG_LAYERS env var into a set of layer indices or None for all."""
+    import os, re
+    val = os.environ.get('RESQ_DIAG_LAYERS', '')
+    if not val:
+        return None
+    if val.strip().lower() == 'all':
+        return 'all'
+    return set(int(x) for x in val.split(',') if x.strip().isdigit())
+
+
+def _should_save_layer(prefix: str) -> bool:
+    """Check if this layer's activations should be saved."""
+    import re
+    layers = _get_diag_layers()
+    if layers is None:
+        return False
+    m = re.search(r'layers\.(\d+)\.', prefix)
+    if not m:
+        return False
+    layer_idx = int(m.group(1))
+    if layers == 'all':
+        return True
+    return layer_idx in layers
+
+
 class AscendW8A8DynamicLinearMethod:
     """Linear method for Ascend W8A8_DYNAMIC.
     """
@@ -107,48 +133,30 @@ class AscendW8A8DynamicLinearMethod:
             output_dtype=output_dtype,
         )
 
-        # Dequantize-compare diagnostic for layer 0 (skip dry run)
-        if hasattr(layer, '_diag_weight_raw') and _is_real_inference():
-            with torch.no_grad():
-                x_f = (x if not isinstance(x, tuple) else x[0]).float()
-                w_raw = layer._diag_weight_raw.float().to(x_f.device)
-                s = layer.weight_scale_fp32.to(x_f.device)
-
-                ref = (x_f @ w_raw) * s.unsqueeze(0)
-                actual = output.float()
-
-                cos_sim = torch.nn.functional.cosine_similarity(
-                    actual.flatten().unsqueeze(0),
-                    ref.flatten().unsqueeze(0),
-                ).item()
-
-                ref_norm = ref.norm().item()
-                norm_ratio = actual.norm().item() / max(ref_norm, 1e-10)
-                max_diff = (actual - ref).abs().max().item()
-                mean_diff = (actual - ref).abs().mean().item()
-
-                print(f"[W8A8 DEQUANT CMP] down_proj layer 0:")
-                print(f"  cos_sim={cos_sim:.6f} norm_ratio={norm_ratio:.4f}")
-                print(f"  max_diff={max_diff:.4f} mean_diff={mean_diff:.6f}")
-                print(f"  ref: norm={ref_norm:.4f} mean={ref.mean().item():.6f}")
-                print(f"  act: norm={actual.norm().item():.4f} mean={actual.mean().item():.6f}")
-                print(f"  ref[0,:5]={ref[0,:5].tolist()}")
-                print(f"  act[0,:5]={actual[0,:5].tolist()}")
-                print(f"  x shape={x_f.shape} w_raw shape={w_raw.shape}")
-
-                del layer._diag_weight_raw
+        # Save activations for online-vs-offline comparison (configurable layers, first real inference)
+        prefix = getattr(layer, 'prefix', '')
+        if (_should_save_layer(prefix)
+                and _is_real_inference()
+                and not getattr(layer, '_acts_saved', False)):
+            layer._acts_saved = True
+            import os
+            x_save = x if not isinstance(x, tuple) else x[0]
+            diag_dir = os.environ.get('RESQ_DIAG_DIR', '/tmp/resq_online_acts')
+            os.makedirs(diag_dir, exist_ok=True)
+            fname = prefix.replace('.', '_') + '.pt'
+            torch.save({
+                'prefix': prefix,
+                'input': x_save.detach().cpu(),
+                'output': output.detach().cpu(),
+            }, os.path.join(diag_dir, fname))
+            print(f"[W8A8 SAVE] {prefix} → {diag_dir}/{fname}")
 
         return ((output, dynamic_scale)
                 if config.get("return_scale", False) else output)
 
     def process_weights_after_loading(self, layer):
-        prefix = getattr(layer, 'prefix', '') if hasattr(layer, 'prefix') else ''
         if self.transpose_weight:
             layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
-
-        # Save raw weight for dequant diagnostic (layer 0 only, after transpose, before NZ)
-        if 'layers.0.' in prefix:
-            layer._diag_weight_raw = layer.weight.data.clone()
 
         # cast quantized weight tensors in NZ format for higher inference speed
         if is_enable_nz():

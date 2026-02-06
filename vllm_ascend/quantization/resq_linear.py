@@ -24,6 +24,32 @@ def _is_real_inference():
         return False
 
 
+def _get_diag_layers():
+    """Parse RESQ_DIAG_LAYERS env var into a set of layer indices or None for all."""
+    import os, re
+    val = os.environ.get('RESQ_DIAG_LAYERS', '')
+    if not val:
+        return None  # not set → no saving
+    if val.strip().lower() == 'all':
+        return 'all'
+    return set(int(x) for x in val.split(',') if x.strip().isdigit())
+
+
+def _should_save_layer(prefix: str) -> bool:
+    """Check if this layer's activations should be saved."""
+    import re
+    layers = _get_diag_layers()
+    if layers is None:
+        return False
+    m = re.search(r'layers\.(\d+)\.', prefix)
+    if not m:
+        return False
+    layer_idx = int(m.group(1))
+    if layers == 'all':
+        return True
+    return layer_idx in layers
+
+
 def _is_pow2(n: int) -> bool:
     """Check if n is a power of 2."""
     return (n & (n - 1) == 0) and (n > 0)
@@ -241,11 +267,6 @@ class ResQLinearMethod(LinearMethodBase):
         if self.is_o_proj:
             self._setup_o_proj_column_order(layer)
 
-        # Save raw weights for dequantize-compare diagnostic (layer 0 only)
-        if "layers.0." in self.prefix:
-            layer._diag_weight_low_raw = layer.weight_low.data.clone()
-            layer._diag_weight_high_raw = layer.weight_high.data.clone()
-
         # Process weight_low (int4): use NPU native packing
         # weight_low shape: (n, k_low) -> pack to (n, k_low//8)
         w_low = layer.weight_low.data.to(torch.int32).npu()
@@ -351,6 +372,8 @@ class ResQLinearMethod(LinearMethodBase):
         **kwargs,
     ) -> torch.Tensor:
         """Apply ResQ quantized linear transformation."""
+        x_raw = x  # save reference before any transformation
+
         if not x.is_contiguous():
             x = x.contiguous()
 
@@ -414,57 +437,26 @@ class ResQLinearMethod(LinearMethodBase):
 
         output = torch.add(output_low, output_high)
 
-        # Dequantize-compare diagnostic for layer 0 (skip dry run)
-        if ("layers.0." in self.prefix
-                and hasattr(layer, '_diag_weight_low_raw')
-                and _is_real_inference()):
-            with torch.no_grad():
-                dev = x_2d.device
-                w_lo = layer._diag_weight_low_raw.float().to(dev)
-                w_hi = layer._diag_weight_high_raw.float().to(dev)
-                s_lo = layer.scale_low.float().unsqueeze(1)
-                s_hi = layer.scale_high.float().unsqueeze(1)
-
-                w_lo_deq = w_lo * s_lo
-                w_hi_deq = w_hi * s_hi
-
-                x_lo_f = x_2d[:, :in_low].float()
-                x_hi_f = x_2d[:, in_low:].float()
-
-                ref_lo = x_lo_f @ w_lo_deq.t()
-                ref_hi = x_hi_f @ w_hi_deq.t()
-                ref_total = ref_lo + ref_hi
-
-                actual = output.float()
-
-                cos_sim = torch.nn.functional.cosine_similarity(
-                    actual.flatten().unsqueeze(0),
-                    ref_total.flatten().unsqueeze(0),
-                ).item()
-
-                ref_norm = ref_total.norm().item()
-                norm_ratio = actual.norm().item() / max(ref_norm, 1e-10)
-                max_diff = (actual - ref_total).abs().max().item()
-                mean_diff = (actual - ref_total).abs().mean().item()
-
-                print(f"[ResQ DEQUANT CMP] {self.prefix}:")
-                print(f"  cos_sim={cos_sim:.6f} norm_ratio={norm_ratio:.4f}")
-                print(f"  max_diff={max_diff:.4f} mean_diff={mean_diff:.6f}")
-                print(f"  ref_total: norm={ref_norm:.4f} mean={ref_total.mean():.6f}")
-                print(f"  actual:    norm={actual.norm().item():.4f} mean={actual.mean().item():.6f}")
-                print(f"  ref_lo:  norm={ref_lo.norm():.4f}  act_lo:  norm={output_low.float().norm():.4f}")
-                print(f"  ref_hi:  norm={ref_hi.norm():.4f}  act_hi:  norm={output_high.float().norm():.4f}")
-                print(f"  ref[0,:5]={ref_total[0,:5].tolist()}")
-                print(f"  act[0,:5]={actual[0,:5].tolist()}")
-                print(f"  x_lo shape={x_lo_f.shape} w_lo shape={w_lo.shape}")
-                print(f"  x_hi shape={x_hi_f.shape} w_hi shape={w_hi.shape}")
-
-                del layer._diag_weight_low_raw, layer._diag_weight_high_raw
-
-        # TODO: this could be an issue if bias is not None, as so far
-        # we do not consider how and if bias should be reordered during quantization
         if bias is not None:
             output = output + bias
 
         output_shape = list(original_shape[:-1]) + [output.shape[-1]]
-        return output.view(output_shape).to(torch.bfloat16)
+        result = output.view(output_shape).to(torch.bfloat16)
+
+        # Save activations for online-vs-offline comparison (configurable layers, first real inference)
+        if (_should_save_layer(self.prefix)
+                and _is_real_inference()
+                and not getattr(self, '_acts_saved', False)):
+            self._acts_saved = True
+            import os
+            diag_dir = os.environ.get('RESQ_DIAG_DIR', '/tmp/resq_online_acts')
+            os.makedirs(diag_dir, exist_ok=True)
+            fname = self.prefix.replace('.', '_') + '.pt'
+            torch.save({
+                'prefix': self.prefix,
+                'input': x_raw.detach().cpu(),
+                'output': result.detach().cpu(),
+            }, os.path.join(diag_dir, fname))
+            print(f"[ResQ SAVE] {self.prefix} → {diag_dir}/{fname}")
+
+        return result

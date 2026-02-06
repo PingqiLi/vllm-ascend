@@ -12,7 +12,10 @@ This script converts ResQ checkpoint keys to match vLLM's expected format:
 - resq.layer.{i}.Uc -> dropped (not needed for inference)
 
 Usage:
-    python convert_resq_ckpt.py --input_path /path/to/resq_ckpt --output_path /path/to/output
+    python convert_resq_ckpt.py \
+        --input_path /path/to/resq_ckpt \
+        --output_path /path/to/output \
+        --orig_model /path/to/original_bf16_model
 """
 
 import argparse
@@ -123,13 +126,21 @@ def convert_quant_description(input_dir: str, output_dir: str, num_layers: int,
         json.dump(new_quant_desc, f, indent=2)
 
 
-def convert_checkpoint(input_dir: str, output_dir: str) -> None:
+def convert_checkpoint(input_dir: str, output_dir: str, orig_model_dir: str = None) -> None:
     """Convert ResQ checkpoint to vLLM format."""
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-
     index_filename = "model.safetensors.index.json"
     quant_desc_filename = "quant_model_description.json"
+
+    if os.path.exists(output_dir):
+        # Clean stale safetensors/index/quant_desc from previous runs to avoid
+        # leftover shard files (e.g. shards containing only resq.* keys that
+        # are now dropped, leaving a stale file that vLLM would try to load).
+        for f in os.listdir(output_dir):
+            if f.endswith('.safetensors') or f == index_filename or f == quant_desc_filename:
+                os.remove(os.path.join(output_dir, f))
+                print(f"Removed stale file: {f}")
+    else:
+        os.makedirs(output_dir)
 
     # Read quant description to determine down_proj quantization type
     quant_desc_path = os.path.join(input_dir, quant_desc_filename)
@@ -193,6 +204,68 @@ def convert_checkpoint(input_dir: str, output_dir: str) -> None:
         if new_state_dict:
             save_file(new_state_dict, os.path.join(output_dir, st_file))
 
+    # Fill missing passthrough weights from original model (CKPT O)
+    # ResQ checkpoint may omit non-quantized weights (model.norm, embed_tokens, lm_head, layernorms).
+    # Detect all missing passthrough params by comparing against CKPT O's weight_map.
+    if orig_model_dir is not None:
+        orig_index_path = os.path.join(orig_model_dir, "model.safetensors.index.json")
+        if not os.path.exists(orig_index_path):
+            print(f"WARNING: {orig_index_path} not found, skipping missing weight recovery.")
+        else:
+            with open(orig_index_path) as f:
+                orig_weight_map = json.load(f)["weight_map"]
+
+            # Find passthrough params in CKPT O that are missing from converted output
+            # Quantized .weight keys are expected to be replaced by _high/_low/_scale etc.
+            QUANT_PROJ = {'q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj'}
+            missing_keys = []
+            for orig_key in orig_weight_map:
+                # Skip quantized linear weights — they become weight_high/weight_low etc.
+                if orig_key.endswith('.weight'):
+                    proj = orig_key.rsplit('.', 2)[-2] if '.' in orig_key else ''
+                    if proj in QUANT_PROJ:
+                        continue
+                # Skip bias (rare but possible)
+                if orig_key.endswith('.bias'):
+                    proj = orig_key.rsplit('.', 2)[-2] if '.' in orig_key else ''
+                    if proj in QUANT_PROJ:
+                        continue
+                if orig_key not in new_weight_map:
+                    missing_keys.append(orig_key)
+
+            if missing_keys:
+                print(f"\nCopying {len(missing_keys)} missing weight(s) from original model ({orig_model_dir}):")
+                # Group by shard file to minimize file reads
+                shard_to_keys = {}
+                for key in missing_keys:
+                    shard = orig_weight_map[key]
+                    shard_to_keys.setdefault(shard, []).append(key)
+
+                copied_weights = {}
+                for shard, keys in shard_to_keys.items():
+                    shard_path = os.path.join(orig_model_dir, shard)
+                    orig_sd = load_file(shard_path)
+                    for key in keys:
+                        if key in orig_sd:
+                            copied_weights[key] = orig_sd[key]
+                            print(f"  {key}: shape={list(orig_sd[key].shape)} dtype={orig_sd[key].dtype}")
+                        else:
+                            print(f"  WARNING: {key} not found in {shard}")
+
+                if copied_weights:
+                    target_file = safetensor_files[0] if safetensor_files else "extra_weights.safetensors"
+                    target_path = os.path.join(output_dir, target_file)
+                    if os.path.exists(target_path):
+                        existing = load_file(target_path)
+                        existing.update(copied_weights)
+                        save_file(existing, target_path)
+                    else:
+                        save_file(copied_weights, target_path)
+                    for key in copied_weights:
+                        new_weight_map[key] = target_file
+            else:
+                print("\nNo missing passthrough weights — CKPT A is complete.")
+
     if has_index:
         index_data["weight_map"] = new_weight_map
         with open(os.path.join(output_dir, index_filename), "w") as f:
@@ -209,11 +282,15 @@ def main():
     parser = argparse.ArgumentParser(
         description="Convert ResQ checkpoint to vLLM-compatible format"
     )
-    parser.add_argument("--input_path", type=str, required=True)
-    parser.add_argument("--output_path", type=str, required=True)
+    parser.add_argument("--input_path", type=str, required=True,
+                        help="Path to ResQ checkpoint (CKPT A)")
+    parser.add_argument("--output_path", type=str, required=True,
+                        help="Path to output converted checkpoint")
+    parser.add_argument("--orig_model", type=str, default=None,
+                        help="Path to original bf16 model (CKPT O) for missing weights like model.norm.weight")
     args = parser.parse_args()
 
-    convert_checkpoint(args.input_path, args.output_path)
+    convert_checkpoint(args.input_path, args.output_path, args.orig_model)
 
 
 if __name__ == "__main__":
