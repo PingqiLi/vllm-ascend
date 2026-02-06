@@ -175,6 +175,12 @@ def convert_checkpoint(input_dir: str, output_dir: str) -> None:
 
         for key, tensor in state_dict.items():
             new_keys = convert_key(key, num_layers, down_proj_is_resq)
+
+            # Fix dtype mismatch: weight_offset is int8 in ckpt but
+            # AscendW8A8DynamicLinearMethod expects bfloat16
+            if key.endswith(".weight_offset") and tensor.dtype == torch.int8:
+                tensor = tensor.to(torch.bfloat16)
+
             if len(new_keys) > 1:
                 for nk in new_keys:
                     new_state_dict[nk] = tensor.clone()
