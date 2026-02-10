@@ -106,6 +106,15 @@ class AscendQuantConfig(QuantizationConfig):
         from vllm.attention.layer import Attention
         if prefix.startswith("language_model"):
             prefix = prefix.split('.', 1)[-1]
+
+        # Shortcut for RESQ to bypass is_layer_skipped_ascend check
+        model_quant_type = self.quant_description.get("model_quant_type", "")
+        if model_quant_type.upper() == "RESQ":
+            if isinstance(layer, LinearBase):
+                return AscendLinearMethod(self, prefix,
+                                          self.packed_modules_mapping)
+            return None
+
         if isinstance(layer, LinearBase):
             if self.is_layer_skipped_ascend(prefix,
                                             self.packed_modules_mapping):
@@ -177,6 +186,17 @@ class AscendQuantConfig(QuantizationConfig):
 
 
 packed_modules_model_mapping = {
+    "qwen3": {
+        "qkv_proj": [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+        ],
+        "gate_up_proj": [
+            "gate_proj",
+            "up_proj",
+        ],
+    },
     "qwen3_moe": {
         "qkv_proj": [
             "q_proj",
@@ -280,6 +300,20 @@ class AscendLinearMethod(LinearMethodBase):
         **extra_weight_attrs,
     ) -> None:
         output_size_per_partition = sum(output_partition_sizes)
+
+        # If the inner quant method has its own create_weights logic, delegate to it.
+        # This is needed for methods like ResQ that handle their own parameter registration.
+        if hasattr(self.quant_method, "create_weights"):
+            return self.quant_method.create_weights(
+                layer,
+                input_size_per_partition,
+                output_partition_sizes,
+                input_size,
+                output_size,
+                params_dtype,
+                **extra_weight_attrs
+            )
+
         weight_loader = extra_weight_attrs.get("weight_loader")
 
         weight_dict = self.quant_method.get_weight(input_size_per_partition,

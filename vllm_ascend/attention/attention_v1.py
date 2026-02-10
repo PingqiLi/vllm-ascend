@@ -597,6 +597,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                                  dtype=query.dtype,
                                  device=query.device)
         ori_output = output
+
         if trace_flag:
             torch.ops.vllm.unified_ascend_attention_with_output(
                 query=query,
