@@ -9,6 +9,10 @@ from typing import Any, Dict, List, Optional
 
 import torch
 import torch_npu
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from vllm.model_executor.layers.linear import LinearMethodBase
 from vllm.model_executor.utils import set_weight_attrs
 
@@ -118,6 +122,12 @@ class ResQLinearMethod(LinearMethodBase):
         self.is_down_proj = "down_proj" in prefix
         self.is_o_proj = "o_proj" in prefix
 
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_rank = get_tensor_model_parallel_rank()
+
+        self.h_dim = None
+        self.l_dim = None
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -215,7 +225,13 @@ class ResQLinearMethod(LinearMethodBase):
 
                     del param._shards
 
-        # Pre-compute butterfly Hadamard matrix for down_proj
+        self.h_dim = layer.weight_high.shape[1]
+        self.l_dim = layer.weight_low.shape[1]
+
+        assert self.h_dim % self.tp_size == 0
+        assert self.l_dim % self.tp_size == 0
+
+        # Pre-compute butterfly Hadamard matrix
         if (
             self.is_down_proj
             and hasattr(layer, "rotation_Pd")
@@ -248,6 +264,96 @@ class ResQLinearMethod(LinearMethodBase):
         layer.scale_low.data = layer.scale_low.data.flatten().to(torch.float32).npu()
         layer.scale_high.data = layer.scale_high.data.flatten().to(torch.float32).npu()
 
+        # TP
+        if self.prefix.endswith("qkv_proj") or self.prefix.endswith("gate_up_proj"):
+            assert layer.weight_low_packed.data.shape[0] == layer.scale_low.data.shape[0]
+            assert layer.weight_high.data.shape[1] == layer.scale_high.data.shape[0]
+            n = layer.weight_low_packed.data.shape[0]
+
+            if self.prefix.endswith("gate_up_proj"):
+                assert n % 2 == 0
+                shard_offsets = [0, n // 2]
+                shard_sizes = [n // 2, n // 2]
+            elif self.prefix.endswith("qkv_proj"):
+                shard_offsets = [0, layer.output_sizes[0], layer.output_sizes[0] + layer.output_sizes[1]]
+                shard_sizes = layer.output_sizes
+
+            weight_low_packed = []
+            scale_low = []
+            weight_high = []
+            scale_high = []
+
+            for shard_offset, shard_size in zip(shard_offsets, shard_sizes):
+                assert shard_size % self.tp_size == 0
+                chunk_size = shard_size // self.tp_size
+                begin = shard_offset + self.tp_rank * chunk_size
+                end = begin + chunk_size
+                weight_low_packed.append(layer.weight_low_packed.data[begin: end, :])
+                weight_high.append(layer.weight_high.data[:, begin: end])
+                scale_low.append(layer.scale_low.data[begin: end])
+                scale_high.append(layer.scale_high.data[begin: end])
+
+            layer.weight_low_packed.data = torch.cat(weight_low_packed)
+            layer.weight_high.data = torch.cat(weight_high, dim=-1)
+            layer.scale_low.data = torch.cat(scale_low)
+            layer.scale_high.data = torch.cat(scale_high)
+            
+        elif self.prefix.endswith("down_proj"):
+            PACK_COUNT = 8
+            chunk_size = (self.l_dim + self.h_dim) // self.tp_size
+            assert chunk_size % PACK_COUNT == 0
+            begin = chunk_size * self.tp_rank
+            end = chunk_size * (self.tp_rank + 1)
+
+            if begin < self.l_dim:
+                layer.weight_low_packed.data = layer.weight_low_packed.data[:, begin // PACK_COUNT: min(end // PACK_COUNT, layer.weight_low_packed.data.shape[1])].clone()
+            else:
+                layer.weight_low_packed.data = torch.empty(0, 0)
+            
+            if end - self.l_dim > 0:
+                layer.weight_high.data = layer.weight_high.data[max(0, begin - self.l_dim): end - self.l_dim, :].clone()
+            else:
+                layer.weight_high.data = torch.empty(0, 0)
+
+        elif self.prefix.endswith("o_proj"):
+            PACK_COUNT = 8
+            assert self.l_dim % (self.tp_size * PACK_COUNT) == 0
+            assert self.h_dim % self.tp_size == 0
+            chunk_size_l = self.l_dim // (self.tp_size * PACK_COUNT) 
+            chunk_size_h = self.h_dim // self.tp_size
+            begin_l = chunk_size_l * self.tp_rank 
+            end_l = chunk_size_l * (self.tp_rank + 1)
+            begin_h = chunk_size_h * self.tp_rank
+            end_h = chunk_size_h * (self.tp_rank + 1)
+
+            layer.weight_low_packed.data = layer.weight_low_packed.data[:, begin_l: end_l].clone()
+            layer.weight_high.data = layer.weight_high.data[begin_h: end_h, :].clone()
+
+    def _get_new_column_order(self, in_dim, head_dim, high_per_head, device):
+        # Compute column reorder indices
+        # Original layout: [head0_cols, head1_cols, ..., headN_cols]
+        # Each head has head_dim columns
+        # We move the last high_per_head columns of each head to the end
+
+        chunk_starts = torch.arange(0, in_dim, head_dim, device=device)
+        high_precision_columns = torch.arange(head_dim - high_per_head, head_dim, device=device)
+
+        # Columns to move to end (high precision columns from each head)
+        columns_to_end = (chunk_starts.unsqueeze(1) + high_precision_columns).flatten()
+
+        # All columns
+        all_columns = torch.arange(in_dim, device=device)
+
+        # Remaining columns (mid precision)
+        mask = torch.ones(in_dim, dtype=torch.bool, device=device)
+        mask[columns_to_end] = False
+        remaining_columns = all_columns[mask]
+
+        # New order: [remaining (mid) | high]
+        new_column_order = torch.cat([remaining_columns, columns_to_end])
+
+        return new_column_order
+
     def _setup_o_proj_column_order(self, layer: torch.nn.Module) -> None:
         """Setup o_proj input column reorder indices based on high_fraction.
 
@@ -278,12 +384,9 @@ class ResQLinearMethod(LinearMethodBase):
             logger.warning(f"[ResQ] o_proj {self.prefix}: in_dim is 0, skipping column reorder setup")
             return
 
-        # Calculate high precision length
-        high_bits_length = int(in_dim * high_fraction)
 
         # For o_proj, we need to know head_dim and num_heads
         # We can infer this from the weight dimensions and high_fraction
-        # high_per_head = high_bits_length // num_heads
         # num_heads * head_dim = in_dim
         # Assuming head_dim is typically 128 for Qwen3
         head_dim = 128  # TODO: Get this from config if needed
@@ -291,33 +394,11 @@ class ResQLinearMethod(LinearMethodBase):
         if num_heads == 0:
             logger.warning(f"[ResQ] o_proj {self.prefix}: num_heads is 0, skipping column reorder setup")
             return
-        high_per_head = high_bits_length // num_heads
+        high_per_head = int(head_dim * high_fraction)
 
         device = layer.weight_low.device if layer.weight_low.numel() > 0 else "cpu"
 
-        # Compute column reorder indices
-        # Original layout: [head0_cols, head1_cols, ..., headN_cols]
-        # Each head has head_dim columns
-        # We move the last high_per_head columns of each head to the end
-
-        chunk_starts = torch.arange(0, in_dim, head_dim, device=device)
-        high_precision_columns = torch.arange(head_dim - high_per_head, head_dim, device=device)
-
-        # Columns to move to end (high precision columns from each head)
-        columns_to_end = (chunk_starts.unsqueeze(1) + high_precision_columns).flatten()
-
-        # All columns
-        all_columns = torch.arange(in_dim, device=device)
-
-        # Remaining columns (mid precision)
-        mask = torch.ones(in_dim, dtype=torch.bool, device=device)
-        mask[columns_to_end] = False
-        remaining_columns = all_columns[mask]
-
-        # New order: [remaining (mid) | high]
-        new_column_order = torch.cat([remaining_columns, columns_to_end])
-
-        layer.o_proj_column_order = new_column_order
+        layer.o_proj_column_order = self._get_new_column_order(in_dim // self.tp_size, head_dim, high_per_head, device)
 
     def apply(
         self,
@@ -337,6 +418,8 @@ class ResQLinearMethod(LinearMethodBase):
 
         # Apply Ud rotation for down_proj
         if self.is_down_proj and layer.rotation_Pd.numel() > 0:
+            if self.tp_size > 1:
+                raise NotImplementedError()
             Hd = layer.rotation_Hd if layer.rotation_Hd.numel() > 0 else None
             K = Hd.shape[0] if Hd is not None else 1
             blocksize = layer.rotation_Pd.shape[0]
@@ -369,29 +452,35 @@ class ResQLinearMethod(LinearMethodBase):
             x_high, dst_type=torch.int8
         )
 
-        # int4 matmul: weight_low_packed (n, k_low//8) -> transpose to (k_low//8, n)
-        output_low = torch_npu.npu_quant_matmul(
-            x_low_quant,
-            layer.weight_low_packed.t(),
-            layer.scale_low,
-            pertoken_scale=lx_scale,
-            output_dtype=torch.float16,
-        )
+        output_low = 0
+        output_high = 0
+        
+        if layer.weight_low_packed.numel():
+            # int4 matmul: weight_low_packed (n, k_low//8) -> transpose to (k_low//8, n)
+            output_low = torch_npu.npu_quant_matmul(
+                x_low_quant,
+                layer.weight_low_packed.t(),
+                layer.scale_low,
+                pertoken_scale=lx_scale,
+                output_dtype=torch.float16,
+            )
 
-        # int8 matmul: weight_high already (k_high, n) with NZ format
-        output_high = torch_npu.npu_quant_matmul(
-            x_high_quant,
-            layer.weight_high,
-            layer.scale_high,
-            pertoken_scale=rx_scale,
-            output_dtype=torch.float16,
-        )
+        if layer.weight_high.numel():
+            # int8 matmul: weight_high already (k_high, n) with NZ format
+            output_high = torch_npu.npu_quant_matmul(
+                x_high_quant,
+                layer.weight_high,
+                layer.scale_high,
+                pertoken_scale=rx_scale,
+                output_dtype=torch.float16,
+            )
 
         output = torch.add(output_low, output_high)
 
         # TODO: this could be an issue if bias is not None, as so far 
         # we do not consider how and if bias should be reordered during quantization
         if bias is not None:
+            raise NotImplementedError()
             output = output + bias
 
         output_shape = list(original_shape[:-1]) + [output.shape[-1]]
