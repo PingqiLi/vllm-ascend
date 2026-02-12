@@ -7,6 +7,7 @@
 import math
 from typing import Any, Dict, List, Optional
 
+import numpy as np
 import torch
 import torch_npu
 from vllm.model_executor.layers.linear import LinearMethodBase
@@ -94,6 +95,32 @@ def _apply_ud_rotation(
     x = x * K / math.sqrt(n)
 
     return x.reshape(original_shape).to(original_dtype)
+
+
+def _convert_scales(scales: torch.Tensor) -> torch.Tensor:
+    """Convert fp32 scales to int64-packed layout expected by mixprecise matmul."""
+    n = scales.shape[0]
+    scale_uint32 = (
+        scales.cpu().to(torch.float32).clone().numpy().astype(np.float32).reshape(1, n)
+    )
+    scale_uint32.dtype = np.uint32
+    scale_uint64 = np.zeros((1, n * 2), dtype=np.uint32)
+    scale_uint64[..., ::2] = scale_uint32
+    scale_uint64.dtype = np.int64
+    return torch.from_numpy(scale_uint64).npu()
+
+
+def _pack_int4_to_int8_signed(x: torch.Tensor) -> torch.Tensor:
+    """Pack two signed int4 values into one int8 element."""
+    assert x.dtype == torch.int8
+    _, n = x.shape
+    assert n % 2 == 0
+
+    # Convert signed int4 [-8, 7] to unsigned nibble [0, 15] via two's complement.
+    x_unsigned = torch.where(x < 0, x + 16, x).to(torch.int32)
+    low = x_unsigned[..., 0::2]
+    high = x_unsigned[..., 1::2]
+    return (low | (high << 4)).to(torch.int8)
 
 
 class ResQLinearMethod(LinearMethodBase):
@@ -232,21 +259,30 @@ class ResQLinearMethod(LinearMethodBase):
         if self.is_o_proj:
             self._setup_o_proj_column_order(layer)
 
-        # Process weight_low (int4): use NPU native packing
-        # weight_low shape: (n, k_low) -> pack to (n, k_low//8)
-        w_low = layer.weight_low.data.to(torch.int32).npu()
-        w_low_packed = torch_npu.npu_convert_weight_to_int4pack(w_low)
+        # Process weight_low (int4): pack two signed int4 values into one int8
+        # weight_low shape: (n, k_low) -> pack to (n, k_low//2)
+        w_low = layer.weight_low.data
+        w_low_packed = _pack_int4_to_int8_signed(w_low).contiguous().npu()
         layer.register_buffer("weight_low_packed", w_low_packed)
 
-        # Process weight_high (int8): transpose to (k_high, n) + NZ format
-        w_high = layer.weight_high.data.transpose(0, 1).contiguous().npu()
+        # Process weight_high (int8): keep original (n, k_high) layout.
+        # Both low/high weights will be transposed in apply() for mixprecise.
+        w_high = layer.weight_high.data.npu()
         if is_enable_nz():
             w_high = torch_npu.npu_format_cast(w_high, ACL_FORMAT_FRACTAL_NZ)
+            w_low_packed = torch_npu.npu_format_cast(
+                w_low_packed, ACL_FORMAT_FRACTAL_NZ
+            ).view(torch.int32)
         layer.weight_high.data = w_high
+        layer.weight_low_packed.data = w_low_packed
 
-        # Process scales: flatten to 1D float32
-        layer.scale_low.data = layer.scale_low.data.flatten().to(torch.float32).npu()
-        layer.scale_high.data = layer.scale_high.data.flatten().to(torch.float32).npu()
+        # Process scales for mixprecise API: fp32 -> packed int64 params
+        layer.scale_low.data = _convert_scales(
+            layer.scale_low.data.flatten().to(torch.float32)
+        )
+        layer.scale_high.data = _convert_scales(
+            layer.scale_high.data.flatten().to(torch.float32)
+        )
 
     def _setup_o_proj_column_order(self, layer: torch.nn.Module) -> None:
         """Setup o_proj input column reorder indices based on high_fraction.
@@ -355,8 +391,8 @@ class ResQLinearMethod(LinearMethodBase):
         original_shape = x.shape
         x_2d = x.contiguous().view(-1, x.shape[-1]).float()
 
-        # weight_high is now (k_high, n) after preprocessing
-        in_high = layer.weight_high.shape[0]
+        # weight_high is kept as (n, k_high) after preprocessing
+        in_high = layer.weight_high.shape[-1]
         in_low = x_2d.shape[-1] - in_high
 
         x_low = x_2d[:, :in_low].to(torch.float16).npu()
@@ -369,25 +405,20 @@ class ResQLinearMethod(LinearMethodBase):
             x_high, dst_type=torch.int8
         )
 
-        # int4 matmul: weight_low_packed (n, k_low//8) -> transpose to (k_low//8, n)
-        output_low = torch_npu.npu_quant_matmul(
+        output = torch_npu.npu_mixprecise_quant_matmul(
             x_low_quant,
-            layer.weight_low_packed.t(),
-            layer.scale_low,
-            pertoken_scale=lx_scale,
+            layer.weight_low_packed.transpose(-1, -2),
+            rx=x_high_quant,
+            hweight=layer.weight_high.transpose(-1, -2),
+            bias=None,
+            lscale=layer.scale_low,
+            hscale=layer.scale_high,
+            lper_token_scale=lx_scale,
+            rper_token_scale=rx_scale,
             output_dtype=torch.float16,
+            mix_type=0,
+            split_kpos=in_low,
         )
-
-        # int8 matmul: weight_high already (k_high, n) with NZ format
-        output_high = torch_npu.npu_quant_matmul(
-            x_high_quant,
-            layer.weight_high,
-            layer.scale_high,
-            pertoken_scale=rx_scale,
-            output_dtype=torch.float16,
-        )
-
-        output = torch.add(output_low, output_high)
 
         # TODO: this could be an issue if bias is not None, as so far 
         # we do not consider how and if bias should be reordered during quantization
