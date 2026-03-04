@@ -4,7 +4,6 @@
 #
 """ResQ mixed-precision quantization linear method."""
 
-import math
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -70,7 +69,6 @@ class ResQLinearMethod(LinearMethodBase):
         self.quant_config = quant_config
         self.prefix = prefix
         self.packed_modules_mapping = packed_modules_mapping
-        self.is_o_proj = "o_proj" in prefix
 
         self.tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tensor_model_parallel_rank()
@@ -107,11 +105,6 @@ class ResQLinearMethod(LinearMethodBase):
         # high_fraction is present in all RESQ layers
         register_resq_param("high_fraction", torch.float32)
 
-
-        if self.is_o_proj:
-            # Buffer for column reorder indices (computed in process_weights_after_loading)
-            layer.register_buffer("o_proj_column_order", torch.empty(0, dtype=torch.long))
-
     def weight_loader(
         self,
         param: torch.nn.Parameter,
@@ -135,8 +128,6 @@ class ResQLinearMethod(LinearMethodBase):
             "weight_high",
             "scale_low",
             "scale_high",
-            "rotation_Pd",
-            "rotation_Hd",
             "high_fraction",
         ]:
             if hasattr(layer, name):
@@ -172,11 +163,6 @@ class ResQLinearMethod(LinearMethodBase):
 
         assert self.h_dim % self.tp_size == 0
         assert self.l_dim % self.tp_size == 0
-
-        # Compute o_proj column reorder indices based on high_fraction
-        # Always setup for o_proj - use high_fraction from checkpoint or default 0.125
-        if self.is_o_proj:
-            self._setup_o_proj_column_order(layer)
 
         # Process weight_low (int4): use NPU native packing
         # weight_low shape: (n, k_low) -> pack to (n, k_low//8)
@@ -256,77 +242,6 @@ class ResQLinearMethod(LinearMethodBase):
                 layer.weight_low_packed.data, ACL_FORMAT_FRACTAL_NZ
             ).view(torch.int32)
 
-    def _get_new_column_order(self, in_dim, head_dim, high_per_head, device):
-        # Compute column reorder indices
-        # Original layout: [head0_cols, head1_cols, ..., headN_cols]
-        # Each head has head_dim columns
-        # We move the last high_per_head columns of each head to the end
-
-        chunk_starts = torch.arange(0, in_dim, head_dim, device=device)
-        high_precision_columns = torch.arange(head_dim - high_per_head, head_dim, device=device)
-
-        # Columns to move to end (high precision columns from each head)
-        columns_to_end = (chunk_starts.unsqueeze(1) + high_precision_columns).flatten()
-
-        # All columns
-        all_columns = torch.arange(in_dim, device=device)
-
-        # Remaining columns (mid precision)
-        mask = torch.ones(in_dim, dtype=torch.bool, device=device)
-        mask[columns_to_end] = False
-        remaining_columns = all_columns[mask]
-
-        # New order: [remaining (mid) | high]
-        new_column_order = torch.cat([remaining_columns, columns_to_end])
-
-        return new_column_order
-
-    def _setup_o_proj_column_order(self, layer: torch.nn.Module) -> None:
-        """Setup o_proj input column reorder indices based on high_fraction.
-
-        The ResQ quantization reorders o_proj weights to [mid | high] layout.
-        We need to reorder the input (attn_output) columns to match this layout.
-
-        The reordering moves high-precision columns (last `high_per_head` columns
-        of each head) to the end of the tensor.
-        """
-        from vllm.logger import logger
-
-        # Get high_fraction value - use checkpoint value if available, else default 0.125
-        # Reference implementation hardcodes 0.125
-        DEFAULT_HIGH_FRACTION = 0.125
-        if hasattr(layer, "high_fraction") and layer.high_fraction.numel() > 0:
-            high_fraction = layer.high_fraction.item()
-        else:
-            high_fraction = DEFAULT_HIGH_FRACTION
-
-        # Get input dimension from weight shape
-        # weight_low shape: (out_features, in_low), weight_high shape: (out_features, in_high)
-        # Note: weight_high has NOT been transposed yet at this point
-        in_low = layer.weight_low.shape[1] if layer.weight_low.numel() > 0 else 0
-        in_high = layer.weight_high.shape[1] if layer.weight_high.numel() > 0 else 0
-        in_dim = in_low + in_high
-
-        if in_dim == 0:
-            logger.warning(f"[ResQ] o_proj {self.prefix}: in_dim is 0, skipping column reorder setup")
-            return
-
-
-        # For o_proj, we need to know head_dim and num_heads
-        # We can infer this from the weight dimensions and high_fraction
-        # num_heads * head_dim = in_dim
-        # Assuming head_dim is typically 128 for Qwen3
-        head_dim = 128  # TODO: Get this from config if needed
-        num_heads = in_dim // head_dim
-        if num_heads == 0:
-            logger.warning(f"[ResQ] o_proj {self.prefix}: num_heads is 0, skipping column reorder setup")
-            return
-        high_per_head = int(head_dim * high_fraction)
-
-        device = layer.weight_low.device if layer.weight_low.numel() > 0 else "cpu"
-
-        layer.o_proj_column_order = self._get_new_column_order(in_dim // self.tp_size, head_dim, high_per_head, device)
-
     def apply(
         self,
         layer: torch.nn.Module,
@@ -337,10 +252,6 @@ class ResQLinearMethod(LinearMethodBase):
         """Apply ResQ quantized linear transformation."""
         if not x.is_contiguous():
             x = x.contiguous()
-
-        # Apply column reordering for o_proj input
-        if self.is_o_proj and layer.o_proj_column_order.numel() > 0:
-            x = x[..., layer.o_proj_column_order]
 
         # Mixed precision matmul
         original_shape = x.shape
