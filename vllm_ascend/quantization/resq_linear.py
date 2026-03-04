@@ -332,7 +332,6 @@ class ResQLinearMethod(LinearMethodBase):
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
-        tp_rank: int = 0,
         **kwargs,
     ) -> torch.Tensor:
         """Apply ResQ quantized linear transformation."""
@@ -345,14 +344,14 @@ class ResQLinearMethod(LinearMethodBase):
 
         # Mixed precision matmul
         original_shape = x.shape
-        x_2d = x.contiguous().view(-1, x.shape[-1]).float()
+        x_2d = x.contiguous().view(-1, x.shape[-1])
 
         # weight_high is (n, k_high) before matmul; matmul uses transposed view.
         in_high = layer.weight_high.shape[-1]
         in_low = x_2d.shape[-1] - in_high
 
-        x_low = x_2d[:, :in_low].to(torch.float16).npu()
-        x_high = x_2d[:, in_low:].to(torch.float16).npu()
+        x_low = x_2d[:, :in_low].npu()
+        x_high = x_2d[:, in_low:].npu()
 
         x_low_quant, lx_scale = torch_npu.npu_dynamic_quant(
             x_low.contiguous(), dst_type=torch.quint4x2
@@ -367,7 +366,7 @@ class ResQLinearMethod(LinearMethodBase):
                                                     rx=x_high_quant, hweight=layer.weight_high.transpose(-1,-2),
                                                     bias=None, lscale=layer.scale_low, hscale=layer.scale_high, 
                                                     lper_token_scale=lx_scale, rper_token_scale=rx_scale,
-                                                    output_dtype=torch.float16, mix_type=0, split_kpos=in_low)
+                                                    output_dtype=torch.bfloat16, mix_type=0, split_kpos=in_low)
 
         # TODO: this could be an issue if bias is not None, as so far 
         # we do not consider how and if bias should be reordered during quantization
@@ -376,4 +375,4 @@ class ResQLinearMethod(LinearMethodBase):
             output = output + bias
 
         output_shape = list(original_shape[:-1]) + [output.shape[-1]]
-        return output.view(output_shape).to(torch.bfloat16)
+        return output.view(output_shape)
