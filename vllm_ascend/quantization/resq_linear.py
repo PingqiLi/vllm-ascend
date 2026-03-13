@@ -4,6 +4,7 @@
 #
 """ResQ mixed-precision quantization linear method."""
 
+import math
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -59,6 +60,21 @@ def _convert_scales(scales):
     return scale
 
 
+def _hadamard_transform(u: torch.Tensor) -> torch.Tensor:
+    """Fast Hadamard transform (unnormalized, butterfly)."""
+    n = u.shape[-1]
+    x = u.reshape(-1, n).clone()
+    h = 1
+    while h < n:
+        x = x.view(-1, n // (2 * h), 2, h)
+        a = x[:, :, 0, :]
+        b = x[:, :, 1, :]
+        x = torch.stack([a + b, a - b], dim=2)
+        x = x.view(-1, n)
+        h *= 2
+    return x.view(u.shape)
+
+
 class ResQLinearMethod(LinearMethodBase):
     """Linear method for ResQ mixed-precision quantization.
 
@@ -71,6 +87,11 @@ class ResQLinearMethod(LinearMethodBase):
     Supports two checkpoint modes:
     - **Adaptive**: o_proj is ResQ (needs column reordering).
     - **Ua-only**: all layers are ResQ with a fixed split.
+
+    When ``rd_block_size`` is present in the checkpoint for a
+    down_proj layer (perm_rd mode), an online block-Hadamard
+    rotation Rd is applied to the activation before the
+    mixed-precision split.
     """
 
     def __init__(
@@ -83,12 +104,14 @@ class ResQLinearMethod(LinearMethodBase):
         self.prefix = prefix
         self.packed_modules_mapping = packed_modules_mapping
         self.is_o_proj = "o_proj" in prefix
+        self.is_down_proj = "down_proj" in prefix
 
         self.tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tensor_model_parallel_rank()
 
         self.h_dim = None
         self.l_dim = None
+        self._rd_block_size = 0
 
     def create_weights(
         self,
@@ -119,6 +142,9 @@ class ResQLinearMethod(LinearMethodBase):
         register_resq_param("scale_high", torch.float32)
         register_resq_param("scale_low", torch.float32)
         register_resq_param("high_fraction", torch.float32)
+
+        if self.is_down_proj:
+            register_resq_param("rd_block_size", torch.int32)
 
         if self.is_o_proj:
             layer.register_buffer(
@@ -157,6 +183,7 @@ class ResQLinearMethod(LinearMethodBase):
                 "scale_low",
                 "scale_high",
                 "high_fraction",
+                "rd_block_size",
         ]:
             if not hasattr(layer, name):
                 continue
@@ -182,7 +209,7 @@ class ResQLinearMethod(LinearMethodBase):
             sorted_shards = [param._shards[k] for k in sorted_keys]
 
             if len(sorted_shards) > 0:
-                if (name == "high_fraction"
+                if (name in ("high_fraction", "rd_block_size")
                         and sorted_shards[0].dim() == 0):
                     full_weight = sorted_shards[0]
                 else:
@@ -200,6 +227,19 @@ class ResQLinearMethod(LinearMethodBase):
 
         if self.is_o_proj:
             self._setup_o_proj_column_order(layer)
+
+        # perm_rd: extract rd_block_size and pre-compute H_b
+        self._rd_block_size = 0
+        if (self.is_down_proj
+                and hasattr(layer, "rd_block_size")
+                and layer.rd_block_size.numel() > 0):
+            bs = int(layer.rd_block_size.item())
+            if bs > 0:
+                self._rd_block_size = bs
+                eye = torch.eye(bs, dtype=torch.float32)
+                h_b = _hadamard_transform(eye) / math.sqrt(bs)
+                layer.register_buffer(
+                    "h_block", h_b.npu())
 
         w_low_packed = _pack_int4_to_int8_signed(
             layer.weight_low.data).contiguous().npu()
@@ -397,6 +437,16 @@ class ResQLinearMethod(LinearMethodBase):
 
         original_shape = x.shape
         x_2d = x.contiguous().view(-1, x.shape[-1])
+
+        # perm_rd: online block Hadamard before split
+        if (self._rd_block_size > 0
+                and hasattr(layer, "h_block")):
+            bs = self._rd_block_size
+            orig_dtype = x_2d.dtype
+            M, D = x_2d.shape
+            x_2d = x_2d.float().view(M, D // bs, bs)
+            x_2d = torch.matmul(x_2d, layer.h_block)
+            x_2d = x_2d.view(M, D).to(orig_dtype)
 
         in_high = layer.weight_high.shape[-1]
         in_low = x_2d.shape[-1] - in_high
