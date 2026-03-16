@@ -275,15 +275,16 @@ class ResQLinearMethod(LinearMethodBase):
     # ----------------------------------------------------------
 
     def _tp_slice(self, layer: torch.nn.Module) -> None:
-        """Tensor-parallel slicing for qkv / gate_up / o_proj."""
+        """Tensor-parallel slicing for all ResQ layers."""
         if self.tp_size <= 1:
             return
 
         if (self.prefix.endswith("qkv_proj")
                 or self.prefix.endswith("gate_up_proj")):
             self._tp_slice_row_parallel(layer)
-        elif self.prefix.endswith("o_proj"):
-            self._tp_slice_o_proj(layer)
+        elif (self.prefix.endswith("o_proj")
+              or self.prefix.endswith("down_proj")):
+            self._tp_slice_input_dim(layer)
 
     def _tp_slice_row_parallel(
         self,
@@ -329,11 +330,11 @@ class ResQLinearMethod(LinearMethodBase):
         layer.weight_high.data = torch.cat(whp, dim=0)
         layer.scale_high.data = torch.cat(sh, dim=-1)
 
-    def _tp_slice_o_proj(
+    def _tp_slice_input_dim(
         self,
         layer: torch.nn.Module,
     ) -> None:
-        """TP slicing for o_proj (column-parallel on input).
+        """TP slicing along input dimension (o_proj, down_proj).
 
         Weights are (n, k); we split along the k dimension."""
         packed_cols = layer.weight_low_packed.data.shape[1]
