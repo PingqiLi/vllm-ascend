@@ -102,6 +102,17 @@ QUANT_MODEL_PREFIX_MAPPINGS: dict[str, dict[str, str]] = {
 # key: model_type
 # value: dict of fused module name -> list of original module names
 packed_modules_model_mapping: dict[str, dict[str, list[str]]] = {
+    "qwen3": {
+        "qkv_proj": [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+        ],
+        "gate_up_proj": [
+            "gate_proj",
+            "up_proj",
+        ],
+    },
     "qwen3_moe": {
         "qkv_proj": [
             "q_proj",
@@ -323,6 +334,26 @@ def get_prefix_mapping(model_type: str) -> dict[str, str]:
     return QUANT_MODEL_PREFIX_MAPPINGS.get(model_type, {})
 
 
+def _get_layer_quant_type(quant_description: dict[str, Any], prefix: str) -> str:
+    """Get quant type for a single layer, handling both standard and RESQ formats.
+
+    Standard layers use `prefix.weight` keys, while RESQ layers use
+    `prefix.weight_low` keys in the quant_description.
+    """
+    weight_key = prefix + ".weight"
+    if weight_key in quant_description:
+        return quant_description[weight_key]
+
+    weight_low_key = prefix + ".weight_low"
+    if weight_low_key in quant_description:
+        return quant_description[weight_low_key]
+
+    raise KeyError(
+        f"Cannot find quant type for {prefix}: "
+        f"neither {weight_key} nor {weight_low_key} found in quant_description"
+    )
+
+
 def get_linear_quant_type(
     quant_description: dict[str, Any], prefix: str, packed_modules_mapping: dict[str, Any]
 ) -> str | None:
@@ -343,7 +374,7 @@ def get_linear_quant_type(
             prefix.replace(proj_name, shard_proj_name) for shard_proj_name in packed_modules_mapping[proj_name]
         ]
         for shard_prefix in shard_prefixes:
-            shard_quant_type = quant_description[shard_prefix + ".weight"]
+            shard_quant_type = _get_layer_quant_type(quant_description, shard_prefix)
 
             if quant_type is None:
                 quant_type = shard_quant_type
@@ -354,7 +385,7 @@ def get_linear_quant_type(
                     f"use {quant_type}. Please check quantization config."
                 )
     else:
-        quant_type = quant_description[prefix + ".weight"]
+        quant_type = _get_layer_quant_type(quant_description, prefix)
     return quant_type
 
 
@@ -514,6 +545,25 @@ class AscendModelSlimConfig(QuantizationConfig):
         if model_type != "kimi_k2":
             if prefix.startswith("language_model"):
                 prefix = prefix.split(".", 1)[-1]
+        # RESQ mixed-precision: bypass is_layer_skipped_ascend since RESQ
+        # layers use .weight_low keys instead of .weight keys.
+        model_quant_type = self.quant_description.get("model_quant_type", "")
+        if model_quant_type.upper() == "RESQ" and isinstance(layer, LinearBase):
+            layer_quant_type = get_linear_quant_type(
+                self.quant_description, prefix, self.packed_modules_mapping
+            )
+            if layer_quant_type and layer_quant_type.upper() == "RESQ":
+                from .methods.w4a4_resq import ResQLinearMethod
+
+                return ResQLinearMethod(self.quant_description, prefix, self.packed_modules_mapping)
+            elif layer_quant_type and layer_quant_type.upper() == "FLOAT":
+                from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
+
+                return AscendUnquantizedLinearMethod()
+            # Non-RESQ quantized layers (e.g., W8A8_DYNAMIC) fall through
+            scheme = create_scheme_for_layer(self.quant_description, prefix, "linear", self.packed_modules_mapping)
+            return AscendLinearMethod(scheme)
+
         if isinstance(layer, LinearBase):
             if self.is_layer_skipped_ascend(prefix, self.packed_modules_mapping):
                 # Delayed import to avoid circular import
